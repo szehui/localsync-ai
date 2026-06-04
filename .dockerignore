@@ -1,0 +1,14 @@
+node_modules
+frontend/node_modules
+frontend/dist
+backend/.venv
+backend/data
+backend/app/tests
+__pycache__
+*.pyc
+.env
+.git
+.gitignore
+README.md
+DEVLOG.md
+*.md

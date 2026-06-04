@@ -8,7 +8,7 @@ services:
     ports:
       - "4535:80"
     volumes:
-      - localsync-data:/app/data
+      - localsync-data:/app/backend/data
     environment:
       - DATABASE_URL=sqlite:///./data/localsync.db
     restart: unless-stopped
