@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  localsync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4535:80"
+    volumes:
+      - localsync-data:/app/data
+    environment:
+      - DATABASE_URL=sqlite:///./data/localsync.db
+    restart: unless-stopped
+
+volumes:
+  localsync-data:
