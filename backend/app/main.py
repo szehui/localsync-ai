@@ -6,9 +6,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from app.models.database import init_db, engine
+from app.models.database import init_db, engine, SessionLocal, SmartTrigger
 from app.routers import auth, library, playlists, triggers
 from app.config import settings
+from app.services.scheduler import init_scheduler, add_trigger_job
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,16 +21,37 @@ jobstores = {
 scheduler = AsyncIOScheduler(jobstores=jobstores)
 
 
+def load_existing_triggers():
+    """On startup, re-register scheduler jobs for all enabled triggers in the DB."""
+    db = SessionLocal()
+    try:
+        enabled_triggers = db.query(SmartTrigger).filter(SmartTrigger.enabled == True).all()
+        for trigger in enabled_triggers:
+            try:
+                add_trigger_job(trigger)
+                logger.info(f"Loaded trigger job: {trigger.name} ({trigger.trigger_type})")
+            except Exception as e:
+                logger.warning(f"Failed to load trigger {trigger.id}: {e}")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init DB, run full sync, start scheduler."""
+    """Startup: init DB, start scheduler, load existing triggers."""
     logger.info("Starting LocalSync AI...")
     init_db()
     logger.info("Database initialized")
 
+    # Give scheduler service a reference to the running scheduler
+    init_scheduler(scheduler)
+
     # Start scheduler
     scheduler.start()
     logger.info("Scheduler started")
+
+    # Load existing trigger jobs from DB
+    load_existing_triggers()
 
     yield
 
