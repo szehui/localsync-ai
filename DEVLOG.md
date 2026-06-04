@@ -24,8 +24,53 @@
 - Phase 1: Foundation ✅
 - Phase 2: Seed-based playlist generation ✅
 - Phase 3: Smart Triggers ✅
-- Phase 4: Frontend (pending)
-- Phase 5: Polish & Deploy (pending)
+- Phase 4: Frontend ✅
+- Phase 5: Polish & Deploy ✅
+
+---
+
+## Phase 4: Frontend
+
+### What was done
+- React/Vite/Tailwind SPA with 4 views:
+  - **SourceDashboard**: Navidrome connection form, library stats
+  - **SeedInterface**: track search, strictness slider (1-5), generate + push
+  - **PlaylistView**: list generated playlists with status badges
+  - **AutomationHub**: trigger CRUD, enable/disable, type-specific config
+- Shared components: Card, Button, Badge, Input, Slider, Select, Spinner, EmptyState
+- Typed API client (all backend endpoints)
+- Build: 38 modules, 165KB JS bundle
+
+### Issues encountered
+- Stale compiled `.js` files picked up by Vite instead of `.tsx` sources
+  - Fixed by removing stale files, adding `*.js` to frontend `.gitignore`
+- `vite.config.js` CJS/ESM mismatch with `"type": "module"` in package.json
+  - Fixed by using `.ts` extension (ESM) instead of `.js` (CJS)
+- Import resolution: explicit `.tsx` extensions needed to avoid `.js` ambiguity
+
+---
+
+## Phase 5: Docker Deployment
+
+### What was done
+- `.dockerignore`: excludes node_modules, .venv, dist, tests, .git
+- Fixed docker-compose volume mount: `/app/backend/data` (matches backend working directory)
+- Verified `docker compose build` succeeds end-to-end:
+  - Stage 1: node:20-alpine → npm ci + vite build
+  - Stage 2: python:3.11-slim → pip install + nginx + backend + frontend dist
+  - Port 4535 → container port 80 (nginx)
+
+### Deployment
+```bash
+docker compose up -d
+# Open http://localhost:4535
+```
+
+### Final stats
+- 44 backend tests passing
+- Frontend: 38 modules, 165KB JS bundle
+- Docker image: multi-stage, ~300MB
+- Repo: https://github.com/szehui/localsync-ai
 
 ---
 
