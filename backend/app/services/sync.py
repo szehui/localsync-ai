@@ -38,26 +38,34 @@ class SyncService:
             db.commit()
             logger.info(f"Synced {stats['artists']} artists")
 
-            # 2. Sync albums (alphabetical by name, up to 1000)
-            albums = await self.client.get_album_list2(type_="alphabeticalByName", size=1000)
-            for album_data in albums:
-                album = Album(
-                    id=album_data["id"],
-                    name=album_data.get("name", "Unknown"),
-                    artist_id=album_data.get("artistId"),
-                    artist_name=album_data.get("artist"),
-                    year=album_data.get("year"),
-                    genre=album_data.get("genre"),
-                    cover_art=album_data.get("coverArt"),
-                    song_count=album_data.get("songCount", 0),
-                    play_count=album_data.get("playCount", 0),
-                    rating=album_data.get("rating", 0),
-                    created_at=_parse_datetime(album_data.get("created")),
-                    last_synced=datetime.utcnow(),
-                )
-                db.merge(album)
-                stats["albums"] += 1
-            db.commit()
+            # 2. Sync albums — paginated fetch to handle large libraries
+            offset = 0
+            page_size = 500
+            while True:
+                albums = await self.client.get_album_list2(type_="alphabeticalByName", size=page_size, offset=offset)
+                if not albums:
+                    break
+                for album_data in albums:
+                    album = Album(
+                        id=album_data["id"],
+                        name=album_data.get("name", "Unknown"),
+                        artist_id=album_data.get("artistId"),
+                        artist_name=album_data.get("artist"),
+                        year=album_data.get("year"),
+                        genre=album_data.get("genre"),
+                        cover_art=album_data.get("coverArt"),
+                        song_count=album_data.get("songCount", 0),
+                        play_count=album_data.get("playCount", 0),
+                        rating=album_data.get("rating", 0),
+                        created_at=_parse_datetime(album_data.get("created")),
+                        last_synced=datetime.utcnow(),
+                    )
+                    db.merge(album)
+                    stats["albums"] += 1
+                db.commit()
+                if len(albums) < page_size:
+                    break
+                offset += page_size
             logger.info(f"Synced {stats['albums']} albums")
 
             # 3. Sync tracks — iterate albums to get songs

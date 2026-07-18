@@ -46,7 +46,7 @@ async def connect(config: NavidromeConfig):
             server_version=version,
         )
     except Exception as e:
-        await client.aclose()
+        await client.close()
         raise HTTPException(status_code=400, detail=str(e))
 
 
