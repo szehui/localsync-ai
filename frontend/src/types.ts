@@ -110,12 +110,13 @@ export interface Trigger {
 }
 
 export interface SyncStatus {
+  is_syncing: boolean;
   last_sync?: string;
   next_sync?: string;
   track_count: number;
   album_count: number;
   artist_count: number;
-  is_syncing: boolean;
+  message?: string;
 }
 
 export interface LibraryStats {

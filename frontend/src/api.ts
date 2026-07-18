@@ -15,6 +15,7 @@ import type {
   TriggerUpdate,
   Trigger,
   LibraryStats,
+  SyncStatus,
 } from './types';
 
 const BASE = '/api';
@@ -79,6 +80,15 @@ export const api = {
 
   getLibraryStats: () =>
     request<LibraryStats>('/library/stats'),
+
+  // Sync
+  triggerSync: () =>
+    request<SyncStatus>('/auth/sync', {
+      method: 'POST',
+    }),
+
+  getSyncStatus: () =>
+    request<SyncStatus>('/auth/sync-status'),
 
   // Playlists
   generatePlaylist: (req: PlaylistGenerateRequest) =>

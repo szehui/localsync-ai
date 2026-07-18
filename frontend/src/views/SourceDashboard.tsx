@@ -1,14 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
 import { Card, Button, Badge, Input, Spinner, EmptyState } from '../components';
-import type { ConnectionStatus, LibraryStats } from '../types';
+import type { ConnectionStatus, LibraryStats, SyncStatus } from '../types';
 
 export function SourceDashboard() {
   const [config, setConfig] = useState({ url: 'http://192.168.4.205:4533', username: '', password: '' });
   const [status, setStatus] = useState<ConnectionStatus | null>(null);
   const [stats, setStats] = useState<LibraryStats | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState('');
 
   const checkStatus = useCallback(async () => {
@@ -19,6 +21,8 @@ export function SourceDashboard() {
       if (s.connected) {
         const st = await api.getLibraryStats();
         setStats(st);
+        const sync = await api.getSyncStatus();
+        setSyncStatus(sync);
       }
     } catch {
       setStatus({ connected: false, message: 'Not configured' });
@@ -36,14 +40,30 @@ export function SourceDashboard() {
       const result = await api.connect(config);
       setStatus(result);
       if (result.connected) {
-        const st = await api.getLibraryStats();
-        setStats(st);
+        // Auto-sync after connection
+        await handleSync();
       }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Connection failed');
       setStatus({ connected: false, message: 'Connection failed' });
     } finally {
       setConnecting(false);
+    }
+  };
+
+  const handleSync = async () => {
+    setSyncing(true);
+    setError('');
+    try {
+      const result = await api.triggerSync();
+      setSyncStatus(result);
+      // Refresh stats after sync
+      const st = await api.getLibraryStats();
+      setStats(st);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Sync failed');
+    } finally {
+      setSyncing(false);
     }
   };
 
@@ -103,12 +123,21 @@ export function SourceDashboard() {
           <Button variant="secondary" onClick={checkStatus} disabled={loading}>
             Refresh
           </Button>
+          {status?.connected && (
+            <Button variant="secondary" onClick={handleSync} disabled={syncing}>
+              {syncing ? 'Syncing...' : 'Sync Now'}
+            </Button>
+          )}
         </div>
       </Card>
 
       {/* Library Stats */}
       <Card>
         <h3 className="font-medium mb-4">Library Statistics</h3>
+        {syncing && <Spinner />}
+        {syncStatus?.message && !syncing && (
+          <p className="text-sm text-gray-400 mb-3">{syncStatus.message}</p>
+        )}
         {loading && <Spinner />}
         {stats && (
           <div className="grid grid-cols-3 gap-4">

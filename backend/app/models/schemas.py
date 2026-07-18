@@ -112,9 +112,10 @@ class TriggerResponse(BaseModel):
 # --- Sync ---
 
 class SyncStatus(BaseModel):
+    is_syncing: bool = False
     last_sync: Optional[datetime] = None
     next_sync: Optional[datetime] = None
     track_count: int = 0
     album_count: int = 0
     artist_count: int = 0
-    is_syncing: bool = False
+    message: str = ""
