@@ -14,6 +14,7 @@ class SyncService:
         self.client = client
         self.is_syncing = False
         self.last_sync: datetime | None = None
+        self.last_stats: dict | None = None
 
     async def full_sync(self, db: Session) -> dict:
         """Full library sync: artists → albums → tracks with metadata."""
@@ -89,7 +90,7 @@ class SyncService:
                             disc_number=song_data.get("discNumber"),
                             play_count=song_data.get("playCount", 0),
                             rating=song_data.get("rating", 0),
-                            starred=song_data.get("starred", False),
+                            starred=_parse_starred(song_data.get("starred")),
                             created_at=_parse_datetime(song_data.get("created")),
                             last_synced=datetime.utcnow(),
                         )
@@ -100,8 +101,8 @@ class SyncService:
                     continue
             db.commit()
             logger.info(f"Synced {stats['tracks']} tracks")
-
             self.last_sync = datetime.utcnow()
+            self.last_stats = stats
             return stats
 
         except Exception as e:
@@ -171,7 +172,7 @@ class SyncService:
                             disc_number=song_data.get("discNumber"),
                             play_count=song_data.get("playCount", 0),
                             rating=song_data.get("rating", 0),
-                            starred=song_data.get("starred", False),
+                            starred=_parse_starred(song_data.get("starred")),
                             created_at=_parse_datetime(song_data.get("created")),
                             last_synced=datetime.utcnow(),
                         )
@@ -210,7 +211,7 @@ class SyncService:
                         if track:
                             track.play_count = song_data.get("playCount", track.play_count)
                             track.rating = song_data.get("rating", track.rating)
-                            track.starred = song_data.get("starred", track.starred)
+                            track.starred = _parse_starred(song_data.get("starred"))
                             track.last_synced = datetime.utcnow()
                 except Exception:
                     continue
@@ -229,3 +230,12 @@ def _parse_datetime(value) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
+
+
+def _parse_starred(value) -> bool:
+    """Navidrome returns datetime string for starred items, False otherwise."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value:
+        return True
+    return False

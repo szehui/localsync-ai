@@ -170,11 +170,8 @@ def test_sync_success(client, monkeypatch):
     response = client.post("/api/auth/sync")
     assert response.status_code == 200, f"Got {response.status_code}: {response.text}"
     data = response.json()
-    assert data["is_syncing"] is False
-    assert "Synced 10 tracks, 2 albums, 1 artists" in data["message"]
-
-    # Verify the sync service method was called
-    mock_sync_service.full_sync.assert_awaited_once()
+    assert data["is_syncing"] is True  # Now async — returns immediately
+    assert data["message"] == "Sync started"
 
     # Clean up dependency override
     app.dependency_overrides.pop(get_db, None)
