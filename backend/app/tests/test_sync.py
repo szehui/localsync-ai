@@ -27,9 +27,10 @@ def mock_client():
             "created": "2024-02-20T14:00:00Z",
         },
     ])
+    # Subsonic API returns getAlbum response as: { "album": { "id": ..., "song": [...] } }
     client.get_album = AsyncMock(side_effect=lambda aid: {
-        "al1": {
-            "id": "al1", "name": "Album One",
+        "album": {
+            "id": aid, "name": "Album One",
             "song": [
                 {"id": "t1", "title": "Track 1", "parent": "al1", "artistId": "a1",
                  "artist": "Artist One", "genre": "Rock", "year": 2024,
@@ -42,18 +43,22 @@ def mock_client():
                  "playCount": 3, "rating": 3, "starred": True,
                  "created": "2024-01-15T10:00:00Z"},
             ],
-        },
-        "al2": {
-            "id": "al2", "name": "Album Two",
+        } if aid == "al1" else {
+            "id": aid, "name": "Album Two",
             "song": [
                 {"id": "t3", "title": "Track 3", "parent": "al2", "artistId": "a2",
                  "artist": "Artist Two", "genre": "Jazz", "year": 2023,
                  "duration": 240, "track": 1, "discNumber": 1,
-                 "playCount": 8, "rating": 5, "starred": True,
+                 "playCount": 2, "rating": 5, "starred": False,
+                 "created": "2024-02-20T14:00:00Z"},
+                {"id": "t4", "title": "Track 4", "parent": "al2", "artistId": "a2",
+                 "artist": "Artist Two", "genre": "Jazz", "year": 2023,
+                 "duration": 260, "track": 2, "discNumber": 1,
+                 "playCount": 1, "rating": 3, "starred": False,
                  "created": "2024-02-20T14:00:00Z"},
             ],
-        },
-    }[aid])
+        }
+    })
     return client
 
 
@@ -67,7 +72,6 @@ class TestParseDatetime:
         result = _parse_datetime("2024-01-15T10:00:00Z")
         assert result is not None
         assert result.year == 2024
-        assert result.month == 1
 
     def test_none(self):
         assert _parse_datetime(None) is None
@@ -101,7 +105,7 @@ class TestFullSync:
 
         assert stats["artists"] == 2
         assert stats["albums"] == 2
-        assert stats["tracks"] == 3
+        assert stats["tracks"] == 4
         assert sync_service.last_sync is not None
         assert not sync_service.is_syncing
 

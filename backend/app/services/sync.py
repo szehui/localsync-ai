@@ -65,13 +65,13 @@ class SyncService:
             for album_id in album_ids:
                 try:
                     album_detail = await self.client.get_album(album_id)
-                    songs = album_detail.get("song", [])
+                    songs = album_detail.get("album", {}).get("song", [])
                     for song_data in songs:
                         track = Track(
                             id=song_data["id"],
                             title=song_data.get("title", "Unknown"),
                             album_id=song_data.get("parent"),
-                            album_name=album_detail.get("name"),
+                            album_name=song_data.get("album", album_detail.get("album", {}).get("name", "")),
                             artist_id=song_data.get("artistId"),
                             artist_name=song_data.get("artist"),
                             genre=song_data.get("genre"),
@@ -147,13 +147,13 @@ class SyncService:
                     stats["albums"] += 1
 
                     # Sync tracks for this album
-                    songs = album_detail.get("song", [])
+                    songs = album_detail.get("album", {}).get("song", [])
                     for song_data in songs:
                         track = Track(
                             id=song_data["id"],
                             title=song_data.get("title", "Unknown"),
                             album_id=song_data.get("parent"),
-                            album_name=album_detail.get("name"),
+                            album_name=song_data.get("album", album_detail.get("album", {}).get("name", "")),
                             artist_id=song_data.get("artistId"),
                             artist_name=song_data.get("artist"),
                             genre=song_data.get("genre"),
@@ -196,7 +196,7 @@ class SyncService:
                 album_id = album_data["id"]
                 try:
                     album_detail = await self.client.get_album(album_id)
-                    songs = album_detail.get("song", [])
+                    songs = album_detail.get("album", {}).get("song", [])
                     for song_data in songs:
                         track = db.query(Track).filter(Track.id == song_data["id"]).first()
                         if track:
