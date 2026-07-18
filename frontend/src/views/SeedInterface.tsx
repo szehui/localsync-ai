@@ -25,6 +25,10 @@ export function SeedInterface() {
     try {
       const tracks = await api.getTracks({ search, limit: 30 });
       setResults(tracks);
+      // Clear selection when new results arrive so user must pick a new seed
+      if (tracks.length > 0) {
+        setSelectedTrack(null);
+      }
       if (tracks.length === 0) {
         setError('No tracks found matching your search');
       }
