@@ -113,8 +113,9 @@ class NavidromeClient:
     async def create_playlist(self, name: str, track_ids: list[str]) -> dict:
         """Create a new playlist on Navidrome."""
         params = {"name": name}
-        for i, tid in enumerate(track_ids):
-            params[f"songId{i}"] = tid
+        # Subsonic API expects multiple songId params, not indexed songId0/songId1
+        if track_ids:
+            params["songId"] = track_ids
         return await self._request("createPlaylist.view", params)
 
     async def update_playlist(self, playlist_id: str, track_ids: list[str], name: str | None = None) -> dict:
@@ -122,8 +123,8 @@ class NavidromeClient:
         params = {"playlistId": playlist_id}
         if name:
             params["name"] = name
-        for i, tid in enumerate(track_ids):
-            params[f"songId{i}"] = tid
+        if track_ids:
+            params["songId"] = track_ids
         return await self._request("updatePlaylist.view", params)
 
     async def get_playlists(self) -> list[dict]:

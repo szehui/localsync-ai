@@ -153,9 +153,7 @@ async def test_create_playlist(client):
         assert result["playlist"]["id"] == "pl-123"
         # Verify songId params were sent
         call_params = mock_get.call_args[1]["params"]
-        assert call_params["songId0"] == "t1"
-        assert call_params["songId1"] == "t2"
-        assert call_params["songId2"] == "t3"
+        assert call_params["songId"] == ["t1", "t2", "t3"]
 
 
 @pytest.mark.asyncio
@@ -176,4 +174,4 @@ async def test_update_playlist(client):
         call_params = mock_get.call_args[1]["params"]
         assert call_params["playlistId"] == "pl-456"
         assert call_params["name"] == "Updated"
-        assert call_params["songId0"] == "t1"
+        assert call_params["songId"] == ["t1", "t2"]

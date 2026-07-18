@@ -42,33 +42,36 @@ async def generate_playlist(
         raise HTTPException(status_code=404, detail="No similar tracks found")
 
     # Build track list from cache, applying strictness filter
-    track_ids = []
+    track_ids = []  # will hold other track IDs (excluding seed)
+    target_other = max(0, request.track_count - 1)  # we want this many other tracks
     for song_data in similar:
         track_id = song_data["id"]
         if track_id == request.seed_track_id:
             continue
-
+        if len(track_ids) >= target_other:
+            break
         # Look up in local cache for filtering
         cached = db.query(Track).filter(Track.id == track_id).first()
         if cached and _passes_strictness(cached, seed_track, request.strictness):
             track_ids.append(track_id)
 
-        if len(track_ids) >= request.track_count:
-            break
-
-    # If strictness filter was too aggressive, relax and fill from similar
-    if len(track_ids) < request.track_count:
+    # If strictness filter was too aggressive, relax and fill from similar (still excluding seed)
+    if len(track_ids) < target_other:
         for song_data in similar:
             track_id = song_data["id"]
-            if track_id not in track_ids and track_id != request.seed_track_id:
-                track_ids.append(track_id)
-            if len(track_ids) >= request.track_count:
+            if track_id == request.seed_track_id:
+                continue
+            if len(track_ids) >= target_other:
                 break
+            if track_id not in track_ids:  # avoid duplicates
+                track_ids.append(track_id)
 
-    # Fetch full track data
-    tracks = db.query(Track).filter(Track.id.in_(track_ids)).all()
+    # Prepend the seed track to the list
+    final_track_ids = [request.seed_track_id] + track_ids
+    # Fetch full track data for the final list
+    tracks = db.query(Track).filter(Track.id.in_(final_track_ids)).all()
     track_map = {t.id: t for t in tracks}
-    ordered_tracks = [track_map[tid] for tid in track_ids if tid in track_map]
+    ordered_tracks = [track_map[tid] for tid in final_track_ids if tid in track_map]
 
     # Generate playlist name
     playlist_name = f"More Like This: {seed_track.title}"
