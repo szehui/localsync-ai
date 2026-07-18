@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from app.models.database import init_db, engine, SessionLocal, SmartTrigger
+from app.models.database import init_db, engine, SessionLocal, SmartTrigger, ConnectionConfig
 from app.routers import auth, library, playlists, triggers
 from app.config import settings
 from app.services.scheduler import init_scheduler, add_trigger_job
@@ -52,6 +52,13 @@ async def lifespan(app: FastAPI):
 
     # Load existing trigger jobs from DB
     load_existing_triggers()
+
+    # Try to restore Navidrome connection from saved config
+    db = SessionLocal()
+    try:
+        await auth._auto_connect(db)
+    finally:
+        db.close()
 
     yield
 

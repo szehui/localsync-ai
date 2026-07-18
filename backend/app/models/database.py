@@ -71,6 +71,14 @@ class GeneratedPlaylist(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ConnectionConfig(Base):
+    __tablename__ = "connection_config"
+    id = Column(Integer, primary_key=True, default=1)  # singleton row
+    url = Column(String, nullable=False)
+    username = Column(String, nullable=False)
+    password = Column(String, nullable=False)
+
+
 class SmartTrigger(Base):
     __tablename__ = "smart_triggers"
     id = Column(Integer, primary_key=True, autoincrement=True)

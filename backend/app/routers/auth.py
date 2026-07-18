@@ -2,7 +2,7 @@
 import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from app.models.database import get_db
+from app.models.database import get_db, ConnectionConfig
 from app.models.schemas import NavidromeConfig, ConnectionStatus, SyncStatus
 from app.services.navidrome import NavidromeClient
 from app.services.sync import SyncService
@@ -10,7 +10,7 @@ from app.services.sync import SyncService
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# In-memory store for current connection (persisted to DB later)
+# In-memory store for current connection
 _current_client: NavidromeClient | None = None
 _current_sync_service: SyncService | None = None
 
@@ -23,9 +23,29 @@ def get_sync_service() -> SyncService | None:
     return _current_sync_service
 
 
+async def _auto_connect(db: Session) -> None:
+    """Attempt to restore Navidrome connection from saved config."""
+    global _current_client, _current_sync_service
+    config = db.query(ConnectionConfig).filter(ConnectionConfig.id == 1).first()
+    if config is None:
+        return
+    try:
+        client = NavidromeClient(
+            url=config.url,
+            username=config.username,
+            password=config.password,
+        )
+        await client.ping()
+        _current_client = client
+        _current_sync_service = SyncService(client)
+        logger.info("Auto-connected to Navidrome from saved config")
+    except Exception as e:
+        logger.warning(f"Failed to auto-connect from saved config: {e}")
+
+
 @router.post("/connect", response_model=ConnectionStatus)
-async def connect(config: NavidromeConfig):
-    """Test and establish connection to Navidrome."""
+async def connect(config: NavidromeConfig, db: Session = Depends(get_db)):
+    """Test and establish connection to Navidrome. Saves config persistently."""
     global _current_client, _current_sync_service
     # Close any previous client
     if _current_client:
@@ -40,6 +60,22 @@ async def connect(config: NavidromeConfig):
         version = result.get("version", "unknown")
         _current_client = client
         _current_sync_service = SyncService(client)
+
+        # Persist config to DB
+        conn = db.query(ConnectionConfig).filter(ConnectionConfig.id == 1).first()
+        if conn:
+            conn.url = config.url
+            conn.username = config.username
+            conn.password = config.password
+        else:
+            db.add(ConnectionConfig(
+                id=1,
+                url=config.url,
+                username=config.username,
+                password=config.password,
+            ))
+        db.commit()
+
         return ConnectionStatus(
             connected=True,
             message=f"Connected to Navidrome v{version}",
@@ -48,6 +84,22 @@ async def connect(config: NavidromeConfig):
     except Exception as e:
         await client.close()
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/disconnect", response_model=ConnectionStatus)
+async def disconnect(db: Session = Depends(get_db)):
+    """Disconnect from Navidrome and clear saved config."""
+    global _current_client, _current_sync_service
+    if _current_client:
+        await _current_client.close()
+        _current_client = None
+        _current_sync_service = None
+    db.query(ConnectionConfig).filter(ConnectionConfig.id == 1).delete()
+    db.commit()
+    return ConnectionStatus(
+        connected=False,
+        message="Disconnected",
+    )
 
 
 @router.get("/status", response_model=ConnectionStatus)
@@ -97,14 +149,14 @@ async def trigger_sync(db: Session = Depends(get_db)):
     global _current_client, _current_sync_service
     if _current_client is None:
         raise HTTPException(status_code=400, detail="Not connected to Navidrome")
-    
+
     # Create sync service if not already created
     if _current_sync_service is None:
         _current_sync_service = SyncService(_current_client)
-    
+
     if _current_sync_service.is_syncing:
         raise HTTPException(status_code=409, detail="Sync already in progress")
-    
+
     try:
         stats = await _current_sync_service.full_sync(db)
         message = f"Synced {stats['tracks']} tracks, {stats['albums']} albums, {stats['artists']} artists"

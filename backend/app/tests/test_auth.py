@@ -58,6 +58,11 @@ def test_connect_failure(client, monkeypatch):
     mock_client.ping.side_effect = Exception("Connection refused")
 
     import app.routers.auth as auth_module
+    from app.models.database import get_db
+
+    # Mock DB dependency (connect endpoint now saves config to DB)
+    mock_db = MagicMock()
+    app.dependency_overrides[get_db] = lambda: mock_db
 
     monkeypatch.setattr(auth_module, "NavidromeClient", lambda *args, **kwargs: mock_client)
 
@@ -66,6 +71,8 @@ def test_connect_failure(client, monkeypatch):
     assert response.status_code == 400
     assert "Connection refused" in response.json()["detail"]
 
+    app.dependency_overrides.pop(get_db, None)
+
 
 def test_connect_success(client, monkeypatch):
     """Successful connection should return connected status and server version."""
@@ -73,6 +80,12 @@ def test_connect_success(client, monkeypatch):
     mock_client.ping.return_value = {"version": "0.50.0"}
 
     import app.routers.auth as auth_module
+    from app.models.database import get_db
+
+    # Mock DB dependency (connect endpoint saves config to DB)
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = None
+    app.dependency_overrides[get_db] = lambda: mock_db
 
     monkeypatch.setattr(auth_module, "NavidromeClient", lambda *args, **kwargs: mock_client)
 
@@ -85,6 +98,8 @@ def test_connect_success(client, monkeypatch):
     assert data["server_version"] == "0.50.0"
     assert auth_module._current_client is not None
     assert auth_module._current_sync_service is not None
+
+    app.dependency_overrides.pop(get_db, None)
 
 
 def test_connect_and_sync_status(client, monkeypatch):
