@@ -38,8 +38,8 @@ class SyncService:
             db.commit()
             logger.info(f"Synced {stats['artists']} artists")
 
-            # 2. Sync albums (newest first, up to 1000)
-            albums = await self.client.get_album_list2(type_="byArtist", size=1000)
+            # 2. Sync albums (alphabetical by name, up to 1000)
+            albums = await self.client.get_album_list2(type_="alphabeticalByName", size=1000)
             for album_data in albums:
                 album = Album(
                     id=album_data["id"],
