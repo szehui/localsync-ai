@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
 
@@ -20,6 +20,8 @@ class ConnectionStatus(BaseModel):
 # --- Library ---
 
 class TrackResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     title: str
     album_id: Optional[str] = None
@@ -36,6 +38,8 @@ class TrackResponse(BaseModel):
 
 
 class AlbumResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     artist_name: Optional[str] = None
@@ -47,6 +51,8 @@ class AlbumResponse(BaseModel):
 
 
 class ArtistResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     name: str
     album_count: int = 0
@@ -96,6 +102,8 @@ class TriggerUpdate(BaseModel):
 
 
 class TriggerResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     trigger_type: str
