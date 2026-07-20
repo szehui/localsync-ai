@@ -16,13 +16,24 @@ import type {
   Trigger,
   LibraryStats,
   SyncStatus,
+  NavidromePlaylist,
+  PlaylistFromPlaylistRequest,
+  LoginRequest,
+  TokenResponse,
+  UserResponse,
 } from './types';
 
 const BASE = '/api';
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const token = localStorage.getItem('access_token');
+  const headers: HeadersInit = {
+    'Content-Type': 'application/json',
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+  };
+
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     ...options,
   });
   if (!res.ok) {
@@ -36,17 +47,24 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
 export const api = {
   // Auth
-  connect: (config: NavidromeConfig) =>
-    request<ConnectionStatus>('/auth/connect', {
+  login: (creds: LoginRequest) =>
+    request<TokenResponse>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify(config),
+      body: JSON.stringify(creds),
     }),
-
-  connectionStatus: () =>
-    request<ConnectionStatus>('/auth/status'),
+  logout: () => request('/auth/logout', { method: 'POST' }),
+  me: () => request<UserResponse>('/auth/me'),
 
   // Library
-  getTracks: (params?: { search?: string; artist_id?: string; album_id?: string; genre?: string; sort?: string; limit?: number; offset?: number }) => {
+  getTracks: (params?: {
+    search?: string;
+    artist_id?: string;
+    album_id?: string;
+    genre?: string;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set('search', params.search);
     if (params?.artist_id) qs.set('artist_id', params.artist_id);
@@ -61,7 +79,12 @@ export const api = {
   getTrack: (id: string) =>
     request<Track>(`/library/tracks/${id}`),
 
-  getAlbums: (params?: { search?: string; sort?: string; limit?: number; offset?: number }) => {
+  getAlbums: (params?: {
+    search?: string;
+    sort?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set('search', params.search);
     if (params?.sort) qs.set('sort', params.sort);
@@ -70,7 +93,11 @@ export const api = {
     return request<Album[]>(`/library/albums?${qs}`);
   },
 
-  getArtists: (params?: { search?: string; limit?: number; offset?: number }) => {
+  getArtists: (params?: {
+    search?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
     const qs = new URLSearchParams();
     if (params?.search) qs.set('search', params.search);
     if (params?.limit) qs.set('limit', String(params.limit));
@@ -96,37 +123,38 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(req),
     }),
-
   pushPlaylist: (req: PlaylistPushRequest) =>
     request<PlaylistPushResponse>('/playlists/push', {
       method: 'POST',
       body: JSON.stringify(req),
     }),
-
-  getGeneratedPlaylists: () =>
-    request<GeneratedPlaylist[]>('/playlists/'),
+  getGeneratedPlaylists: () => request<GeneratedPlaylist[]>('/playlists/'),
+  getPlaylistTracks: (playlistId: number) =>
+    request<Track[]>(`/playlists/${playlistId}/tracks`),
+  listNavidromePlaylists: () =>
+    request<NavidromePlaylist[]>('/playlists/navidrome'),
+  generateFromPlaylist: (req: PlaylistFromPlaylistRequest) =>
+    request<PlaylistGenerateResponse>('/playlists/generate-from-playlist', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
 
   // Triggers
-  getTriggers: () =>
-    request<Trigger[]>('/triggers/'),
-
+  getTriggers: () => request<Trigger[]>('/triggers/'),
   createTrigger: (trigger: TriggerCreate) =>
     request<Trigger>('/triggers/', {
       method: 'POST',
       body: JSON.stringify(trigger),
     }),
-
   updateTrigger: (id: number, update: TriggerUpdate) =>
     request<Trigger>(`/triggers/${id}`, {
       method: 'PUT',
       body: JSON.stringify(update),
     }),
-
   deleteTrigger: (id: number) =>
     request<{ status: string }>(`/triggers/${id}`, {
       method: 'DELETE',
     }),
-
   toggleTrigger: (id: number) =>
     request<{ id: number; enabled: boolean }>(`/triggers/${id}/toggle`, {
       method: 'POST',

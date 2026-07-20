@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
-import { Card, Button, Badge, Input, Select, Spinner, EmptyState, formatDate } from '../components';
+import { 
+  Card, Button, Badge, Input, Select, Spinner, EmptyState, 
+  formatDate, SectionHeader 
+} from '../components';
 import type { Trigger, TriggerCreate } from '../types';
 
 const TRIGGER_TYPES = [
@@ -8,6 +11,12 @@ const TRIGGER_TYPES = [
   { value: 'heavy_rotation', label: 'Heavy Rotation (every 6h)' },
   { value: 'scheduled', label: 'Scheduled (custom cron)' },
 ];
+
+const TRIGGER_ICONS: Record<string, string> = {
+  recency: '🆕',
+  heavy_rotation: '🔄',
+  scheduled: '⏰',
+};
 
 export function AutomationHub() {
   const [triggers, setTriggers] = useState<Trigger[]>([]);
@@ -36,6 +45,13 @@ export function AutomationHub() {
 
   useEffect(() => { loadTriggers(); }, [loadTriggers]);
 
+  const resetForm = () => {
+    setFormName('');
+    setFormCron('');
+    setFormThreshold('5');
+    setFormPlaylistName('');
+  };
+
   const handleCreate = async () => {
     setError('');
     const create: TriggerCreate = {
@@ -52,10 +68,7 @@ export function AutomationHub() {
     try {
       await api.createTrigger(create);
       setShowForm(false);
-      setFormName('');
-      setFormCron('');
-      setFormThreshold('5');
-      setFormPlaylistName('');
+      resetForm();
       await loadTriggers();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to create trigger');
@@ -82,134 +95,152 @@ export function AutomationHub() {
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold">Automation Hub</h2>
-        <Button onClick={() => setShowForm(!showForm)}>
-          {showForm ? 'Cancel' : '+ New Trigger'}
-        </Button>
-      </div>
+      <SectionHeader
+        title="Automation Hub"
+        subtitle="Automatically generate playlists on a schedule"
+        action={
+          <Button onClick={() => { setShowForm(!showForm); resetForm(); }}>
+            {showForm ? 'Cancel' : '+ New Trigger'}
+          </Button>
+        }
+      />
 
-      {error && <p className="text-sm text-red-400">{error}</p>}
+      {error && (
+        <div className="bg-red-500/10 text-red-400 border border-red-500/20 rounded-lg px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
 
       {/* Create Form */}
       {showForm && (
-        <Card>
-          <h3 className="font-medium mb-4">Create Smart Trigger</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Name</label>
-              <Input
-                value={formName}
-                onChange={setFormName}
-                placeholder="My Trigger"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Type</label>
-              <Select
-                value={formType}
-                onChange={setFormType}
-                options={TRIGGER_TYPES}
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-400 mb-1">Playlist Name (optional)</label>
-              <Input
-                value={formPlaylistName}
-                onChange={setFormPlaylistName}
-                placeholder="Auto-generated if empty"
-              />
-            </div>
+        <Card className="animate-slide-up">
+          <h3 className="font-medium text-white mb-5">Create Smart Trigger</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-5">
+            <Input
+              value={formName}
+              onChange={setFormName}
+              placeholder="My Trigger"
+              label="Name"
+            />
+            <Select
+              value={formType}
+              onChange={setFormType}
+              options={TRIGGER_TYPES}
+              label="Type"
+            />
+            <Input
+              value={formPlaylistName}
+              onChange={setFormPlaylistName}
+              placeholder="Auto-generated if empty"
+              label="Playlist Name (optional)"
+            />
             {formType === 'scheduled' && (
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Cron Expression</label>
-                <Input
-                  value={formCron}
-                  onChange={setFormCron}
-                  placeholder="0 17 * * 5 (Fri 5pm)"
-                />
-              </div>
+              <Input
+                value={formCron}
+                onChange={setFormCron}
+                placeholder="0 17 * * 5 (Fri 5pm)"
+                label="Cron Expression"
+              />
             )}
             {formType === 'heavy_rotation' && (
-              <div>
-                <label className="block text-sm text-gray-400 mb-1">Play Threshold</label>
-                <Input
-                  value={formThreshold}
-                  onChange={setFormThreshold}
-                  placeholder="5"
-                  type="number"
-                />
-              </div>
+              <Input
+                value={formThreshold}
+                onChange={setFormThreshold}
+                placeholder="5"
+                type="number"
+                label="Play Threshold"
+              />
             )}
           </div>
-          <Button onClick={handleCreate}>Create Trigger</Button>
+          <div className="flex justify-end">
+            <Button onClick={handleCreate}>Create Trigger</Button>
+          </div>
         </Card>
       )}
 
       {/* Triggers List */}
-      {loading && <Spinner />}
+      {loading && <Spinner text="Loading triggers…" />}
       {!loading && triggers.length === 0 && (
-        <EmptyState message="No triggers configured. Create one to automate your playlists." />
+        <EmptyState
+          message="No triggers configured. Create one to automate your playlists."
+          icon="⚙️"
+        />
       )}
 
-      <div className="space-y-4">
-        {triggers.map((trigger) => (
-          <Card key={trigger.id}>
-            <div className="flex items-start justify-between">
-              <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="font-medium text-white">{trigger.name}</h3>
-                  <Badge variant={trigger.enabled ? 'success' : 'default'}>
-                    {trigger.enabled ? 'Enabled' : 'Disabled'}
-                  </Badge>
-                </div>
-                <div className="flex items-center gap-3 mt-1 text-sm text-gray-400">
-                  <span className="capitalize">{trigger.trigger_type.replace('_', ' ')}</span>
-                  {trigger.threshold && (
-                    <>
-                      <span>•</span>
-                      <span>Threshold: {trigger.threshold} plays</span>
-                    </>
-                  )}
-                  {trigger.cron_expression && (
-                    <>
-                      <span>•</span>
-                      <span>Cron: {trigger.cron_expression}</span>
-                    </>
-                  )}
+      {!loading && triggers.length > 0 && (
+        <div className="space-y-3">
+          {triggers.map((trigger) => (
+            <Card key={trigger.id} hover className="animate-slide-up">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-base">{TRIGGER_ICONS[trigger.trigger_type] || '⚡'}</span>
+                    <h3 className="font-medium text-white truncate">{trigger.name}</h3>
+                    <Badge
+                      variant={trigger.enabled ? 'success' : 'default'}
+                      dot={trigger.enabled}
+                    >
+                      {trigger.enabled ? 'Enabled' : 'Disabled'}
+                    </Badge>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-1 text-xs text-gray-500">
+                    <span className="capitalize">{trigger.trigger_type.replace('_', ' ')}</span>
+                    {trigger.threshold && (
+                      <>
+                        <span className="text-gray-600">|</span>
+                        <span>Threshold: <span className="text-gray-400">{trigger.threshold} plays</span></span>
+                      </>
+                    )}
+                    {trigger.cron_expression && (
+                      <>
+                        <span className="text-gray-600">|</span>
+                        <span>Cron: <code className="px-1 py-0.5 rounded bg-surface-overlay text-accent text-[10px]">{trigger.cron_expression}</code></span>
+                      </>
+                    )}
+                  </div>
                   {trigger.playlist_name && (
-                    <>
-                      <span>•</span>
-                      <span>→ {trigger.playlist_name}</span>
-                    </>
+                    <p className="text-xs text-gray-500 mt-1">
+                      → <span className="text-gray-400">{trigger.playlist_name}</span>
+                    </p>
                   )}
+                  <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
+                    {trigger.last_run && <span>Last run: {formatDate(trigger.last_run)}</span>}
+                    {trigger.next_run && (
+                      <>
+                        <span>·</span>
+                        <span>Next run: {formatDate(trigger.next_run)}</span>
+                      </>
+                    )}
+                    {trigger.navidrome_playlist_id && (
+                      <>
+                        <span>·</span>
+                        <span className="text-emerald-500/70">✓ Linked to Navidrome</span>
+                      </>
+                    )}
+                  </div>
                 </div>
-                {trigger.last_run && (
-                  <p className="text-xs text-gray-500 mt-1">
-                    Last run: {formatDate(trigger.last_run)}
-                  </p>
-                )}
-                {trigger.navidrome_playlist_id && (
-                  <p className="text-xs text-green-500/70 mt-0.5">
-                    Linked to Navidrome playlist
-                  </p>
-                )}
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <Button
+                    variant={trigger.enabled ? 'ghost' : 'accent'}
+                    onClick={() => handleToggle(trigger.id)}
+                    size="sm"
+                  >
+                    {trigger.enabled ? 'Disable' : 'Enable'}
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => handleDelete(trigger.id)}
+                    size="sm"
+                    className="text-red-400 hover:text-red-300 hover:bg-red-500/10"
+                  >
+                    Delete
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant={trigger.enabled ? 'secondary' : 'primary'}
-                  onClick={() => handleToggle(trigger.id)}
-                >
-                  {trigger.enabled ? 'Disable' : 'Enable'}
-                </Button>
-                <Button variant="danger" onClick={() => handleDelete(trigger.id)}>
-                  Delete
-                </Button>
-              </div>
-            </div>
-          </Card>
-        ))}
-      </div>
+            </Card>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

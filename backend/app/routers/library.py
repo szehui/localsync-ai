@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from app.models.database import get_db, Track, Album, Artist
 from app.models.schemas import TrackResponse, AlbumResponse, ArtistResponse
+from app.routers.auth import get_current_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.get("/tracks", response_model=list[TrackResponse])

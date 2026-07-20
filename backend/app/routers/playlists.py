@@ -8,11 +8,13 @@ from app.models.schemas import (
     PlaylistGenerateResponse,
     PlaylistPushRequest,
     PlaylistPushResponse,
+    PlaylistFromPlaylistRequest,
+    NavidromePlaylist,
     TrackResponse,
 )
-from app.routers.auth import get_navidrome_client
+from app.routers.auth import get_navidrome_client, get_current_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.post("/generate", response_model=PlaylistGenerateResponse)
@@ -160,6 +162,153 @@ async def list_generated_playlists(db: Session = Depends(get_db)):
         }
         for p in playlists
     ]
+
+
+@router.get("/{playlist_id}/tracks", response_model=list[TrackResponse])
+async def get_playlist_tracks(
+    playlist_id: int,
+    db: Session = Depends(get_db),
+):
+    """Get the full track listing for a generated playlist."""
+    playlist = db.query(GeneratedPlaylist).filter(GeneratedPlaylist.id == playlist_id).first()
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if not playlist.track_ids:
+        return []
+    try:
+        track_ids = json.loads(playlist.track_ids)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    tracks = db.query(Track).filter(Track.id.in_(track_ids)).all()
+    track_map = {t.id: t for t in tracks}
+    ordered_tracks = [track_map[tid] for tid in track_ids if tid in track_map]
+    return [TrackResponse.model_validate(t) for t in ordered_tracks]
+
+
+@router.get("/navidrome", response_model=list[NavidromePlaylist])
+async def list_navidrome_playlists(client=Depends(get_navidrome_client)):
+    """List all playlists on the Navidrome server."""
+    if client is None:
+        raise HTTPException(status_code=400, detail="Not connected to Navidrome")
+    try:
+        playlists = await client.get_playlists()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Navidrome error: {e}")
+    return [
+        NavidromePlaylist(
+            id=p["id"],
+            name=p.get("name", "Unnamed"),
+            song_count=p.get("songCount", 0),
+            owner=p.get("owner", ""),
+            public=p.get("public", False),
+            created=p.get("created"),
+            cover_art=p.get("coverArt"),
+        )
+        for p in playlists
+    ]
+
+
+@router.post("/generate-from-playlist", response_model=PlaylistGenerateResponse)
+async def generate_from_playlist(
+    request: PlaylistFromPlaylistRequest,
+    db: Session = Depends(get_db),
+    client=Depends(get_navidrome_client),
+):
+    """Generate a playlist from a seed playlist using Navidrome similarity."""
+    if client is None:
+        raise HTTPException(status_code=400, detail="Not connected to Navidrome")
+
+    # Fetch the seed playlist from Navidrome
+    try:
+        nav_playlist = await client.get_playlist(request.navidrome_playlist_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Navidrome fetch error: {e}")
+
+    entries = nav_playlist.get("playlist", {}).get("entry", [])
+    if not entries:
+        raise HTTPException(status_code=404, detail="Seed playlist has no tracks")
+
+    seed_track_ids = [s["id"] for s in entries]
+    source_name = nav_playlist.get("playlist", {}).get("name", "Unknown Playlist")
+
+    # For each seed track, get similar songs
+    all_candidates: list[str] = []
+    seen = set(seed_track_ids)  # avoid adding seed tracks to candidates
+    # Pre-seed the ordered list with the original playlist tracks
+    ordered_seed_ids: list[str] = []
+    for s in entries:
+        tid = s["id"]
+        if tid not in seen:
+            seen.add(tid)
+            ordered_seed_ids.append(tid)
+
+    for seed_id in seed_track_ids:
+        try:
+            similar = await client.get_similar_songs2(seed_id, count=request.per_seed_track)
+            for song_data in similar:
+                tid = song_data["id"]
+                if tid not in seen:
+                    seen.add(tid)
+                    all_candidates.append(tid)
+        except Exception:
+            continue  # skip if similarity fails for one track
+
+    # Apply strictness filter using cached tracks
+    filtered_tracks: list[str] = []
+    for tid in all_candidates:
+        if len(filtered_tracks) >= request.track_count:
+            break
+        cached = db.query(Track).filter(Track.id == tid).first()
+        # Use the first seed track as reference for strictness filtering
+        if cached and seed_track_ids:
+            first_seed = db.query(Track).filter(Track.id == seed_track_ids[0]).first()
+            if first_seed and _passes_strictness(cached, first_seed, request.strictness):
+                filtered_tracks.append(tid)
+            elif first_seed is None:
+                filtered_tracks.append(tid)  # no reference track in cache, include anyway
+        else:
+            filtered_tracks.append(tid)
+
+    # If strictness was too aggressive, relax with remaining candidates
+    if len(filtered_tracks) < request.track_count:
+        for tid in all_candidates:
+            if len(filtered_tracks) >= request.track_count:
+                break
+            if tid not in filtered_tracks:
+                filtered_tracks.append(tid)
+
+    # Final track list: seed playlist tracks (up to 10) + similar tracks
+    from itertools import islice
+    final_track_ids = list(islice(ordered_seed_ids, 10)) + filtered_tracks
+    final_track_ids = final_track_ids[:request.track_count]
+
+    # Fetch full track data
+    tracks = db.query(Track).filter(Track.id.in_(final_track_ids)).all()
+    track_map = {t.id: t for t in tracks}
+    ordered_tracks = [track_map[tid] for tid in final_track_ids if tid in track_map]
+
+    playlist_name = f"Inspired By: {source_name}"
+
+    # Save to local DB
+    playlist = GeneratedPlaylist(
+        name=playlist_name,
+        seed_track_id=seed_track_ids[0] if seed_track_ids else None,
+        seed_track_name=f"Playlist: {source_name}",
+        seed_playlist_id=request.navidrome_playlist_id,
+        seed_playlist_name=source_name,
+        strictness=request.strictness,
+        track_count=len(ordered_tracks),
+        track_ids=json.dumps(final_track_ids),
+    )
+    db.add(playlist)
+    db.commit()
+    db.refresh(playlist)
+
+    return PlaylistGenerateResponse(
+        name=playlist_name,
+        tracks=[TrackResponse.model_validate(t) for t in ordered_tracks],
+        track_count=len(ordered_tracks),
+    )
 
 
 def _passes_strictness(track: Track, seed: Track, strictness: int) -> bool:

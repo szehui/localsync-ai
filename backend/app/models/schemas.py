@@ -83,6 +83,37 @@ class PlaylistPushResponse(BaseModel):
     track_count: int
 
 
+class NavidromePlaylist(BaseModel):
+    id: str
+    name: str
+    song_count: int
+    owner: str
+    public: bool
+    created: Optional[str] = None
+    cover_art: Optional[str] = None
+
+
+class PlaylistFromPlaylistRequest(BaseModel):
+    navidrome_playlist_id: str
+    track_count: int = 30
+    strictness: int = 3
+    per_seed_track: int = 5  # similar songs to pull per seed track
+
+
+class PlaylistDetailResponse(BaseModel):
+    id: int
+    name: str
+    navidrome_playlist_id: Optional[str] = None
+    seed_track_id: Optional[str] = None
+    seed_track_name: Optional[str] = None
+    seed_playlist_id: Optional[str] = None
+    seed_playlist_name: Optional[str] = None
+    strictness: int
+    track_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- Smart Triggers ---
 
 class TriggerCreate(BaseModel):
@@ -115,6 +146,25 @@ class TriggerResponse(BaseModel):
     last_run: Optional[datetime] = None
     next_run: Optional[datetime] = None
     created_at: datetime
+
+
+# --- Web Auth (JWT) ---
+
+class LoginRequest(BaseModel):
+    url: str
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserResponse(BaseModel):
+    username: str
+    navidrome_url: str
+    server_version: Optional[str] = None
 
 
 # --- Sync ---

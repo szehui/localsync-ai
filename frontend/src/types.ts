@@ -68,11 +68,44 @@ export interface PlaylistPushResponse {
   track_count: number;
 }
 
+export interface PlaylistDetailResponse {
+  id: number;
+  name: string;
+  navidrome_playlist_id?: string | null;
+  seed_track_id?: string | null;
+  seed_track_name?: string | null;
+  seed_playlist_id?: string | null;
+  seed_playlist_name?: string | null;
+  strictness: number;
+  track_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlaylistFromPlaylistRequest {
+  navidrome_playlist_id: string;
+  track_count?: number;
+  strictness?: number;
+  per_seed_track?: number;
+}
+
+export interface NavidromePlaylist {
+  id: string;
+  name: string;
+  song_count: number;
+  owner: string;
+  public: boolean;
+  created?: string;
+  cover_art?: string;
+}
+
 export interface GeneratedPlaylist {
   id: number;
   name: string;
   navidrome_playlist_id?: string;
   seed_track_name?: string;
+  seed_playlist_id?: string;
+  seed_playlist_name?: string;
   strictness: number;
   track_count: number;
   created_at: string;
@@ -123,4 +156,23 @@ export interface LibraryStats {
   track_count: number;
   album_count: number;
   artist_count: number;
+}
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+export interface LoginRequest {
+  url: string;
+  username: string;
+  password: string;
+}
+
+export interface TokenResponse {
+  access_token: string;
+  token_type: string;
+}
+
+export interface UserResponse {
+  username: string;
+  navidrome_url: string;
+  server_version?: string;
 }

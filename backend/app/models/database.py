@@ -64,6 +64,8 @@ class GeneratedPlaylist(Base):
     navidrome_playlist_id = Column(String, nullable=True)  # ID after pushing to Navidrome
     seed_track_id = Column(String, nullable=True)
     seed_track_name = Column(String, nullable=True)
+    seed_playlist_id = Column(String, nullable=True)  # Navidrome playlist ID if generated from a playlist
+    seed_playlist_name = Column(String, nullable=True)  # Navidrome playlist name if from a playlist
     strictness = Column(Integer, default=3)  # 1-5 slider
     track_count = Column(Integer, default=20)
     track_ids = Column(Text, nullable=True)  # JSON array of track IDs
@@ -104,3 +106,12 @@ def get_db():
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Migrate existing tables: add columns that may not exist yet
+    import sqlalchemy as sa
+    inspector = sa.inspect(engine)
+    columns = [c["name"] for c in inspector.get_columns("generated_playlists")]
+    if "seed_playlist_id" not in columns:
+        with engine.connect() as conn:
+            conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_id VARCHAR"))
+            conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_name VARCHAR"))
+            conn.commit()

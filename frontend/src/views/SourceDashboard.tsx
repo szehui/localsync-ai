@@ -1,162 +1,170 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api } from '../api';
-import { Card, Button, Badge, Input, Spinner, EmptyState } from '../components';
-import type { ConnectionStatus, LibraryStats, SyncStatus } from '../types';
+import { Card, Button, Badge, Spinner, formatDate } from '../components';
+import type { GeneratedPlaylist } from '../types';
 
 export function SourceDashboard() {
-  const [config, setConfig] = useState({ url: 'http://192.168.4.205:4533', username: '', password: '' });
-  const [status, setStatus] = useState<ConnectionStatus | null>(null);
-  const [stats, setStats] = useState<LibraryStats | null>(null);
-  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const [syncing, setSyncing] = useState(false);
-  const [error, setError] = useState('');
+  const [library, setLibrary] = useState<any>(null);
+  const [status, setStatus] = useState<{ syncing: boolean; lastSync?: string; message?: string }>({
+    syncing: false,
+  });
+  const [playlists, setPlaylists] = useState<GeneratedPlaylist[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const checkStatus = useCallback(async () => {
-    setLoading(true);
+  const loadLibrary = useCallback(async () => {
     try {
-      const s = await api.connectionStatus();
-      setStatus(s);
-      if (s.connected) {
-        const st = await api.getLibraryStats();
-        setStats(st);
-        const sync = await api.getSyncStatus();
-        setSyncStatus(sync);
-      }
-    } catch {
-      setStatus({ connected: false, message: 'Not configured' });
-    } finally {
-      setLoading(false);
+      const data = await api.getLibraryStats();
+      setLibrary(data);
+    } catch (e: any) {
+      console.warn('Library stats failed:', e);
     }
   }, []);
 
-  useEffect(() => { checkStatus(); }, [checkStatus]);
-
-  const handleConnect = async () => {
-    setConnecting(true);
-    setError('');
+  const loadPlaylists = useCallback(async () => {
     try {
-      const result = await api.connect(config);
-      setStatus(result);
-      if (result.connected) {
-        // Auto-sync after connection
-        await handleSync();
-      }
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Connection failed');
-      setStatus({ connected: false, message: 'Connection failed' });
+      setRefreshing(true);
+      const data = await api.getGeneratedPlaylists();
+      setPlaylists(data);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message || 'Failed to load playlists');
     } finally {
-      setConnecting(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  const loadSyncStatus = useCallback(async () => {
+    try {
+      const data = await api.getSyncStatus();
+      setStatus({ syncing: data.is_syncing, lastSync: data.last_sync, message: data.message });
+    } catch (e: any) {
+      console.warn('Sync status failed:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadLibrary();
+    loadPlaylists();
+    loadSyncStatus();
+    const interval = setInterval(loadSyncStatus, 15000);
+    return () => clearInterval(interval);
+  }, [loadLibrary, loadPlaylists, loadSyncStatus]);
+
+  const handleRefresh = async () => {
+    await Promise.all([loadLibrary(), loadPlaylists()]);
+  };
+
+  const handleTriggerSync = async () => {
+    try {
+      await api.triggerSync();
+      setStatus((prev) => ({ ...prev, syncing: true }));
+    } catch (e: any) {
+      setError(e.message || 'Failed to trigger sync');
     }
   };
 
-  const handleSync = async () => {
-    setSyncing(true);
-    setError('');
-    try {
-      const result = await api.triggerSync();
-      setSyncStatus(result);
-      // Refresh stats after sync
-      const st = await api.getLibraryStats();
-      setStats(st);
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Sync failed');
-    } finally {
-      setSyncing(false);
-    }
-  };
+  if (refreshing && playlists.length === 0) {
+    return <Spinner text="Loading playlists…" />;
+  }
 
   return (
     <div className="space-y-6">
-      <h2 className="text-lg font-semibold">Source Management</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-semibold">Dashboard</h2>
+        <Button variant="secondary" onClick={handleRefresh} disabled={refreshing}>
+          {refreshing ? 'Refreshing…' : 'Refresh'}
+        </Button>
+      </div>
 
-      {/* Connection Card */}
-      <Card>
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="font-medium">Navidrome Connection</h3>
-          {status && (
-            <Badge variant={status.connected ? 'success' : 'danger'}>
-              {status.connected ? '● Connected' : '● Disconnected'}
-            </Badge>
+      {/* Stats Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {/* Library Stats */}
+        <Card>
+          <div className="flex items-start justify-between mb-2">
+            <div>
+              <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">Library</h3>
+              <p className="text-lg font-semibold">{library?.track_count?.toLocaleString() ?? '--'} tracks</p>
+            </div>
+            <Badge variant="info" dot />
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs text-gray-400 mt-2">
+            <span>{library?.album_count?.toLocaleString() ?? '--'} albums</span>
+            <span>{library?.artist_count?.toLocaleString() ?? '--'} artists</span>
+          </div>
+        </Card>
+
+        {/* Sync Status */}
+        <Card>
+          <div className="flex items-start justify-between mb-2">
+            <div>
+              <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">Sync</h3>
+              <p className="text-lg font-semibold">{status.syncing ? 'Syncing…' : 'Idle'}</p>
+            </div>
+            <Badge
+              variant={status.syncing ? 'warning' : status.lastSync ? 'success' : 'default'}
+              dot
+            />
+          </div>
+          {status.lastSync && (
+            <p className="mt-2 text-xs text-gray-400">
+              Last sync: {formatDate(status.lastSync)}
+            </p>
           )}
-        </div>
-
-        {status?.server_version && (
-          <p className="text-sm text-gray-400 mb-4">Server version: {status.server_version}</p>
-        )}
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Server URL</label>
-            <Input
-              value={config.url}
-              onChange={(v) => setConfig((c) => ({ ...c, url: v }))}
-              placeholder="http://192.168.4.205:4533"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Username</label>
-            <Input
-              value={config.username}
-              onChange={(v) => setConfig((c) => ({ ...c, username: v }))}
-              placeholder="Username"
-            />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Password</label>
-            <Input
-              value={config.password}
-              onChange={(v) => setConfig((c) => ({ ...c, password: v }))}
-              placeholder="Password"
-              type="password"
-            />
-          </div>
-        </div>
-
-        {error && <p className="text-sm text-red-400 mb-3">{error}</p>}
-
-        <div className="flex gap-3">
-          <Button onClick={handleConnect} disabled={connecting}>
-            {connecting ? 'Connecting...' : 'Connect'}
-          </Button>
-          <Button variant="secondary" onClick={checkStatus} disabled={loading}>
-            Refresh
-          </Button>
-          {status?.connected && (
-            <Button variant="secondary" onClick={handleSync} disabled={syncing}>
-              {syncing ? 'Syncing...' : 'Sync Now'}
-            </Button>
+          {status.message && (
+            <p className="mt-1 text-xs text-gray-400">{status.message}</p>
           )}
-        </div>
-      </Card>
+          <Button
+            variant="accent"
+            onClick={handleTriggerSync}
+            disabled={status.syncing}
+            className="w-full mt-3 text-xs"
+          >
+            {status.syncing ? 'Syncing…' : 'Sync Now'}
+          </Button>
+        </Card>
 
-      {/* Library Stats */}
-      <Card>
-        <h3 className="font-medium mb-4">Library Statistics</h3>
-        {syncing && <Spinner />}
-        {syncStatus?.message && !syncing && (
-          <p className="text-sm text-gray-400 mb-3">{syncStatus.message}</p>
-        )}
-        {loading && <Spinner />}
-        {stats && (
-          <div className="grid grid-cols-3 gap-4">
-            <StatBox label="Tracks" value={stats.track_count.toLocaleString()} />
-            <StatBox label="Albums" value={stats.album_count.toLocaleString()} />
-            <StatBox label="Artists" value={stats.artist_count.toLocaleString()} />
+        {/* Playlists */}
+        <Card>
+          <div className="flex items-start justify-between mb-2">
+            <div>
+              <h3 className="text-sm font-medium text-gray-400 uppercase tracking-wider">Playlists</h3>
+              <p className="text-lg font-semibold">{playlists.length}</p>
+            </div>
+            <Badge variant="success" dot />
           </div>
-        )}
-        {!loading && !stats && <EmptyState message="Connect to Navidrome to see library stats" />}
-      </Card>
-    </div>
-  );
-}
+          <div className="mt-2 space-y-2 text-sm">
+            {playlists.map((p) => (
+              <div key={p.id} className="flex items-center justify-between px-2 py-1.5 rounded-lg bg-surface-overlay">
+                <div className="flex items-center gap-2">
+                  <Badge variant="info" dot />
+                  <div>
+                    <div className="font-medium">{p.name}</div>
+                    <div className="text-xs text-gray-400">{p.track_count} tracks</div>
+                  </div>
+                </div>
+                <Badge
+                  variant={p.navidrome_playlist_id ? 'success' : 'warning'}
+                >
+                  {p.navidrome_playlist_id ? 'Synced' : 'Local'}
+                </Badge>
+              </div>
+            ))}
+            {playlists.length === 0 && (
+              <p className="text-center text-gray-500 text-xs py-2">
+                No playlists yet. Create one in the Seed tab.
+              </p>
+            )}
+          </div>
+        </Card>
+      </div>
 
-function StatBox({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="bg-gray-700/50 rounded-lg p-4 text-center">
-      <div className="text-2xl font-bold text-white">{value}</div>
-      <div className="text-sm text-gray-400 mt-1">{label}</div>
+      {/* Error Banner */}
+      {error && (
+        <div className="bg-red-900/50 border border-red-500/20 rounded-lg p-4">
+          <p className="text-red-400 text-sm">{error}</p>
+        </div>
+      )}
     </div>
   );
 }

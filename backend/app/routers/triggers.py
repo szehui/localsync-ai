@@ -4,8 +4,9 @@ from sqlalchemy.orm import Session
 from app.models.database import get_db, SmartTrigger
 from app.models.schemas import TriggerCreate, TriggerUpdate, TriggerResponse
 from app.services.scheduler import add_trigger_job, remove_trigger_job, pause_trigger_job, resume_trigger_job
+from app.routers.auth import get_current_user
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 @router.get("/", response_model=list[TriggerResponse])
