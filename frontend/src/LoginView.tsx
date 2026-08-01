@@ -1,11 +1,9 @@
 import { useState } from 'react';
 import { api } from './api';
+import { useAuth } from './AuthContext';
 
-interface LoginViewProps {
-  onAuth: () => void;
-}
-
-export function LoginView({ onAuth }: LoginViewProps) {
+export function LoginView() {
+  const { login } = useAuth();
   const [url, setUrl] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -19,8 +17,7 @@ export function LoginView({ onAuth }: LoginViewProps) {
 
     try {
       const res = await api.login({ url, username, password });
-      localStorage.setItem('access_token', res.access_token);
-      onAuth();
+      login(res.access_token);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Connection failed';
       setError(msg);

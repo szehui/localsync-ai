@@ -1,8 +1,6 @@
 // API client — calls FastAPI backend at /api/*
 
 import type {
-  NavidromeConfig,
-  ConnectionStatus,
   Track,
   Album,
   Artist,
@@ -21,6 +19,7 @@ import type {
   LoginRequest,
   TokenResponse,
   UserResponse,
+  ConnectionStatus,
 } from './types';
 
 const BASE = '/api';
@@ -54,6 +53,8 @@ export const api = {
     }),
   logout: () => request('/auth/logout', { method: 'POST' }),
   me: () => request<UserResponse>('/auth/me'),
+  connectionStatus: () =>
+    request<ConnectionStatus>('/auth/status'),
 
   // Library
   getTracks: (params?: {
@@ -158,5 +159,18 @@ export const api = {
   toggleTrigger: (id: number) =>
     request<{ id: number; enabled: boolean }>(`/triggers/${id}/toggle`, {
       method: 'POST',
+    }),
+
+  // Last.fm
+  getLastfmConfig: () =>
+    request<{ configured: boolean; username?: string }>('/auth/lastfm'),
+  setLastfmConfig: (req: { api_key: string; username: string }) =>
+    request<{ configured: boolean; username?: string }>('/auth/lastfm', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+  clearLastfmConfig: () =>
+    request<{ configured: boolean }>('/auth/lastfm', {
+      method: 'DELETE',
     }),
 };

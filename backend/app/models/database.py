@@ -96,6 +96,13 @@ class SmartTrigger(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class LastfmConfig(Base):
+    __tablename__ = "lastfm_config"
+    id = Column(Integer, primary_key=True, default=1)  # singleton row
+    api_key = Column(String, nullable=False)
+    username = Column(String, nullable=False)
+
+
 def get_db():
     db = SessionLocal()
     try:
