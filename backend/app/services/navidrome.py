@@ -118,6 +118,10 @@ class NavidromeClient:
             params["songId"] = track_ids
         return await self._request("createPlaylist.view", params)
 
+    async def delete_playlist(self, playlist_id: str) -> dict:
+        """Delete a playlist from Navidrome."""
+        return await self._request("deletePlaylist.view", {"id": playlist_id})
+
     async def update_playlist(self, playlist_id: str, track_ids: list[str], name: str | None = None) -> dict:
         """Update an existing playlist (replace all tracks)."""
         params = {"playlistId": playlist_id}

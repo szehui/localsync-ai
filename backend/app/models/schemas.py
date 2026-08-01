@@ -167,6 +167,19 @@ class UserResponse(BaseModel):
     server_version: Optional[str] = None
 
 
+# --- Last.fm ---
+
+
+class LastfmConfigRequest(BaseModel):
+    api_key: str
+    username: str
+
+
+class LastfmConfigResponse(BaseModel):
+    configured: bool
+    username: Optional[str] = None
+
+
 # --- Sync ---
 
 class SyncStatus(BaseModel):

@@ -30,6 +30,10 @@ export function AutomationHub() {
   const [formCron, setFormCron] = useState('');
   const [formThreshold, setFormThreshold] = useState('5');
   const [formPlaylistName, setFormPlaylistName] = useState('');
+  const [lastfmConfig, setLastfmConfig] = useState<{ configured: boolean; username?: string } | null>(null);
+  const [lastfmUsername, setLastfmUsername] = useState('');
+  const [lastfmApiKey, setLastfmApiKey] = useState('');
+  const [savingLastfm, setSavingLastfm] = useState(false);
 
   const loadTriggers = useCallback(async () => {
     setLoading(true);
@@ -44,6 +48,39 @@ export function AutomationHub() {
   }, []);
 
   useEffect(() => { loadTriggers(); }, [loadTriggers]);
+
+  useEffect(() => {
+    api.getLastfmConfig().then(cfg => {
+      setLastfmConfig(cfg);
+      if (cfg.configured && cfg.username) {
+        setLastfmUsername(cfg.username);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleSaveLastfm = async () => {
+    setError('');
+    setSavingLastfm(true);
+    try {
+      const cfg = await api.setLastfmConfig({ api_key: lastfmApiKey, username: lastfmUsername });
+      setLastfmConfig(cfg);
+      setLastfmApiKey('');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to save Last.fm config');
+    } finally {
+      setSavingLastfm(false);
+    }
+  };
+
+  const handleClearLastfm = async () => {
+    try {
+      await api.clearLastfmConfig();
+      setLastfmConfig({ configured: false });
+      setLastfmUsername('');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to clear Last.fm config');
+    }
+  };
 
   const resetForm = () => {
     setFormName('');
@@ -110,6 +147,48 @@ export function AutomationHub() {
           {error}
         </div>
       )}
+
+      {/* Last.fm Config */}
+      <Card>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <h3 className="font-medium text-white mb-1">Last.fm Integration</h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Connect Last.fm to personalize your Daily Mix with songs similar to your listening history.
+              The trigger will mix 50% similar tracks + 50% recently added tracks.
+            </p>
+            {lastfmConfig?.configured ? (
+              <div className="flex items-center gap-3">
+                <Badge variant="success" dot>Connected as {lastfmConfig.username}</Badge>
+                <Button variant="ghost" size="sm" onClick={handleClearLastfm} className="text-red-400 hover:text-red-300">
+                  Disconnect
+                </Button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <Input
+                  value={lastfmUsername}
+                  onChange={setLastfmUsername}
+                  placeholder="Last.fm username"
+                  label="Username"
+                />
+                <Input
+                  value={lastfmApiKey}
+                  onChange={setLastfmApiKey}
+                  placeholder="API key"
+                  label="API Key"
+                  type="password"
+                />
+                <div className="flex items-end">
+                  <Button onClick={handleSaveLastfm} disabled={savingLastfm || !lastfmUsername || !lastfmApiKey}>
+                    {savingLastfm ? 'Saving…' : 'Connect'}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </Card>
 
       {/* Create Form */}
       {showForm && (

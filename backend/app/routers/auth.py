@@ -14,8 +14,8 @@ import asyncio
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from app.models.database import get_db, ConnectionConfig, SessionLocal
-from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus
+from app.models.database import get_db, ConnectionConfig, SessionLocal, LastfmConfig
+from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse
 from app.services.navidrome import NavidromeClient
 from app.services.sync import SyncService
 from app.services.auth import create_access_token, verify_token
@@ -250,6 +250,46 @@ async def sync_status(_user: dict = Depends(get_current_user)):
         artist_count=_current_sync_service.last_stats.get("artists", 0) if _current_sync_service.last_stats else 0,
         message="Syncing..." if _current_sync_service.is_syncing else f"Idle — last sync: {_current_sync_service.last_stats.get('tracks', 0)} tracks, {_current_sync_service.last_stats.get('albums', 0)} albums, {_current_sync_service.last_stats.get('artists', 0)} artists" if _current_sync_service.last_stats else "Idle",
     )
+
+
+# ── Last.fm config (protected) ───────────────────────────────────────────────
+
+
+@router.get("/lastfm", response_model=LastfmConfigResponse)
+async def get_lastfm_config(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
+    """Return whether Last.fm is configured (without exposing the API key)."""
+    config = db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
+    if config is None:
+        return LastfmConfigResponse(configured=False)
+    return LastfmConfigResponse(configured=True, username=config.username)
+
+
+@router.put("/lastfm", response_model=LastfmConfigResponse)
+async def set_lastfm_config(
+    req: LastfmConfigRequest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """Save Last.fm API key + username for the recency trigger."""
+    config = db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
+    if config:
+        config.api_key = req.api_key
+        config.username = req.username
+    else:
+        db.add(LastfmConfig(id=1, api_key=req.api_key, username=req.username))
+    db.commit()
+    return LastfmConfigResponse(configured=True, username=req.username)
+
+
+@router.delete("/lastfm", response_model=LastfmConfigResponse)
+async def clear_lastfm_config(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
+    """Remove saved Last.fm config."""
+    db.query(LastfmConfig).filter(LastfmConfig.id == 1).delete()
+    db.commit()
+    return LastfmConfigResponse(configured=False)
+
+
+# ── Legacy /connect endpoint (backwards compat, protected) ───────────────────
 
 
 @router.post("/sync", response_model=SyncStatus)

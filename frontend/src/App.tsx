@@ -24,7 +24,7 @@ export default function App() {
 }
 
 function AppRouter() {
-  const { authenticated, loading, login } = useAuth();
+  const { authenticated, loading } = useAuth();
 
   if (loading) {
     return (
@@ -41,7 +41,7 @@ function AppRouter() {
   }
 
   if (!authenticated) {
-    return <LoginView onAuth={() => { /* login() was already called inside LoginView */ }} />;
+    return <LoginView />;
   }
 
   return <MainApp />;
