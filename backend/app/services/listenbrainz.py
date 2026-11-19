@@ -197,3 +197,52 @@ class ListenBrainzClient:
             len(raw), len(listens), days,
         )
         return listens
+
+    # ── similarity ───────────────────────────────────────────────────────────
+
+    async def get_recommendations(self, count: int = MAX_ITEMS_PER_GET,
+                                  offset: int = 0) -> list[dict]:
+        """Collaborative-filtering recording recommendations for the user.
+
+        Returns [{recording_mbid, score, latest_listened_at}]. This is
+        user-level (not seeded by a track) and only regenerated weekly upstream,
+        so callers should cache it.
+
+        Returns [] on HTTP 204 — recommendations have not been computed for the
+        account yet. That is the normal state for a new/near-empty account, not
+        an error.
+        """
+        data = await self._get(
+            f"{self.api_base}/1/cf/recommendation/user/{self.username}/recording",
+            params={"count": count, "offset": offset},
+        )
+        payload = (data or {}).get("payload", {}) if isinstance(data, dict) else {}
+        mbids = payload.get("mbids") or []
+        logger.info("ListenBrainz: %d CF recommendations available", len(mbids))
+        return mbids
+
+    async def get_similar_recordings(self, recording_mbid: str, limit: int = 50,
+                                     algorithm: str = DEFAULT_LABS_ALGORITHM) -> list[dict]:
+        """Similar recordings for one seed, from the Labs dataset.
+
+        Returns [{recording_mbid, recording_name, artist_credit_name,
+        release_name, score}].
+
+        The endpoint takes exactly ONE MBID per call — comma-separated values
+        are rejected with 400 — so this is inherently one call per seed and
+        callers must cache the result. It needs no authentication, and unlike
+        the CF endpoint it works for accounts with no listening history at all.
+        """
+        data = await self._get(
+            f"{self.labs_api_base}/similar-recordings/json",
+            params={"recording_mbids": recording_mbid, "algorithm": algorithm},
+            authenticated=False,
+        )
+        if not isinstance(data, list):
+            logger.warning(
+                "ListenBrainz Labs: unexpected payload for %s: %r",
+                recording_mbid, type(data).__name__,
+            )
+            return []
+        return data[:limit] if limit else data
+

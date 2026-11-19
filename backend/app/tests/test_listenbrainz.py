@@ -189,3 +189,103 @@ class TestRateLimiter:
         limiter = RateLimiter(min_interval=0)
         limiter.observe({})
         assert limiter._blocked_until == 0.0
+
+
+class TestRecommendations:
+    @pytest.mark.asyncio
+    async def test_204_returns_empty(self, client):
+        """No recommendations computed yet — normal for a new account."""
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(204, content=b"")
+            assert await client.get_recommendations() == []
+
+    @pytest.mark.asyncio
+    async def test_parses_mbids_with_scores(self, client):
+        payload = {"payload": {
+            "count": 2, "entity": "recording",
+            "mbids": [
+                {"recording_mbid": "m1", "score": 9.345},
+                {"recording_mbid": "m2", "score": 6.998},
+            ],
+        }}
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, payload)
+            recs = await client.get_recommendations()
+
+        assert [r["recording_mbid"] for r in recs] == ["m1", "m2"]
+        assert recs[0]["score"] == 9.345
+
+    @pytest.mark.asyncio
+    async def test_sends_count_and_offset(self, client):
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, {"payload": {"mbids": []}})
+            await client.get_recommendations(count=50, offset=10)
+
+        params = mock_get.call_args.kwargs["params"]
+        assert params == {"count": 50, "offset": 10}
+
+    @pytest.mark.asyncio
+    async def test_missing_payload_is_empty(self, client):
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, {})
+            assert await client.get_recommendations() == []
+
+
+class TestSimilarRecordings:
+    @pytest.mark.asyncio
+    async def test_parses_labs_payload(self, client):
+        labs = [{
+            "recording_mbid": "sim1", "recording_name": "Time Is the Enemy",
+            "artist_credit_name": "Quantic", "release_name": "The 5th Exotic",
+            "score": 163, "reference_mbid": "seed1",
+        }]
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, labs)
+            sims = await client.get_similar_recordings("seed1")
+
+        assert len(sims) == 1
+        assert sims[0]["recording_mbid"] == "sim1"
+        assert sims[0]["artist_credit_name"] == "Quantic"
+
+    @pytest.mark.asyncio
+    async def test_empty_list_is_valid(self, client):
+        """Labs returns [] for MBIDs it has no data for — not an error."""
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, [])
+            assert await client.get_similar_recordings("seed-with-no-data") == []
+
+    @pytest.mark.asyncio
+    async def test_sends_single_mbid_and_algorithm(self, client):
+        """The endpoint accepts ONE uuid per call; comma lists are rejected."""
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, [])
+            await client.get_similar_recordings("abc-123")
+
+        params = mock_get.call_args.kwargs["params"]
+        assert params["recording_mbids"] == "abc-123"
+        assert "," not in params["recording_mbids"]
+        assert params["algorithm"].startswith("session_based_days_7500")
+
+    @pytest.mark.asyncio
+    async def test_labs_call_is_unauthenticated(self, client):
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, [])
+            await client.get_similar_recordings("abc-123")
+
+        assert "Authorization" not in mock_get.call_args.kwargs["headers"]
+
+    @pytest.mark.asyncio
+    async def test_non_list_payload_is_empty(self, client):
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, {"unexpected": "dict"})
+            assert await client.get_similar_recordings("abc-123") == []
+
+    @pytest.mark.asyncio
+    async def test_limit_truncates(self, client):
+        labs = [{"recording_mbid": f"m{i}"} for i in range(60)]
+        with patch.object(client._client, "get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = _response(200, labs)
+            sims = await client.get_similar_recordings("seed1", limit=50)
+
+        assert len(sims) == 50
+
