@@ -1,6 +1,8 @@
 """Library sync service — pulls metadata from Navidrome into local SQLite cache."""
 import json
 import logging
+import re
+import unicodedata
 from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models.database import Artist, Album, Track, SessionLocal
@@ -74,27 +76,9 @@ class SyncService:
             for album_id in album_ids:
                 try:
                     album_detail = await self.client.get_album(album_id)
-                    songs = album_detail.get("album", {}).get("song", [])
-                    for song_data in songs:
-                        track = Track(
-                            id=song_data["id"],
-                            title=song_data.get("title", "Unknown"),
-                            album_id=song_data.get("parent"),
-                            album_name=song_data.get("album", album_detail.get("album", {}).get("name", "")),
-                            artist_id=song_data.get("artistId"),
-                            artist_name=song_data.get("artist"),
-                            genre=song_data.get("genre"),
-                            year=song_data.get("year"),
-                            duration=song_data.get("duration"),
-                            track_number=song_data.get("track"),
-                            disc_number=song_data.get("discNumber"),
-                            play_count=song_data.get("playCount", 0),
-                            rating=song_data.get("rating", 0),
-                            starred=_parse_starred(song_data.get("starred")),
-                            created_at=_parse_datetime(song_data.get("created")),
-                            last_synced=datetime.utcnow(),
-                        )
-                        db.merge(track)
+                    album = album_detail.get("album", {})
+                    for song_data in album.get("song", []):
+                        db.merge(_build_track(song_data, album))
                         stats["tracks"] += 1
                 except Exception as e:
                     logger.warning(f"Failed to sync album {album_id}: {e}")
@@ -157,26 +141,9 @@ class SyncService:
 
                     # Sync tracks for this album
                     songs = album_detail.get("album", {}).get("song", [])
+                    inner_album = album_detail.get("album", {})
                     for song_data in songs:
-                        track = Track(
-                            id=song_data["id"],
-                            title=song_data.get("title", "Unknown"),
-                            album_id=song_data.get("parent"),
-                            album_name=song_data.get("album", album_detail.get("album", {}).get("name", "")),
-                            artist_id=song_data.get("artistId"),
-                            artist_name=song_data.get("artist"),
-                            genre=song_data.get("genre"),
-                            year=song_data.get("year"),
-                            duration=song_data.get("duration"),
-                            track_number=song_data.get("track"),
-                            disc_number=song_data.get("discNumber"),
-                            play_count=song_data.get("playCount", 0),
-                            rating=song_data.get("rating", 0),
-                            starred=_parse_starred(song_data.get("starred")),
-                            created_at=_parse_datetime(song_data.get("created")),
-                            last_synced=datetime.utcnow(),
-                        )
-                        db.merge(track)
+                        db.merge(_build_track(song_data, inner_album))
                         stats["tracks"] += 1
                 except Exception as e:
                     logger.warning(f"Failed to sync new album {album_id}: {e}")
@@ -217,6 +184,63 @@ class SyncService:
                     continue
         except Exception as e:
             logger.warning(f"Play count update failed: {e}")
+
+
+def build_search_key(artist, title) -> str:
+    """Normalized "<artist>|<title>" key for MBID-free track resolution.
+
+    ListenBrainz listens always carry artist_name + track_name, so this key is
+    what resolves the ~50% of the library that has no musicBrainzId. Applied
+    identically at sync time and at query time — the two must never diverge.
+
+    Strips accents (NFKD -> ASCII), lowercases, and drops every non-alphanumeric
+    character so spacing/hyphen/slash differences do not break the match:
+        ("AC/DC", "Back In Black") -> "acdc|backinblack"
+        ("Röyksopp", "Some Resolve") -> "royksopp|someresolve"
+    """
+    return f"{_normalize_text(artist)}|{_normalize_text(title)}"
+
+
+def _normalize_text(value) -> str:
+    if not value:
+        return ""
+    text = unicodedata.normalize("NFKD", str(value))
+    text = text.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+
+def _build_track(song_data: dict, album: dict) -> Track:
+    """Build a Track from a Subsonic song dict.
+
+    Single construction site for both full and incremental sync so the MBID /
+    search_key logic cannot drift between the two paths.
+
+    `album` is the inner album dict from a getAlbum response
+    ({"album": {...}}), used as a fallback for album_name.
+    """
+    title = song_data.get("title")
+    artist = song_data.get("artist")
+    mbid = (song_data.get("musicBrainzId") or "").strip() or None
+    return Track(
+        id=song_data["id"],
+        title=title or "Unknown",
+        album_id=song_data.get("parent"),
+        album_name=song_data.get("album", album.get("name", "")),
+        artist_id=song_data.get("artistId"),
+        artist_name=artist,
+        genre=song_data.get("genre"),
+        year=song_data.get("year"),
+        duration=song_data.get("duration"),
+        track_number=song_data.get("track"),
+        disc_number=song_data.get("discNumber"),
+        play_count=song_data.get("playCount", 0),
+        rating=song_data.get("rating", 0),
+        starred=_parse_starred(song_data.get("starred")),
+        created_at=_parse_datetime(song_data.get("created")),
+        last_synced=datetime.utcnow(),
+        recording_mbid=mbid,
+        search_key=build_search_key(artist, title),
+    )
 
 
 def _parse_datetime(value) -> datetime | None:

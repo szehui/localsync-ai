@@ -1,8 +1,11 @@
+import logging
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 engine = create_engine(
     settings.database_url,
@@ -55,6 +58,12 @@ class Track(Base):
     starred = Column(Boolean, default=False)
     created_at = Column(DateTime, nullable=True)
     last_synced = Column(DateTime, default=datetime.utcnow)
+    # MusicBrainz recording ID from Navidrome's Subsonic musicBrainzId field.
+    # NULL when the album wasn't tagged (tagging in Sze's library is per-album).
+    recording_mbid = Column(String, nullable=True, index=True)
+    # Normalized "<artist>|<title>" for MBID-free resolution of ListenBrainz
+    # listens, which always carry artist_name + track_name.
+    search_key = Column(String, nullable=True, index=True)
 
 
 class GeneratedPlaylist(Base):
@@ -122,3 +131,47 @@ def init_db():
             conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_id VARCHAR"))
             conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_name VARCHAR"))
             conn.commit()
+
+    # ListenBrainz support: recording MBID + normalized search key on tracks.
+    track_columns = [c["name"] for c in inspector.get_columns("tracks")]
+    added = []
+    with engine.connect() as conn:
+        if "recording_mbid" not in track_columns:
+            conn.execute(sa.text("ALTER TABLE tracks ADD COLUMN recording_mbid VARCHAR"))
+            added.append("recording_mbid")
+        if "search_key" not in track_columns:
+            conn.execute(sa.text("ALTER TABLE tracks ADD COLUMN search_key VARCHAR"))
+            added.append("search_key")
+        conn.execute(sa.text(
+            "CREATE INDEX IF NOT EXISTS ix_tracks_recording_mbid ON tracks (recording_mbid)"
+        ))
+        conn.execute(sa.text(
+            "CREATE INDEX IF NOT EXISTS ix_tracks_search_key ON tracks (search_key)"
+        ))
+        conn.commit()
+
+    # Backfill search_key from existing rows (no Navidrome calls needed).
+    # recording_mbid CANNOT be backfilled — it requires a library resync.
+    if "search_key" in added:
+        _backfill_search_keys()
+        logger.info(
+            "tracks.search_key backfilled; tracks.recording_mbid needs a full library resync"
+        )
+
+
+def _backfill_search_keys():
+    """Populate tracks.search_key for rows synced before the column existed."""
+    import sqlalchemy as sa
+
+    from app.services.sync import build_search_key
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("SELECT id, artist_name, title FROM tracks WHERE search_key IS NULL")
+        ).fetchall()
+        for track_id, artist_name, title in rows:
+            conn.execute(
+                sa.text("UPDATE tracks SET search_key = :k WHERE id = :i"),
+                {"k": build_search_key(artist_name, title), "i": track_id},
+            )
+        conn.commit()
