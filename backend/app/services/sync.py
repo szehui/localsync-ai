@@ -19,14 +19,18 @@ class SyncService:
         self.last_stats: dict | None = None
 
     async def full_sync(self, db: Session) -> dict:
-        """Full library sync: artists → albums → tracks with metadata."""
+        """Full library sync: artists → albums → tracks, then prune vanished rows."""
         self.is_syncing = True
-        stats = {"artists": 0, "albums": 0, "tracks": 0}
+        stats = {
+            "artists": 0, "albums": 0, "tracks": 0,
+            "pruned_artists": 0, "pruned_albums": 0, "pruned_tracks": 0,
+        }
 
         try:
             logger.info("Starting full library sync...")
 
             # 1. Sync artists
+            seen_artist_ids: set = set()
             artists = await self.client.get_artists()
             for artist_data in artists:
                 artist = Artist(
@@ -37,11 +41,13 @@ class SyncService:
                     last_synced=datetime.utcnow(),
                 )
                 db.merge(artist)
+                seen_artist_ids.add(artist_data["id"])
                 stats["artists"] += 1
             db.commit()
             logger.info(f"Synced {stats['artists']} artists")
 
             # 2. Sync albums — paginated fetch to handle large libraries
+            seen_album_ids: set = set()
             offset = 0
             page_size = 500
             while True:
@@ -64,6 +70,7 @@ class SyncService:
                         last_synced=datetime.utcnow(),
                     )
                     db.merge(album)
+                    seen_album_ids.add(album_data["id"])
                     stats["albums"] += 1
                 db.commit()
                 if len(albums) < page_size:
@@ -71,20 +78,33 @@ class SyncService:
                 offset += page_size
             logger.info(f"Synced {stats['albums']} albums")
 
-            # 3. Sync tracks — iterate albums to get songs
-            album_ids = [a.id for a in db.query(Album.id).all()]
-            for album_id in album_ids:
+            # 3. Sync tracks — iterate the albums Navidrome actually returned
+            #    this run (not every album row in the DB, which may be stale).
+            seen_track_ids: set = set()
+            for album_id in sorted(seen_album_ids):
                 try:
                     album_detail = await self.client.get_album(album_id)
                     album = album_detail.get("album", {})
                     for song_data in album.get("song", []):
                         db.merge(_build_track(song_data, album))
+                        seen_track_ids.add(song_data["id"])
                         stats["tracks"] += 1
                 except Exception as e:
                     logger.warning(f"Failed to sync album {album_id}: {e}")
                     continue
             db.commit()
             logger.info(f"Synced {stats['tracks']} tracks")
+
+            # 4. Prune rows Navidrome no longer returns (children first).
+            stats["pruned_tracks"] = _prune(db, Track, seen_track_ids)
+            stats["pruned_albums"] = _prune(db, Album, seen_album_ids)
+            stats["pruned_artists"] = _prune(db, Artist, seen_artist_ids)
+            if any(stats[k] for k in ("pruned_tracks", "pruned_albums", "pruned_artists")):
+                logger.info(
+                    "Pruned %d tracks / %d albums / %d artists no longer in Navidrome",
+                    stats["pruned_tracks"], stats["pruned_albums"], stats["pruned_artists"],
+                )
+
             self.last_sync = datetime.utcnow()
             self.last_stats = stats
             return stats
@@ -241,6 +261,39 @@ def _build_track(song_data: dict, album: dict) -> Track:
         recording_mbid=mbid,
         search_key=build_search_key(artist, title),
     )
+
+
+def _prune(db: Session, model, seen_ids: set) -> int:
+    """Delete rows of `model` whose id was not returned by Navidrome this run.
+
+    A full sync is an authoritative snapshot, so vanished rows must go. When
+    Navidrome re-scans a library it can reassign song IDs; without this, the old
+    rows linger forever. That is not cosmetic — they land in `tracks.search_key`,
+    so the ListenBrainz resolver can match a dead ID, and duplicate keys make it
+    ambiguous which copy is live.
+
+    Refuses to run on an empty `seen_ids`: an empty or failed fetch must never
+    wipe the local library.
+    """
+    if not seen_ids:
+        logger.warning("Prune skipped for %s: nothing seen this run", model.__name__)
+        return 0
+
+    existing = [row[0] for row in db.query(model.id).all()]
+    stale = [row_id for row_id in existing if row_id not in seen_ids]
+    if not stale:
+        return 0
+
+    deleted = 0
+    # Batch the IN clause: SQLite caps bound parameters well below library size.
+    for start in range(0, len(stale), 500):
+        batch = stale[start:start + 500]
+        deleted += db.query(model).filter(model.id.in_(batch)).delete(
+            synchronize_session=False
+        )
+    db.commit()
+    logger.info("Pruned %d stale %s row(s)", deleted, model.__name__)
+    return deleted
 
 
 def _parse_datetime(value) -> datetime | None:
