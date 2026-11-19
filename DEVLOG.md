@@ -221,10 +221,11 @@ tracks it gathers up to 50 newest so a "50-track" mix is not silently 23 tracks.
   fix: 27,945 tracks, duplicates down to 994 (3.6%).
 
 ### Tests
-93 → 217 passing (124 new). Coverage added for the 204 path, rate limiting and
-quota headers, cache TTLs and empty-list caching, resolver ambiguity
-determinism, blend edge cases, source-routing (Last.fm not contacted when
-ListenBrainz covers a run), and sync pruning.
+93 → 195 passing (102 new), plus 22 pre-existing YouTube/Lidarr tests for 217
+total. Coverage added for the 204 path, rate limiting and quota headers, cache
+TTLs and empty-list caching, resolver ambiguity determinism, blend edge cases,
+source-routing (Last.fm not contacted when ListenBrainz covers a run), and sync
+pruning.
 
 ### Deployment & live verification (2026-11-19)
 - Rebuilt and restarted the container; startup migration added both columns,
@@ -246,3 +247,36 @@ ListenBrainz covers a run), and sync pruning.
   startup migration only backfills `search_key`
 - Config via Automation Hub → ListenBrainz (username + user token), plus a
   "Check" action that reports the account listen count and warns at 0
+
+---
+
+## 2026-11-19 — YouTube Music Playlist Import + Lidarr Queueing
+
+### What it does
+Paste a YouTube Music playlist URL and the app will:
+1. Parse the playlist with `yt-dlp --flat-playlist` (metadata only, no download)
+2. Fuzzy-match each track against the Navidrome library (three search
+   strategies — title-only, artist+title, artist-only — scored with a blend of
+   `SequenceMatcher` and stop-word-blind token overlap, threshold 0.75)
+3. Queue artists with no local match to Lidarr via MusicBrainz lookup
+4. Create the playlist in Navidrome, updating in place if the name already
+   exists (delete-then-recreate, since `updatePlaylist.view` doesn't reliably
+   replace tracks)
+
+### Notes
+- `Dockerfile` now installs Node.js — yt-dlp needs it to solve YouTube's JS
+  challenges. Without it, playlist parsing fails on modern YouTube.
+- Artist/title parsing strips the usual "(Official Video)", "(Lyric Video)",
+  "(Remastered)" noise and falls back to the channel name (minus the "- Topic"
+  suffix) when the title carries no artist.
+- Album is blank from a flat playlist entry — it is only known after a Navidrome
+  match, so Lidarr gets the artist, not a specific album.
+- Cleanup during merge: a second `LidarrConfig` model had been declared on its
+  own `declarative_base()` in `models/lidarr.py`. It mapped the same table but
+  was absent from `Base.metadata`, so `init_db()` never created it — the table
+  only existed because a script had made it by hand. Consolidated onto the main
+  `Base` in `models/database.py`; `init_db()` is now the single source of truth.
+- Scratch scripts (`fix_indent.py`, `kpop_test.py`, `similarity_test.py`,
+  `fresh_discoveries_draft.py`, `update_newest.py`, `backup_scheduler.py`) and
+  checked-in backups (`database.py.bak`, `lastfm.py.backup`) were left out of the
+  merge — git history already covers those.

@@ -112,6 +112,14 @@ class LastfmConfig(Base):
     username = Column(String, nullable=False)
 
 
+class LidarrConfig(Base):
+    """Singleton table to store Lidarr connection configuration."""
+    __tablename__ = "lidarr_config"
+    id = Column(Integer, primary_key=True, default=1)
+    url = Column(String, nullable=False)
+    api_key = Column(String, nullable=False)
+
+
 class ListenbrainzConfig(Base):
     """Singleton table for ListenBrainz credentials.
 

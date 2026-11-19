@@ -191,4 +191,57 @@ export const api = {
       '/auth/listenbrainz/test',
       { method: 'POST' },
     ),
+
+  // YouTube Import
+  parseYouTubePlaylist: (req: { url: string }) =>
+    request<{ playlist_title: string; track_count: number; tracks: Array<{
+      title: string;
+      artist: string;
+      album: string;
+      duration: number;
+      youtube_id: string;
+    }> }>('/youtube-import/parse', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  importYouTubePlaylist: (req: { url: string; playlist_name?: string }) =>
+    request<{
+      playlist_name: string;
+      navidrome_playlist_id?: string;
+      matched_count: number;
+      missing_count: number;
+      lidarr_queued_count: number;
+      tracks: Array<{
+        title: string;
+        artist: string;
+        album: string;
+        status: 'matched' | 'missing' | 'queued_to_lidarr';
+        lidarr_artist_added: boolean;
+        error?: string;
+      }>;
+    }>('/youtube-import/import', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+
+  // Lidarr Config
+  getLidarrConfig: () =>
+    request<{ configured: boolean; url?: string; connected?: boolean; version?: string }>(
+      '/youtube-import/lidarr-config'
+    ),
+
+  setLidarrConfig: (req: { url: string; api_key: string }) =>
+    request<{ configured: boolean; url?: string; connected?: boolean; version?: string }>(
+      '/youtube-import/lidarr-config',
+      {
+        method: 'PUT',
+        body: JSON.stringify(req),
+      }
+    ),
+
+  clearLidarrConfig: () =>
+    request<{ configured: boolean }>('/youtube-import/lidarr-config', {
+      method: 'DELETE',
+    }),
 };

@@ -29,6 +29,7 @@ def trigger():
     t.enabled = True
     t.playlist_name = None
     t.last_run = None
+    t.threshold = 5
     return t
 
 

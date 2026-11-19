@@ -5,14 +5,16 @@ import { SourceDashboard } from './views/SourceDashboard.tsx';
 import { SeedInterface } from './views/SeedInterface.tsx';
 import { PlaylistView } from './views/PlaylistView.tsx';
 import { AutomationHub } from './views/AutomationHub.tsx';
+import { YouTubeImport } from './views/YouTubeImport.tsx';
 
-type Tab = 'source' | 'seed' | 'playlists' | 'automation';
+type Tab = 'source' | 'seed' | 'playlists' | 'automation' | 'youtube';
 
 const TABS: { id: Tab; label: string; icon: string; description: string }[] = [
   { id: 'source', label: 'Source', icon: '🎵', description: 'Connect & sync your library' },
   { id: 'seed', label: 'Seed', icon: '🌱', description: 'Generate from any track' },
   { id: 'playlists', label: 'Playlists', icon: '📋', description: 'View and manage' },
   { id: 'automation', label: 'Automation', icon: '⚡', description: 'Smart triggers' },
+  { id: 'youtube', label: 'YouTube Import', icon: '📺', description: 'Import YTM playlists' },
 ];
 
 export default function App() {
@@ -123,6 +125,7 @@ function MainApp() {
         {activeTab === 'seed' && <SeedInterface />}
         {activeTab === 'playlists' && <PlaylistView />}
         {activeTab === 'automation' && <AutomationHub />}
+        {activeTab === 'youtube' && <YouTubeImport />}
       </main>
     </div>
   );

@@ -8,8 +8,10 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 from app.models.database import init_db, engine, SessionLocal, SmartTrigger, ConnectionConfig
 from app.routers import auth, library, playlists, triggers
+from app.routers import youtube_import
 from app.config import settings
 from app.services.scheduler import init_scheduler, add_trigger_job
+from app.services.lidarr import LidarrService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -19,6 +21,15 @@ jobstores = {
     "default": SQLAlchemyJobStore(engine=engine)
 }
 scheduler = AsyncIOScheduler(jobstores=jobstores)
+
+# Lidarr service global instance
+lidarr_service: LidarrService | None = None
+
+
+def set_lidarr_service(service: LidarrService | None):
+    """Set the global Lidarr service instance."""
+    global lidarr_service
+    lidarr_service = service
 
 
 def load_existing_triggers():
@@ -60,12 +71,27 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
 
+    # Try to restore Lidarr connection from saved config
+    from app.models.database import LidarrConfig
+    db = SessionLocal()
+    try:
+        lidarr_config = db.query(LidarrConfig).filter(LidarrConfig.id == 1).first()
+        if lidarr_config:
+            try:
+                service = LidarrService(lidarr_config.url, lidarr_config.api_key)
+                await service.test_connection()
+                set_lidarr_service(service)
+                logger.info("Auto-connected to Lidarr from saved config")
+            except Exception as e:
+                logger.warning(f"Failed to auto-connect to Lidarr: {e}")
+    finally:
+        db.close()
+
     yield
 
     # Shutdown
     scheduler.shutdown()
     logger.info("LocalSync AI shutdown complete")
-
 
 app = FastAPI(
     title="LocalSync AI",
@@ -87,6 +113,7 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(library.router, prefix="/api/library", tags=["library"])
 app.include_router(playlists.router, prefix="/api/playlists", tags=["playlists"])
 app.include_router(triggers.router, prefix="/api/triggers", tags=["triggers"])
+app.include_router(youtube_import.router, prefix="/api/youtube-import", tags=["youtube-import"])
 
 
 @app.get("/api/health")
