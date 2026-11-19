@@ -318,3 +318,22 @@ narrower, and all four were fixed:
 Result: 32 matched, **0 wrong-artist matches** (was 4), 4 false negatives recovered,
 studio versions preferred. 37 tracks reported missing, of which ~35 are verified
 absent from the library.
+
+### Live run — "Break out the boom box" (2026-11-19)
+
+Run against that real 69-track YouTube Music playlist through the deployed API:
+
+- Parsed: 69 tracks, channel noise stripped ("Queen Official" becomes "Queen")
+- Matched to the Navidrome library: **32**, correct artists, studio copies
+  preferred over live/remaster variants
+- Wrong songs: **0** — the artist gate rejected They Might Be Giants, Rihanna and
+  Sara Bareilles, each of which had matched on title alone before the fix
+- Missing from library: **37**
+- Queued to Lidarr: **0 newly**. Every one of the 37 missing artists is already
+  monitored ("Artist already in Lidarr" logged for each), and re-adding is
+  skipped by design
+- Navidrome playlist created: "Break out the boom box"
+  (`id: 5EQ9NdhfPYC2RLMmdnsh9P`)
+
+Absent artists stay flagged `missing` in the result so the UI can surface them,
+while already-monitored artists are not re-added.
