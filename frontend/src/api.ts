@@ -173,4 +173,22 @@ export const api = {
     request<{ configured: boolean }>('/auth/lastfm', {
       method: 'DELETE',
     }),
+
+  // ListenBrainz
+  getListenbrainzConfig: () =>
+    request<{ configured: boolean; username?: string }>('/auth/listenbrainz'),
+  setListenbrainzConfig: (req: { username: string; token: string }) =>
+    request<{ configured: boolean; username?: string }>('/auth/listenbrainz', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+  clearListenbrainzConfig: () =>
+    request<{ configured: boolean }>('/auth/listenbrainz', {
+      method: 'DELETE',
+    }),
+  testListenbrainzConfig: () =>
+    request<{ valid: boolean; username?: string; listen_count: number; message: string }>(
+      '/auth/listenbrainz/test',
+      { method: 'POST' },
+    ),
 };

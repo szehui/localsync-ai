@@ -180,6 +180,26 @@ class LastfmConfigResponse(BaseModel):
     username: Optional[str] = None
 
 
+# --- ListenBrainz ---
+
+
+class ListenbrainzConfigRequest(BaseModel):
+    username: str
+    token: str
+
+
+class ListenbrainzConfigResponse(BaseModel):
+    configured: bool
+    username: Optional[str] = None
+
+
+class ListenbrainzTestResponse(BaseModel):
+    valid: bool
+    username: Optional[str] = None
+    listen_count: int = 0
+    message: str = ""
+
+
 # --- Sync ---
 
 class SyncStatus(BaseModel):

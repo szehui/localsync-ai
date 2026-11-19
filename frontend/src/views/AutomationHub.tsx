@@ -34,6 +34,12 @@ export function AutomationHub() {
   const [lastfmUsername, setLastfmUsername] = useState('');
   const [lastfmApiKey, setLastfmApiKey] = useState('');
   const [savingLastfm, setSavingLastfm] = useState(false);
+  const [lbConfig, setLbConfig] = useState<{ configured: boolean; username?: string } | null>(null);
+  const [lbUsername, setLbUsername] = useState('');
+  const [lbToken, setLbToken] = useState('');
+  const [savingLb, setSavingLb] = useState(false);
+  const [testingLb, setTestingLb] = useState(false);
+  const [lbStatus, setLbStatus] = useState<{ valid: boolean; listen_count: number; message: string } | null>(null);
 
   const loadTriggers = useCallback(async () => {
     setLoading(true);
@@ -79,6 +85,55 @@ export function AutomationHub() {
       setLastfmUsername('');
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Failed to clear Last.fm config');
+    }
+  };
+
+  useEffect(() => {
+    api.getListenbrainzConfig().then(cfg => {
+      setLbConfig(cfg);
+      if (cfg.configured && cfg.username) {
+        setLbUsername(cfg.username);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleSaveLb = async () => {
+    setError('');
+    setSavingLb(true);
+    try {
+      const cfg = await api.setListenbrainzConfig({ username: lbUsername, token: lbToken });
+      setLbConfig(cfg);
+      setLbToken('');
+      // Verify immediately so the user learns about a bad token (or an empty
+      // account) now rather than when a trigger silently yields nothing.
+      setLbStatus(await api.testListenbrainzConfig());
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to save ListenBrainz config');
+    } finally {
+      setSavingLb(false);
+    }
+  };
+
+  const handleTestLb = async () => {
+    setError('');
+    setTestingLb(true);
+    try {
+      setLbStatus(await api.testListenbrainzConfig());
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to reach ListenBrainz');
+    } finally {
+      setTestingLb(false);
+    }
+  };
+
+  const handleClearLb = async () => {
+    try {
+      await api.clearListenbrainzConfig();
+      setLbConfig({ configured: false });
+      setLbUsername('');
+      setLbStatus(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to clear ListenBrainz config');
     }
   };
 
@@ -148,14 +203,86 @@ export function AutomationHub() {
         </div>
       )}
 
-      {/* Last.fm Config */}
+      {/* ListenBrainz Config — primary history source */}
       <Card>
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
-            <h3 className="font-medium text-white mb-1">Last.fm Integration</h3>
+            <div className="flex items-center gap-2 mb-1">
+              <h3 className="font-medium text-white">ListenBrainz Integration</h3>
+              <Badge variant="info">Primary</Badge>
+            </div>
             <p className="text-xs text-gray-500 mb-3">
-              Connect Last.fm to personalize your Daily Mix with songs similar to your listening history.
-              The trigger will mix 50% similar tracks + 50% recently added tracks.
+              Listening history and similar-artist data for your Daily Mix. Requires scrobbling
+              enabled in Navidrome (Settings → External Services). Last.fm is only used as a
+              fallback when ListenBrainz returns nothing.
+            </p>
+            {lbConfig?.configured ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <Badge variant="success" dot>Connected as {lbConfig.username}</Badge>
+                  <Button variant="ghost" size="sm" onClick={handleTestLb} disabled={testingLb}>
+                    {testingLb ? 'Checking…' : 'Check'}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={handleClearLb} className="text-red-400 hover:text-red-300">
+                    Disconnect
+                  </Button>
+                </div>
+                {lbStatus && (
+                  lbStatus.valid ? (
+                    lbStatus.listen_count === 0 ? (
+                      <div className="bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded-lg px-3 py-2 text-xs">
+                        Token valid, but this account has <strong>0 listens</strong>. Keep scrobbling
+                        from Navidrome and history will build — until then triggers fall back to
+                        Navidrome play counts.
+                      </div>
+                    ) : (
+                      <p className="text-xs text-gray-400">
+                        {lbStatus.listen_count.toLocaleString()} listens on ListenBrainz
+                      </p>
+                    )
+                  ) : (
+                    <div className="bg-red-500/10 text-red-400 border border-red-500/20 rounded-lg px-3 py-2 text-xs">
+                      {lbStatus.message}
+                    </div>
+                  )
+                )}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <Input
+                  value={lbUsername}
+                  onChange={setLbUsername}
+                  placeholder="ListenBrainz username"
+                  label="Username"
+                />
+                <Input
+                  value={lbToken}
+                  onChange={setLbToken}
+                  placeholder="User token"
+                  label="User Token"
+                  type="password"
+                />
+                <div className="flex items-end">
+                  <Button onClick={handleSaveLb} disabled={savingLb || !lbUsername || !lbToken}>
+                    {savingLb ? 'Saving…' : 'Connect'}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      {/* Last.fm Config (fallback) */}
+      <Card>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <h3 className="font-medium text-white">Last.fm Integration</h3>
+              <Badge variant="default">Fallback</Badge>
+            </div>
+            <p className="text-xs text-gray-500 mb-3">
+              Optional. Used only when ListenBrainz returns no history for a trigger.
             </p>
             {lastfmConfig?.configured ? (
               <div className="flex items-center gap-3">

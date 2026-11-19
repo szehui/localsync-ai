@@ -14,9 +14,10 @@ import asyncio
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from app.models.database import get_db, ConnectionConfig, SessionLocal, LastfmConfig
-from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse
+from app.models.database import get_db, ConnectionConfig, SessionLocal, LastfmConfig, ListenbrainzConfig
+from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse
 from app.services.navidrome import NavidromeClient
+from app.services.listenbrainz import ListenBrainzClient, ListenBrainzError, UserNotFoundError
 from app.services.sync import SyncService
 from app.services.auth import create_access_token, verify_token
 
@@ -287,6 +288,81 @@ async def clear_lastfm_config(db: Session = Depends(get_db), _user: dict = Depen
     db.query(LastfmConfig).filter(LastfmConfig.id == 1).delete()
     db.commit()
     return LastfmConfigResponse(configured=False)
+
+
+# ── ListenBrainz config (protected) ──────────────────────────────────────────
+
+
+@router.get("/listenbrainz", response_model=ListenbrainzConfigResponse)
+async def get_listenbrainz_config(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
+    """Return whether ListenBrainz is configured (without exposing the token)."""
+    config = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+    if config is None:
+        return ListenbrainzConfigResponse(configured=False)
+    return ListenbrainzConfigResponse(configured=True, username=config.username)
+
+
+@router.put("/listenbrainz", response_model=ListenbrainzConfigResponse)
+async def set_listenbrainz_config(
+    req: ListenbrainzConfigRequest,
+    db: Session = Depends(get_db),
+    _user: dict = Depends(get_current_user),
+):
+    """Save ListenBrainz username + user token for the recency trigger."""
+    config = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+    if config:
+        config.username = req.username
+        config.user_token = req.token
+    else:
+        db.add(ListenbrainzConfig(id=1, username=req.username, user_token=req.token))
+    db.commit()
+    return ListenbrainzConfigResponse(configured=True, username=req.username)
+
+
+@router.delete("/listenbrainz", response_model=ListenbrainzConfigResponse)
+async def clear_listenbrainz_config(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
+    """Remove saved ListenBrainz config."""
+    db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).delete()
+    db.commit()
+    return ListenbrainzConfigResponse(configured=False)
+
+
+@router.post("/listenbrainz/test", response_model=ListenbrainzTestResponse)
+async def test_listenbrainz_config(db: Session = Depends(get_db), _user: dict = Depends(get_current_user)):
+    """Validate the saved ListenBrainz token and report the account's listen count.
+
+    The count matters: with scrobbling just enabled the account is empty, and
+    ListenBrainz-backed triggers fall back to Navidrome history until it fills.
+    Surfacing the number is how the user knows data is actually flowing.
+    """
+    config = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+    if config is None:
+        raise HTTPException(status_code=400, detail="ListenBrainz is not configured")
+
+    client = ListenBrainzClient(user_token=config.user_token, username=config.username)
+    try:
+        info = await client.validate_token()
+        if not info.get("valid"):
+            return ListenbrainzTestResponse(
+                valid=False, username=config.username,
+                message="Token rejected by ListenBrainz",
+            )
+        count = await client.get_listen_count()
+        return ListenbrainzTestResponse(
+            valid=True, username=config.username, listen_count=count,
+            message=f"{count} listens",
+        )
+    except UserNotFoundError:
+        return ListenbrainzTestResponse(
+            valid=False, username=config.username,
+            message="User not found on ListenBrainz",
+        )
+    except ListenBrainzError as e:
+        return ListenbrainzTestResponse(
+            valid=False, username=config.username, message=str(e),
+        )
+    finally:
+        await client.close()
 
 
 # ── Legacy /connect endpoint (backwards compat, protected) ───────────────────
