@@ -11,12 +11,28 @@ import re
 from datetime import datetime, timedelta
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
-from app.models.database import SmartTrigger, GeneratedPlaylist, ConnectionConfig, SessionLocal, Track, LastfmConfig
+from app.models.database import SmartTrigger, GeneratedPlaylist, ConnectionConfig, SessionLocal, Track, LastfmConfig, ListenbrainzConfig
 from app.services.navidrome import NavidromeClient
 from app.services.lastfm import LastfmClient
+from app.services.listenbrainz import ListenBrainzClient
+from app.services.lb_cache import (
+    get_cached_recommendations,
+    get_cached_similar,
+    put_recommendations,
+    put_similar,
+)
+from app.services.resolver import resolve_entries
 from app.routers.playlists import _passes_strictness
 
 logger = logging.getLogger(__name__)
+
+# ListenBrainz tuning. The API budget is 30 requests/window at ~1 req/sec, so
+# seeds are capped and every response is cached before it is reused.
+LB_SEED_LIMIT = 20            # Labs similar-recordings calls per run
+LB_SEARCH_FALLBACK_CAP = 10   # Navidrome search3 calls for unresolved entries
+MIN_LB_LISTENS = 10           # below this, LB history is too thin to trust alone
+LB_RECENCY_DAYS = 7           # listening-history window
+LB_CANDIDATE_TARGET = 30      # enough history candidates to fill the 60% side
 
 # Reference to the global scheduler instance (set from main.py)
 _scheduler = None
@@ -86,6 +102,124 @@ def _cooldown_prefix_for(playlist_name: str) -> str:
     return m.group(1).strip() if m else playlist_name
 
 
+# ─── Playlist blending ──────────────────────────────────────────────────────
+
+def _dedupe(ids) -> list[str]:
+    """Preserve order, drop blanks and repeats."""
+    seen = set()
+    out = []
+    for sid in ids:
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _blend_tracks(
+    lb_similar,
+    nav_similar,
+    lfm_similar,
+    newest_ids,
+    target: int = 50,
+    newest_share: float = 0.4,
+    lb_share_of_history: float = 0.6,
+    rng=None,
+) -> list[str]:
+    """Blend similarity pools and recently-added tracks into a playlist.
+
+    Splits the target into a history side and a newest side (60/40 by default).
+    On the history side ListenBrainz is primary: it takes `lb_share_of_history`
+    of those slots and Navidrome similarity takes the rest. Last.fm is demoted
+    to a fill source — it only contributes when ListenBrainz cannot cover its
+    share, which is what keeps the app working on a Last.fm-free account.
+
+    Shortfalls on either side are filled from whatever is left before the
+    playlist is allowed to come out short, and the result is de-duplicated
+    across all pools. Pure function: no DB, no network, seeded `rng` for tests.
+    """
+    rng = rng or random
+
+    target = max(0, target)
+    newest_target = int(newest_share * target)
+    history_target = target - newest_target
+
+    lb_pool = _dedupe(lb_similar)
+    nav_pool = _dedupe(nav_similar)
+    lfm_pool = _dedupe(lfm_similar)
+    newest_pool = _dedupe(newest_ids)
+
+    for pool in (lb_pool, nav_pool, lfm_pool, newest_pool):
+        rng.shuffle(pool)
+
+    lb_target = int(lb_share_of_history * history_target)
+    nav_target = history_target - lb_target
+
+    picked: list[str] = []
+    seen: set[str] = set()
+
+    # Pass 1 — honour each pool's share, in priority order.
+    for pool, cap in ((lb_pool, lb_target), (nav_pool, nav_target)):
+        taken = 0
+        for sid in pool:
+            if taken >= cap or len(picked) >= history_target:
+                break
+            if sid in seen:
+                continue
+            picked.append(sid)
+            seen.add(sid)
+            taken += 1
+
+    # Pass 2 — cover a history shortfall: Last.fm first, then leftovers.
+    for pool in (lfm_pool, lb_pool, nav_pool):
+        for sid in pool:
+            if len(picked) >= history_target:
+                break
+            if sid in seen:
+                continue
+            picked.append(sid)
+            seen.add(sid)
+
+    chosen_newest: list[str] = []
+    for sid in newest_pool:
+        if len(chosen_newest) >= newest_target:
+            break
+        if sid in seen:
+            continue
+        chosen_newest.append(sid)
+        seen.add(sid)
+
+    # Pass 3 — a thin newest side is topped up from history rather than
+    # shipping a short playlist.
+    if len(chosen_newest) < newest_target:
+        gap = newest_target - len(chosen_newest)
+        for pool in (lb_pool, nav_pool, lfm_pool):
+            for sid in pool:
+                if gap <= 0:
+                    break
+                if sid in seen:
+                    continue
+                picked.append(sid)
+                seen.add(sid)
+                gap -= 1
+
+    final = picked + chosen_newest
+    if len(final) < target:
+        # Pass 4 — history could not cover its side (thin/absent listening
+        # history, e.g. a fresh ListenBrainz account). Top up from the newest
+        # leftovers so the playlist is full rather than mysteriously short.
+        for sid in newest_pool:
+            if len(final) >= target:
+                break
+            if sid in seen:
+                continue
+            final.append(sid)
+            seen.add(sid)
+
+    rng.shuffle(final)
+    return final[:target]
+
+
 # ─── DB-backed Navidrome Client ─────────────────────────────────────────────
 
 def _get_client_from_db() -> NavidromeClient:
@@ -105,6 +239,113 @@ def _get_client_from_db() -> NavidromeClient:
         )
     finally:
         db.close()
+
+
+# ─── ListenBrainz candidate gathering ───────────────────────────────────────
+
+def _entry_from_similar(row: dict) -> dict | None:
+    """Normalize a Labs similar-recordings row into a resolver entry."""
+    artist = (row.get("artist_credit_name") or row.get("artist_name") or "").strip()
+    title = (row.get("recording_name") or row.get("track_name") or "").strip()
+    mbid = (row.get("recording_mbid") or "").strip() or None
+    if not mbid and not (artist and title):
+        return None
+    return {"artist": artist, "title": title, "recording_mbid": mbid}
+
+
+async def _gather_lb_candidates(db: Session, client: NavidromeClient) -> list[dict]:
+    """Collect ListenBrainz-derived candidate entries, cheapest source first.
+
+    Order matters for the rate limit:
+      1. CF recommendations — one call for the whole listening profile, 24h cache
+      2. Labs similar-recordings per recent seed — one call each, 7d cache,
+         only while short of the candidate target
+
+    Recommendations carry only MBIDs; Labs rows carry names, so those can also
+    resolve through the text index. Returns [] when ListenBrainz is
+    unconfigured, has no history yet, or errors — the caller then falls back to
+    Last.fm.
+    """
+    cfg = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+    if cfg is None:
+        return []
+
+    lb = ListenBrainzClient(cfg.user_token, cfg.username)
+    try:
+        listens = await lb.get_recent_listens(days=LB_RECENCY_DAYS, count=200)
+        if not listens:
+            logger.info("ListenBrainz: no listens in the last %d days — falling back", LB_RECENCY_DAYS)
+            return []
+        if len(listens) < MIN_LB_LISTENS:
+            logger.info(
+                "ListenBrainz: only %d listen(s) (need %d) — treating history as thin",
+                len(listens), MIN_LB_LISTENS,
+            )
+
+        entries: list[dict] = []
+
+        recs = get_cached_recommendations(db)
+        if recs is None:
+            recs = await lb.get_recommendations()
+            put_recommendations(db, recs)
+        for rec in recs:
+            mbid = (rec.get("recording_mbid") or "").strip()
+            if mbid:
+                # No names available here; MBID-only entries resolve via the index.
+                entries.append({"artist": "", "title": "", "recording_mbid": mbid})
+
+        seeds_used = 0
+        for seed in listens:
+            if len(entries) >= LB_CANDIDATE_TARGET or seeds_used >= LB_SEED_LIMIT:
+                break
+            mbid = seed.get("recording_mbid")
+            if not mbid:
+                continue
+            similar = get_cached_similar(db, mbid)
+            if similar is None:
+                similar = await lb.get_similar_recordings(mbid)
+                put_similar(db, mbid, similar)
+            seeds_used += 1
+            for row in similar:
+                entry = _entry_from_similar(row)
+                if entry:
+                    entries.append(entry)
+
+        logger.info(
+            "ListenBrainz: %d candidate(s) from %d recommendation(s) + %d seed(s) "
+            "(of %d listens)",
+            len(entries), len(recs), seeds_used, len(listens),
+        )
+        return entries
+    except Exception as e:
+        logger.warning("ListenBrainz candidate gathering failed: %s", e)
+        return []
+    finally:
+        await lb.close()
+
+
+async def _resolve_via_search(client: NavidromeClient, unresolved, cap: int = LB_SEARCH_FALLBACK_CAP) -> list[str]:
+    """Last resort: ask Navidrome to search for entries nothing else matched.
+
+    Capped because each call hits Navidrome, and MBID-only entries (no names)
+    have nothing to search on anyway.
+    """
+    found: list[str] = []
+    for entry in unresolved[:cap]:
+        artist = (entry.get("artist") or "").strip()
+        title = (entry.get("title") or "").strip()
+        if not artist or not title:
+            continue
+        try:
+            result = await client.search(
+                f"{artist} {title}", artist_count=0, album_count=0, song_count=1,
+            )
+            songs = (result or {}).get("searchResult3", {}).get("song", [])
+            if songs:
+                found.append(songs[0]["id"])
+        except Exception as e:
+            logger.debug("search fallback failed for '%s - %s': %s", artist, title, e)
+    return found
 
 
 # ─── Job Functions ───────────────────────────────────────────────────────────
@@ -132,13 +373,44 @@ async def run_recency_trigger(trigger_id: int):
             blocked = _get_cooldown_track_ids(db, cooldown_prefix, days=2)
 
             # ── Gather candidate tracks ──
+            similar_from_lb: list[str] = []       # PRIMARY: ListenBrainz
             similar_from_nav: list[str] = []      # PATH A: Navidrome similar songs
             similar_from_lastfm: list[str] = []   # PATH B: Last.fm similar -> Navidrome lookup
             newest_ids: list[str] = []
 
-            # Try Last.fm-sourced similar tracks
-            lastfm_cfg = db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
-            if lastfm_cfg:
+            # ── ListenBrainz first — it is the primary history source ──
+            lb_entries = await _gather_lb_candidates(db, client)
+            if lb_entries:
+                lb_ids, unresolved = resolve_entries(db, lb_entries)
+                lb_ids.extend(await _resolve_via_search(client, unresolved))
+                similar_from_lb = [sid for sid in dict.fromkeys(lb_ids) if sid not in blocked]
+                logger.info(
+                    f"ListenBrainz: {len(lb_entries)} candidates -> "
+                    f"{len(similar_from_lb)} usable tracks"
+                )
+
+                # Navidrome's own similarity is local and free, so gather it for a
+                # few resolved seeds even when ListenBrainz covers the run. Without
+                # this the history side would be 100% ListenBrainz and the blend
+                # would lose its 40% "safe" Navidrome component.
+                for seed_id in similar_from_lb[:5]:
+                    try:
+                        nav_songs = await client.get_similar_songs2(seed_id, count=20)
+                    except Exception as e:
+                        logger.debug(f"Navidrome similarity failed for seed {seed_id}: {e}")
+                        continue
+                    similar_from_nav.extend(
+                        s["id"] for s in (nav_songs or []) if s.get("id")
+                    )
+                similar_from_nav = [
+                    sid for sid in dict.fromkeys(similar_from_nav) if sid not in blocked
+                ]
+
+            # ── Last.fm only when ListenBrainz produced nothing ──
+            lastfm_cfg = None if similar_from_lb else db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
+            if similar_from_lb:
+                logger.info("ListenBrainz covered this run — Last.fm skipped")
+            elif lastfm_cfg:
                 try:
                     lfm = LastfmClient(lastfm_cfg.api_key, lastfm_cfg.username)
                     try:
@@ -195,7 +467,7 @@ async def run_recency_trigger(trigger_id: int):
                 except Exception as e:
                     logger.warning(f"Last.fm fetch failed: {e}")
             else:
-                logger.info("Last.fm not configured - using 100% recently added tracks")
+                logger.info("Neither ListenBrainz nor Last.fm configured — using newest tracks only")
 
             # Apply 2-day cooldown: exclude tracks already in recent same-named playlists
             similar_from_nav = [sid for sid in similar_from_nav if sid not in blocked]
@@ -203,8 +475,12 @@ async def run_recency_trigger(trigger_id: int):
 
             # Recently added tracks (40% of playlist) with per-artist diversity
             newest_ids = []
+            # How many newest tracks to gather. With no listening history at all
+            # (fresh ListenBrainz account, Last.fm unset) a 20-track cap would be
+            # the entire playlist, so gather enough to still fill 50.
+            has_history = bool(similar_from_lb or similar_from_nav or similar_from_lastfm)
+            newest_target = 20 if has_history else 50
             artist_counts = {}  # track how many tracks we've taken per artist
-            newest_target = int(0.4 * 50)  # 20 from newest (defined early to avoid ordering issue)
             max_per_artist = 4  # cap per artist to spread variety
             try:
                 recent_albums = await client.get_album_list2(type_="newest", size=50)
@@ -226,7 +502,7 @@ async def run_recency_trigger(trigger_id: int):
                                 if current >= max_per_artist:
                                     continue
                                 # also avoid duplicates with similar pools
-                                if song_id in similar_from_nav or song_id in similar_from_lastfm:
+                                if song_id in similar_from_lb or song_id in similar_from_nav or song_id in similar_from_lastfm:
                                     continue
                                 newest_ids.append(song_id)
                                 artist_counts[artist_name] = current + 1
@@ -267,48 +543,21 @@ async def run_recency_trigger(trigger_id: int):
             # Apply cooldown to the assembled newest pool (in case the per-artist fallback added blocked IDs)
             newest_ids = [sid for sid in newest_ids if sid not in blocked]
 
-            # --- Build 50-track playlist with weighted blend ---
-            #  60% listening history / 40% newest
-            #  Within similar: 60% Last.fm / 40% Navidrome
-            target = 50
-            similar_total_target = int(0.6 * target)        # 30 from listening history
-            newest_target = int(0.4 * target)               # 20 from newest
-            lastfm_target = int(0.6 * similar_total_target) # 18 from Last.fm
-            nav_target = similar_total_target - lastfm_target # 12 from Navidrome
-
-            random.shuffle(similar_from_nav)
-            random.shuffle(similar_from_lastfm)
-            random.shuffle(newest_ids)
-
-            # Select up to targets from each pool
-            selected_nav = similar_from_nav[:nav_target]
-            selected_lastfm = similar_from_lastfm[:lastfm_target]
-            selected_newest = newest_ids[:newest_target]
-
-            # Build the final playlist with two fallback stages:
-            # 1) If a similar sub-pool is short, fill from the other similar sub-pool
-            # 2) If newest pool is short, fill from remaining similar tracks (keeps diversity)
-            similar_selected = selected_nav + selected_lastfm
-            if len(similar_selected) < nav_target + lastfm_target:
-                needed = (nav_target + lastfm_target) - len(similar_selected)
-                remaining_nav = [x for x in similar_from_nav if x not in selected_nav]
-                remaining_lastfm = [x for x in similar_from_lastfm if x not in selected_lastfm]
-                fill = (remaining_nav + remaining_lastfm)[:needed]
-                similar_selected.extend(fill)
-
-            # If newest pool is short, expand similar pool (keeps artist diversity high)
-            if len(selected_newest) < newest_target:
-                gap = newest_target - len(selected_newest)
-                remaining = [x for x in similar_from_nav + similar_from_lastfm
-                            if x not in similar_selected]
-                random.shuffle(remaining)
-                similar_selected.extend(remaining[:gap])
-
-            # Final assembly: similar + newest, interleaved
-            random.shuffle(similar_selected)
-            random.shuffle(selected_newest)
-            track_ids = (similar_selected + selected_newest)[:target]
-            random.shuffle(track_ids)
+            # --- Build the playlist: ListenBrainz-primary blend ---
+            # 60% listening history / 40% newest; within history ListenBrainz
+            # holds 60% and Navidrome similarity 40%, Last.fm only fills gaps.
+            track_ids = _blend_tracks(
+                lb_similar=similar_from_lb,
+                nav_similar=similar_from_nav,
+                lfm_similar=similar_from_lastfm,
+                newest_ids=newest_ids,
+                target=50,
+            )
+            logger.info(
+                f"Blend: {len(similar_from_lb)} LB + {len(similar_from_nav)} nav + "
+                f"{len(similar_from_lastfm)} lastfm history, {len(newest_ids)} newest "
+                f"-> {len(track_ids)} tracks"
+            )
             # ── Push to Navidrome ────────────────────────────────────────────
             # playlist_name was computed at the top of the function (used for cooldown prefix too)
 
