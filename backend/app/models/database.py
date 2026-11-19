@@ -112,6 +112,47 @@ class LastfmConfig(Base):
     username = Column(String, nullable=False)
 
 
+class ListenbrainzConfig(Base):
+    """Singleton table for ListenBrainz credentials.
+
+    Primary listening-history source. Last.fm (LastfmConfig) remains as a
+    fallback, consulted only when ListenBrainz yields nothing.
+    """
+    __tablename__ = "listenbrainz_config"
+    id = Column(Integer, primary_key=True, default=1)  # singleton row
+    user_token = Column(String, nullable=False)
+    username = Column(String, nullable=False)
+    api_base = Column(String, default="https://api.listenbrainz.org")
+    labs_api_base = Column(String, default="https://labs.api.listenbrainz.org")
+    enabled = Column(Boolean, default=True)
+    last_connect_check = Column(DateTime, nullable=True)
+
+
+class LbRecommendationCache(Base):
+    """Cached user-level collaborative-filtering recommendations.
+
+    The CF endpoint is expensive (1 call, 30/window budget) and only changes on
+    a weekly cadence upstream, so it is refetched on a 24h TTL.
+    """
+    __tablename__ = "lb_recommendation_cache"
+    id = Column(Integer, primary_key=True, default=1)  # singleton row
+    mbids = Column(Text, nullable=False)  # JSON [{recording_mbid, score, latest_listened_at}]
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LbSimilarCache(Base):
+    """Cached per-recording Labs similar-recordings responses.
+
+    The Labs endpoint accepts exactly one recording MBID per call, so with ~20
+    seeds per run this cache is what keeps the call count sane. 7d TTL.
+    """
+    __tablename__ = "lb_similar_cache"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_mbid = Column(String, nullable=False, index=True)
+    payload = Column(Text, nullable=False)  # JSON list
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+
+
 def get_db():
     db = SessionLocal()
     try:
