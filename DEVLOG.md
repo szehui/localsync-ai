@@ -133,3 +133,116 @@ docker compose up -d
 ### Issues encountered
 - `NavidromeClient` has `close()` not `aclose()` — fixed scheduler service calls
 - Patch tool mangled file structure on first rewrite attempt — used write_file instead
+
+---
+
+## 2026-11-18 — ListenBrainz as Primary Data Source
+
+### Why
+Last.fm is introducing API charges. Listening history and similarity had to move
+to a free source, with Last.fm kept as a fallback rather than a dependency.
+
+### Architecture
+ListenBrainz is now primary for both history and similarity; Last.fm only runs
+when ListenBrainz yields nothing usable.
+
+- **`services/listenbrainz.py`** — read-only client. Rate limited at 1 req/sec
+  and honors `X-RateLimit-*` (30/window). Three quirks handled explicitly:
+  - `204 No Content` returns an **empty body, not JSON** — treated as `[]`
+    without parsing (a naive `json.load` crashes here)
+  - listens nest the MBID under `track_metadata.mbid_mapping`, falling back to
+    `additional_info`
+  - Labs `similar-recordings` takes **one** MBID per request; batching returns 400
+- **`services/lb_cache.py`** — recommendations cached 24h, Labs similar 7d per
+  recording MBID. Empty lists are cached deliberately: `[]` means the dataset has
+  no neighbours, which is stable and stops a 20-seed run repaying 20 calls daily.
+- **`services/resolver.py`** — maps ListenBrainz → Navidrome song IDs with **no
+  API calls**, via a dual local index.
+
+### The MBID coverage problem
+Live measurement over 120 albums / 1,548 songs: **50.2%** of tracks carry
+`musicBrainzId`, and tagging is *per album* — 59 albums fully tagged, 61 fully
+untagged, **0 mixed**. An MBID index alone therefore leaves half the library
+unreachable, in whole-album chunks.
+
+Confirmed on the full production library after deploy: **15,473 of 27,945 tracks
+(55.4%)** carry an MBID, and the per-album shape holds exactly — of 2,934 albums,
+**1,321 fully tagged, 1,613 fully untagged, 0 mixed**.
+
+Fix: `tracks.search_key` — a normalized `<artist>|<title>` build at sync time
+(`build_search_key`, NFKD → ASCII → lowercase → strip non-alphanumerics).
+Resolution tries MBID first, then text, **per entry**: an MBID ListenBrainz knows
+whose library copy is an untagged rip still resolves through text. Unresolved
+entries get a capped (10) `search3` fallback.
+
+Measured hit rate on the live library (1,000-track samples):
+- MBID known to ListenBrainz: **99.8% resolved**
+- text-only (no MBID): **99.4% resolved**
+- realistic mix: **99.8% resolved**
+
+Verified end-to-end with real listens: 4 of 4 scrobbles resolved to Navidrome
+track IDs — two via MBID, two via the text index (because ListenBrainz had no
+MBID mapping for them). That split is precisely the case the dual resolver exists
+for.
+
+Verified live on the production DB: **21,999/21,999** tracks have a `search_key`
+after backfill.
+
+### Blend refactor
+The recency trigger's inline 60/40 selection became `_blend_tracks()` — pure,
+seedable, tested for short pools, duplicates, and thin history. History side is
+60% ListenBrainz / 40% Navidrome similarity; Last.fm only fills gaps. Heavy
+rotation got the same treatment per seed, sourcing LB similarity via each track's
+recorded MBID.
+
+### Bootstrap mode
+The account had **0 listens** at migration time (scrobbling was just enabled in
+Navidrome), so ListenBrainz is a data desert until history accrues. The newest
+pool target is now driven by how much history actually resolved: below 30 history
+tracks it gathers up to 50 newest so a "50-track" mix is not silently 23 tracks.
+`MIN_LB_LISTENS = 10` marks the thin-history threshold in logs.
+
+### Bugs found while wiring this up
+- `similar_from_nav` lived *inside* the Last.fm block — a successful ListenBrainz
+  run silently lost Navidrome similarity entirely
+- Heavy rotation indexed `search3.view`'s response envelope as a list
+  (`nav_hits[0]["id"]`), raising `KeyError` that the surrounding `except`
+  swallowed — Last.fm-sourced similarity had never contributed anything there
+- With no history at all, the newest gather capped at 20, shipping a 20-track mix
+- **Stale library rows (found on the production DB).** 20,880 of 48,825 track
+  rows were four months old, from song IDs Navidrome had since reassigned —
+  verified server-side: of 9 old IDs on a sample album, **0 still existed**, while
+  both current IDs did. Cause: the track pass iterated every album row in the DB
+  instead of the albums Navidrome just returned, and nothing deleted rows that
+  vanished. This poisoned the resolver: 17,955 duplicate `search_key` values
+  (36.8% of the table) meant ambiguity was routine and dead IDs were in the mix.
+  `full_sync` now prunes unseen tracks/albums/artists (batched, and refuses to
+  run on an empty seen-set so a failed fetch cannot wipe the library). After the
+  fix: 27,945 tracks, duplicates down to 994 (3.6%).
+
+### Tests
+93 → 217 passing (124 new). Coverage added for the 204 path, rate limiting and
+quota headers, cache TTLs and empty-list caching, resolver ambiguity
+determinism, blend edge cases, source-routing (Last.fm not contacted when
+ListenBrainz covers a run), and sync pruning.
+
+### Deployment & live verification (2026-11-19)
+- Rebuilt and restarted the container; startup migration added both columns,
+  backfilled `search_key` for **21,999/21,999** tracks, and created the cache
+  tables and indexes
+- Full resync populated `recording_mbid` (27,945 tracks over 2,934 albums) and
+  pruned 20,880 stale tracks / 981 albums / 60 artists
+- ListenBrainz live: token valid, **4 listens** recorded (scrobbling confirmed
+  working), 0 CF recommendations (needs more history), bogus-MBID request
+  correctly returns `[]`
+- Recency trigger run end-to-end: reached ListenBrainz, logged the thin-history
+  warning, fell through to Last.fm, and pushed a 50-track
+  "Fresh Discoveries 2026-11-19" to Navidrome
+- Expected steady state once history accrues: ~2 calls/run warm (listens +
+  recommendations, both cached), ~22 on a cold run — within the 30/window budget
+
+### Operational notes
+- `tracks.recording_mbid` requires a **full library resync** after deploy; the
+  startup migration only backfills `search_key`
+- Config via Automation Hub → ListenBrainz (username + user token), plus a
+  "Check" action that reports the account listen count and warns at 0

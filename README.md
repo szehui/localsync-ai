@@ -32,6 +32,24 @@ On first launch, configure your Navidrome connection:
 - Username: your Navidrome username
 - Password: your Navidrome password
 
+### Listening history (ListenBrainz)
+
+ListenBrainz is the primary source for listening history and track similarity.
+Last.fm is optional and only used as a fallback when ListenBrainz returns nothing.
+
+1. Enable scrobbling to ListenBrainz in Navidrome (user profile → External
+   Services → paste your ListenBrainz user token).
+2. In Automation Hub, enter your ListenBrainz **username** and **user token**.
+3. Press **Check** to verify — it reports the account's listen count and warns
+   when the account has no history yet.
+
+Notes:
+- The API is read-only; nothing is ever submitted to ListenBrainz.
+- A fresh account has no collaborative-filtering data. Until history builds,
+  playlists are built from Navidrome similarity and recently-added tracks
+  ("bootstrap mode"). This is expected, not an error.
+- Listen to music for a few weeks and recommendations begin to personalise.
+
 ## Project Structure
 
 ```
