@@ -235,3 +235,128 @@ def test_lidarr_init():
 def test_lidarr_headers():
     svc = LidarrService("http://localhost:8686", "my-api-key")
     assert svc.headers["X-Api-Key"] == "my-api-key"
+
+
+# ---- Title / artist cleaning (YouTube noise) ----
+
+def test_clean_track_title_strips_remaster():
+    from app.services.youtube_music import clean_track_title
+
+    assert clean_track_title("Hotel California (2013 Remaster)") == "Hotel California"
+    assert clean_track_title("Hotel California [2023 Remaster]") == "Hotel California"
+    assert clean_track_title("Walk This Way (7\" Single Version)") == "Walk This Way"
+    assert clean_track_title("Separate Ways (Worlds Apart) [2023 Remaster]") == \
+        "Separate Ways (Worlds Apart)"
+    assert clean_track_title("Juke Box Hero (Foreigner 4 Stereo Remix)") == "Juke Box Hero"
+
+
+def test_clean_track_title_keeps_meaningful_titles():
+    from app.services.youtube_music import clean_track_title
+
+    # A leading parenthetical is part of the title, not edition noise.
+    assert clean_track_title("(Don't Fear) The Reaper") == "(Don't Fear) The Reaper"
+    assert clean_track_title("Bohemian Rhapsody") == "Bohemian Rhapsody"
+
+
+def test_clean_artist_name_strips_channel_noise():
+    from app.services.youtube_music import clean_artist_name
+
+    assert clean_artist_name("Queen Official") == "Queen"
+    assert clean_artist_name("Whitesnake TV") == "Whitesnake"
+    assert clean_artist_name("Thomas Dolby Official") == "Thomas Dolby"
+    assert clean_artist_name("BTS - Topic") == "BTS"
+    assert clean_artist_name("Survivor Band") == "Survivor"
+    assert clean_artist_name("HouseOfPainTV") == "HouseOfPain"
+    assert clean_artist_name("SirMixAlotChannel") == "SirMixAlot"
+
+
+def test_clean_artist_name_preserves_real_names():
+    from app.services.youtube_music import clean_artist_name
+
+    # "The Band" is an artist, not a channel suffix.
+    assert clean_artist_name("The Band") == "The Band"
+    assert clean_artist_name("Aerosmith") == "Aerosmith"
+    assert clean_artist_name("") == ""
+
+
+# ---- Artist gate: a right title with the wrong artist is a wrong song ----
+
+def test_artist_gate_rejects_wrong_artist():
+    from app.routers.youtube_import import _artist_agrees
+
+    # The false positives seen on a real playlist.
+    assert not _artist_agrees("Kool & The Gang", "They Might Be Giants")
+    assert not _artist_agrees("Kris Kross", "Rihanna")
+    assert not _artist_agrees("Eve 6", "Sara Bareilles")
+
+
+def test_artist_gate_accepts_correct_artist():
+    from app.routers.youtube_import import _artist_agrees
+
+    assert _artist_agrees("Queen", "Queen")
+    assert _artist_agrees("Journey", "Journey")
+    # Channel-cleaned forms must agree with the library's punctuation.
+    assert _artist_agrees("TheCranberries", "The Cranberries")
+
+
+def test_artist_gate_passes_unknown_artist():
+    from app.routers.youtube_import import _artist_agrees
+
+    # No artist to compare means a title match is all the evidence there is.
+    assert _artist_agrees("", "Rihanna")
+
+
+def test_cleaned_title_scores_against_remastered_library_copy():
+    """A YT title with a remaster suffix must still match the clean library copy."""
+    from app.routers.youtube_import import _match_score
+    from app.services.youtube_music import clean_track_title
+
+    yt = clean_track_title("Separate Ways (Worlds Apart) [2023 Remaster]")
+    lib = clean_track_title("Separate Ways (Worlds Apart)")
+    assert _match_score(yt, "journey", lib, "Journey") == 1.0
+
+    yt2 = clean_track_title("Juke Box Hero")
+    lib2 = clean_track_title("Juke Box Hero (Foreigner 4 Stereo Remix)")
+    assert _match_score(yt2, "Foreigner", lib2, "Foreigner") == 1.0
+
+
+def test_preference_prefers_studio_over_live():
+    """Cleaning ties "Song" with "Song (Live...)"; the tie-break must pick studio.
+
+    Raw string similarity is the WRONG signal here: "2001 Remaster" resembles
+    "Live; 2010 Remaster" more than it resembles the bare title, so a raw-score
+    tie-break would deliberately choose the live take.
+    """
+    from app.routers.youtube_import import _match_score, _preference_key
+    from app.services.youtube_music import clean_track_title
+
+    yt_title, yt_artist = "Hungry Like the Wolf (2001 Remaster)", "Duran Duran"
+    studio = "Hungry Like the Wolf"
+    live = "Hungry Like the Wolf (Live; 2010 Remaster)"
+
+    clean_studio = clean_track_title(studio)
+    clean_live = clean_track_title(live)
+    assert clean_studio == clean_live == "Hungry Like the Wolf"  # the tie
+
+    raw_studio = _match_score(yt_title, yt_artist, studio, "Duran Duran")
+    raw_live = _match_score(yt_title, yt_artist, live, "Duran Duran")
+    assert raw_live > raw_studio  # proves raw score is misleading
+
+    pref_studio = _preference_key(studio, clean_studio, raw_studio)
+    pref_live = _preference_key(live, clean_live, raw_live)
+    assert pref_studio > pref_live
+
+
+def test_preference_falls_back_to_raw_score():
+    """When both copies carry noise, prefer the closer raw title."""
+    from app.routers.youtube_import import _preference_key
+    from app.services.youtube_music import clean_track_title
+
+    yt = "Go Your Own Way (2004 Remaster)"
+    same = "Go Your Own Way (2004 Remaster)"
+    other = "Go Your Own Way (2001 Remaster)"
+
+    clean_same = clean_track_title(same)
+    clean_other = clean_track_title(other)
+    # Neither needed no cleaning, so raw proximity decides.
+    assert _preference_key(same, clean_same, 1.0) > _preference_key(other, clean_other, 0.8)

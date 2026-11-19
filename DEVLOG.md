@@ -280,3 +280,41 @@ Paste a YouTube Music playlist URL and the app will:
   `fresh_discoveries_draft.py`, `update_newest.py`, `backup_scheduler.py`) and
   checked-in backups (`database.py.bak`, `lastfm.py.backup`) were left out of the
   merge — git history already covers those.
+
+### Matching fixes found by testing a real playlist (2026-11-19)
+
+Tested against a real 69-track playlist ("Break out the boom box"). The first run
+matched 31 and looked like a 55% failure rate — but checking the library database
+directly showed most "misses" were correct: the library genuinely lacks that
+80s/90s rock (Soft Cell, Survivor, Queen's studio version, Def Leppard, ZZ Top,
+Billy Idol, Cranberries and more are simply absent). The real defects were
+narrower, and all four were fixed:
+
+1. **Search queried the raw YouTube title.** Navidrome's index doesn't match
+   "(2013 Remaster)" / "[2023 Remaster]" suffixes, so owned songs returned *zero*
+   candidates. Titles are now cleaned before searching *and* on both sides when
+   scoring, so a library copy carrying its own suffix
+   ("Juke Box Hero (Foreigner 4 Stereo Remix)") still scores 1.0.
+   Recovered: Separate Ways (Worlds Apart), Hungry Like the Wolf, Go Your Own Way,
+   Juke Box Hero.
+2. **Channel names were treated as artists.** "Queen Official", "Whitesnake TV",
+   "HouseOfPainTV" and "SirMixAlotChannel" were compared against real artist names
+   (destroying the 30% artist weight) and would have been sent to Lidarr as lookup
+   terms. Now stripped — including glued forms — while protecting real names like
+   "The Band".
+3. **A right title with the wrong artist counted as a match.** "Celebration" by
+   Kool & The Gang resolved to They Might Be Giants; "Jump" by Kris Kross to
+   Rihanna; "Inside Out" by Eve 6 to Sara Bareilles. A title-heavy blend (0.7/0.3)
+   lets an exact title alone clear 0.75. Added an artist gate at 0.45 similarity:
+   no artist agreement, no match — the track is reported missing instead, which is
+   honest, and Run-D.M.C.'s "Walk This Way" no longer silently becomes the
+   Aerosmith original.
+4. **Live takes won ties.** After cleaning, "Song", "Song (Live; 2010 Remaster)"
+   and "Song (2001 Remaster)" all score 1.0 and the first from search won. Raw
+   string similarity is the *wrong* tie-break — "2001 Remaster" resembles
+   "Live; 2010 Remaster" more than it resembles the bare title, so it actively
+   favoured the live copy. Now prefers the candidate needing no cleaning.
+
+Result: 32 matched, **0 wrong-artist matches** (was 4), 4 false negatives recovered,
+studio versions preferred. 37 tracks reported missing, of which ~35 are verified
+absent from the library.

@@ -7,6 +7,71 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# Trailing edition/version noise that carries no identity for search or scoring.
+# "Hotel California (2013 Remaster)" and "Hotel California" are the same song to
+# Navidrome's search index only if the parenthetical is gone.
+_VERSION_NOISE_RE = re.compile(
+    r"""\s*[\(\[]\s*[^\)\]]*?
+        (remaster|remastered|version|edit|mix|mono|stereo|deluxe|
+         bonus|explicit|clean|anniversary|digital|single|radio)
+        [^\)\]]*?[\)\]]\s*$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# YouTube channel names are not artist names. These suffixes are added by labels
+# and auto-generated "- Topic" channels, and they wreck artist similarity scoring
+# ("Queen Official" vs "Queen" only scores 0.63).
+_TOPIC_SUFFIX_RE = re.compile(r"\s*[-\u2013\u2014]\s*topic\s*$", re.IGNORECASE)
+_CHANNEL_SUFFIX_RE = re.compile(
+    r"\s*\b(vevo|official|tv|channel)\b\.?\s*$", re.IGNORECASE
+)
+# Suffixes glued to the name with no separator, e.g. "HouseOfPainTV".
+_GLUED_SUFFIX_RE = re.compile(r"(?<=[a-z])(vevo|official|tv|channel)\s*$", re.IGNORECASE)
+
+
+def clean_track_title(title: str) -> str:
+    """Strip trailing edition/version noise from a track title.
+
+    Used for both the YouTube title and the library title when searching and
+    scoring, so "(2013 Remaster)" on one side and "(Album Version)" on the other
+    don't prevent a match. Falls back to the raw title if cleaning empties it.
+    """
+    if not title:
+        return ""
+    cleaned = title.strip()
+    for _ in range(3):  # e.g. "... (Album Version) [Remastered]"
+        stripped = _VERSION_NOISE_RE.sub("", cleaned).strip()
+        if stripped == cleaned:
+            break
+        cleaned = stripped
+    cleaned = cleaned.strip(" -\u2013\u2014")
+    return cleaned or title.strip()
+
+
+def clean_artist_name(name: str) -> str:
+    """Strip YouTube channel noise from an artist name.
+
+    Handles auto-generated "- Topic" channels plus label channel suffixes such as
+    "Official", "TV", "VEVO", "Channel", and the glued forms ("HouseOfPainTV").
+    Conservative by design: it only removes a trailing "Band" when a real name
+    remains, so "The Band" survives intact.
+    """
+    if not name:
+        return ""
+    cleaned = _TOPIC_SUFFIX_RE.sub("", name.strip())
+    for _ in range(3):
+        before = cleaned
+        cleaned = _CHANNEL_SUFFIX_RE.sub("", cleaned)
+        cleaned = _GLUED_SUFFIX_RE.sub("", cleaned)
+        cleaned = cleaned.strip(" -\u2013\u2014")
+        if cleaned == before:
+            break
+    band = re.search(r"\s+band\s*$", cleaned, re.IGNORECASE)
+    if band and len(cleaned[: band.start()].strip()) >= 4:
+        cleaned = cleaned[: band.start()].strip()
+    return cleaned or name.strip()
+
+
 
 def _parse_artist_title(title: str) -> tuple[str, str]:
     """Try to extract artist and track from a YouTube video title.
@@ -163,6 +228,11 @@ class YouTubeMusicService:
                     # e.g. "BTS - Topic" → "BTS"
                     artist = re.sub(r"\s*-\s*Topic$", "", channel, flags=re.IGNORECASE)
                     artist = artist.strip()
+
+                # Channel names are not artist names: "Queen Official",
+                # "HouseOfPainTV" and "SirMixAlotChannel" would otherwise be sent
+                # to Lidarr as lookup terms and would wreck similarity scoring.
+                artist = clean_artist_name(artist)
 
                 tracks.append({
                     'title': track_title,

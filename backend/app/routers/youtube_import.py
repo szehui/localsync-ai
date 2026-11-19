@@ -17,7 +17,11 @@ from app.models.schemas_youtube import (
     LidarrConfigResponse,
 )
 from app.models.database import LidarrConfig
-from app.services.youtube_music import youtube_music_service
+from app.services.youtube_music import (
+    youtube_music_service,
+    clean_artist_name,
+    clean_track_title,
+)
 from app.services.lidarr import LidarrService
 from app.services.navidrome import NavidromeClient
 from app.routers.auth import get_navidrome_client, get_current_user
@@ -80,6 +84,51 @@ def _match_score(title1: str, artist1: str, title2: str, artist2: str) -> float:
 
     # Take the better of the two strategies
     return max(seq_score, tok_score)
+
+
+# A correct title with the wrong artist is a wrong song: "Celebration" by Kool &
+# The Gang must not resolve to They Might Be Giants just because the title is
+# exact. Require some artist agreement whenever we know the artist at all.
+_ARTIST_GATE = 0.45
+
+
+def _artist_similarity(artist1: str, artist2: str) -> float:
+    """Similarity of two artist names, tolerant of word splits and stop words."""
+    norm1 = _normalize_text(artist1)
+    norm2 = _normalize_text(artist2)
+    seq = SequenceMatcher(None, norm1, norm2).ratio()
+    tok1 = _tokenize(artist1)
+    tok2 = _tokenize(artist2)
+    if not tok1 or not tok2:
+        tok = 1.0 if norm1 == norm2 else 0.0
+    else:
+        tok = len(tok1 & tok2) / len(tok1 | tok2)
+    return max(seq, tok)
+
+
+def _artist_agrees(yt_artist: str, lib_artist: str) -> bool:
+    """True when the library artist plausibly matches the YouTube artist.
+
+    Unknown YouTube artists pass: with no artist to compare there is nothing to
+    gate on, and a title match is the only evidence available.
+    """
+    if not (yt_artist or "").strip():
+        return True
+    return _artist_similarity(yt_artist, lib_artist) >= _ARTIST_GATE
+
+
+def _preference_key(raw_title: str, clean_title: str, raw_score: float) -> tuple:
+    """Rank two equally-scoring candidates.
+
+    Cleaning makes "Song", "Song (Live; 2010 Remaster)" and "Song (2001 Remaster)"
+    all score 1.0, so the importer can otherwise drop a live take into a playlist
+    when a studio copy exists. Preferring the candidate that needed no cleaning is
+    the reliable signal: a raw string comparison actually favours the live copy,
+    because "2001 Remaster" resembles "Live; 2010 Remaster" more than it
+    resembles the bare title.
+    """
+    needed_no_cleaning = 1.0 if (raw_title or "").strip() == (clean_title or "").strip() else 0.0
+    return (needed_no_cleaning, raw_score)
 
 
 def _get_lidarr_service(db: Session) -> Optional[LidarrService]:
@@ -151,12 +200,18 @@ async def import_youtube_playlist(
         try:
             # Search strategy: title-only first (most flexible), then
             # combined, then artist-only. Verify artist match via fuzzy scoring.
+            #
+            # Queries use the CLEANED title: Navidrome's search index rarely
+            # matches "(2013 Remaster)" / "[2023 Remaster]" suffixes, so searching
+            # the raw YouTube title returns nothing for songs we own.
             songs: List[dict] = []
+            search_title = clean_track_title(track["title"])
+            search_artist = clean_artist_name(track["artist"])
 
             # Strategy 1: title-only (best for artist name variations)
-            if track["title"]:
+            if search_title:
                 title_result = await client.search(
-                    query=track["title"],
+                    query=search_title,
                     artist_count=0,
                     album_count=0,
                     song_count=20,
@@ -164,9 +219,9 @@ async def import_youtube_playlist(
                 songs = title_result.get("searchResult3", {}).get("song", [])
 
             # Strategy 2: combined artist+title
-            if not songs and track["artist"] and track["title"]:
+            if not songs and search_artist and search_title:
                 combo_result = await client.search(
-                    query=f"{track['artist']} {track['title']}",
+                    query=f"{search_artist} {search_title}",
                     artist_count=0,
                     album_count=0,
                     song_count=10,
@@ -174,9 +229,9 @@ async def import_youtube_playlist(
                 songs = combo_result.get("searchResult3", {}).get("song", [])
 
             # Strategy 3: artist-only (broad, last resort)
-            if not songs and track["artist"]:
+            if not songs and search_artist:
                 artist_result = await client.search(
-                    query=track["artist"],
+                    query=search_artist,
                     artist_count=5,
                     album_count=0,
                     song_count=20,
@@ -186,16 +241,36 @@ async def import_youtube_playlist(
             # Find best match across all candidates
             best_match = None
             best_score = 0.0
+            best_pref = (-1.0, -1.0)
 
             for song in songs:
+                song_title = clean_track_title(song.get("title", ""))
+                song_artist = clean_artist_name(song.get("artist", ""))
                 score = _match_score(
-                    track["title"],
-                    track["artist"],
-                    song.get("title", ""),
-                    song.get("artist", ""),
+                    search_title,
+                    search_artist,
+                    song_title,
+                    song_artist,
                 )
-                if score > best_score and score >= 0.75:
+                if score < 0.75:
+                    continue
+                # A perfect title with an unrelated artist is a different song.
+                if not _artist_agrees(search_artist, song_artist):
+                    continue
+                # Among equally-scoring copies (studio vs live vs remaster),
+                # prefer the one that needed no cleaning.
+                raw_title = song.get("title", "")
+                pref = _preference_key(
+                    raw_title,
+                    song_title,
+                    _match_score(track["title"], track["artist"],
+                                 raw_title, song.get("artist", "")),
+                )
+                if score > best_score or (
+                    score == best_score and pref > best_pref
+                ):
                     best_score = score
+                    best_pref = pref
                     best_match = song
 
             if best_match:
@@ -210,7 +285,7 @@ async def import_youtube_playlist(
                 )
             else:
                 artist_name = track["artist"]
-                if artist_name not in missing_artists:
+                if artist_name and artist_name not in missing_artists:
                     missing_artists[artist_name] = {
                         "artist_name": artist_name,
                         "album_name": track["album"],
