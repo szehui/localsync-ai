@@ -409,6 +409,11 @@ export function AutomationHub() {
                       → <span className="text-gray-400">{trigger.playlist_name}</span>
                     </p>
                   )}
+                  {trigger.trigger_type === 'recency' && (
+                    <p className="text-xs text-gray-600 mt-1">
+                      Prunes dated playlists older than 14 days after each run
+                    </p>
+                  )}
                   <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">
                     {trigger.last_run && <span>Last run: {formatDate(trigger.last_run)}</span>}
                     {trigger.next_run && (

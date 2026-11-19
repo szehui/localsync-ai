@@ -37,6 +37,10 @@ LB_CANDIDATE_TARGET = 30      # enough history candidates to fill the 60% side
 # Reference to the global scheduler instance (set from main.py)
 _scheduler = None
 
+# Dated playlists (e.g. 'Fresh Discoveries YYYY-MM-DD') pile up one per day, so
+# the recency trigger prunes ones past this window once it writes a new one.
+PLAYLIST_RETENTION_DAYS = 14
+
 
 def init_scheduler(scheduler):
     """Called from main.py to give us a reference to the running scheduler."""
@@ -100,6 +104,114 @@ def _cooldown_prefix_for(playlist_name: str) -> str:
     """
     m = re.match(r'^(.*?)\s*\d{4}-\d{2}-\d{2}$', playlist_name)
     return m.group(1).strip() if m else playlist_name
+
+
+# ─── Retention / pruning ────────────────────────────────────────────────────
+
+def _playlist_date(playlist_name: str | None) -> datetime | None:
+    """Parse the YYYY-MM-DD suffix of a dated playlist name.
+
+    Returns None when the name carries no parseable date (custom static names,
+    or a malformed suffix). Callers treat that as "not eligible for pruning".
+    """
+    m = re.search(r'(\d{4}-\d{2}-\d{2})$', (playlist_name or "").strip())
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def _stale_playlist_rows(db: Session, reference_name: str, retention_days: int) -> list:
+    """Return GeneratedPlaylist rows for the same dated series that are too old.
+
+    Age comes from the date in the playlist name, not `updated_at` — the
+    recency trigger rewrites today's playlist, so `updated_at` says nothing
+    about how old the *list* is. Only names in the same series (sharing the
+    reference name's prefix, date suffix stripped) are considered, so custom
+    and undated playlists are never touched.
+    """
+    reference_date = _playlist_date(reference_name)
+    if reference_date is None:
+        return []
+
+    prefix = _cooldown_prefix_for(reference_name)
+    if not prefix:
+        # Degenerate name (bare date) — an empty prefix would match every
+        # playlist, so refuse to prune rather than wipe the library.
+        return []
+    cutoff = reference_date - timedelta(days=retention_days)
+
+    rows = (
+        db.query(GeneratedPlaylist)
+        .filter(GeneratedPlaylist.name.like(f"{prefix}%"))
+        .all()
+    )
+    stale = []
+    for row in rows:
+        name = (row.name or "").strip()
+        if not name.startswith(prefix):
+            continue  # LIKE is case-insensitive-ish in SQLite; be strict here
+        date = _playlist_date(name)
+        if date is None or date >= cutoff:
+            continue
+        stale.append(row)
+    return stale
+
+
+async def _prune_old_dated_playlists(
+    db: Session,
+    client: NavidromeClient,
+    reference_name: str,
+    retention_days: int = PLAYLIST_RETENTION_DAYS,
+) -> int:
+    """Delete playlists in the same dated series older than `retention_days`.
+
+    Called after a new dated playlist is published. Deletion happens in
+    Navidrome first; the DB row is only removed once that succeeded (or there
+    was nothing to delete), so a failed API call leaves the row behind for the
+    next run to retry. Per-row failures are logged and skipped — pruning must
+    never take down a run that already produced a playlist.
+
+    Returns the number of playlists removed.
+    """
+    stale = _stale_playlist_rows(db, reference_name, retention_days)
+    if not stale:
+        return 0
+
+    # One listing call so rows whose playlist was already removed by hand are
+    # dropped cleanly — Subsonic raises on deletePlaylist with an unknown id,
+    # which would otherwise leave the row retrying every run forever.
+    existing_ids: set[str] | None = None
+    if any(row.navidrome_playlist_id for row in stale):
+        try:
+            existing_ids = {
+                str(p["id"]) for p in (await client.get_playlists() or []) if p.get("id")
+            }
+        except Exception as e:
+            logger.warning(
+                f"Prune: could not list Navidrome playlists ({e}) — deleting blind"
+            )
+            existing_ids = None
+
+    pruned = 0
+    for row in stale:
+        name = row.name
+        pid = row.navidrome_playlist_id
+        if pid and (existing_ids is None or str(pid) in existing_ids):
+            try:
+                await client.delete_playlist(pid)
+            except Exception as e:
+                logger.warning(
+                    f"Prune: could not delete Navidrome playlist '{name}' "
+                    f"({pid}): {e} — keeping row for retry"
+                )
+                continue
+        db.delete(row)
+        pruned += 1
+        logger.info(f"Pruned stale playlist '{name}' (older than {retention_days} days)")
+    return pruned
 
 
 # ─── Playlist blending ──────────────────────────────────────────────────────
@@ -627,6 +739,20 @@ async def run_recency_trigger(trigger_id: int):
                     track_ids=json.dumps(track_ids),
                 )
                 db.add(playlist)
+
+            # ── Prune stale playlists in this dated series ───────────────────
+            # A dated series ('Fresh Discoveries YYYY-MM-DD') grows by one
+            # playlist a day, so drop anything past the retention window once
+            # the new one is safely published. Never fatal to the run.
+            try:
+                pruned = await _prune_old_dated_playlists(db, client, playlist_name)
+                if pruned:
+                    logger.info(
+                        f"Pruned {pruned} playlist(s) older than "
+                        f"{PLAYLIST_RETENTION_DAYS} days"
+                    )
+            except Exception as e:
+                logger.warning(f"Playlist pruning failed (new playlist was created): {e}")
 
             trigger.last_run = datetime.utcnow()
             db.commit()

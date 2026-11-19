@@ -337,3 +337,37 @@ Run against that real 69-track YouTube Music playlist through the deployed API:
 
 Absent artists stay flagged `missing` in the result so the UI can surface them,
 while already-monitored artists are not re-added.
+
+---
+
+## 2026-11-19 — Playlist Retention (prune stale Fresh Discoveries)
+
+### What it does
+After the recency trigger publishes a dated playlist (`Fresh Discoveries
+YYYY-MM-DD`), it now prunes playlists in that same series that are more than
+**two weeks old** — deleted from Navidrome and from the `generated_playlists`
+table. Before this, one playlist per day accumulated forever.
+
+### Design
+- Age comes from the **date in the playlist name**, not `updated_at`. The
+  trigger rewrites today's playlist on every run, so `updated_at` says nothing
+  about how old the *list* is.
+- Only names sharing the reference name's prefix (date stripped) are
+  eligible — `More Like This: …`, `Weekend Mix`, imported YouTube playlists and
+  undated custom names are never touched. A trigger with a custom static name
+  (no date suffix) has no series to age against and prunes nothing.
+- `PLAYLIST_RETENTION_DAYS = 14` in `services/scheduler.py`. Cutoff is
+  `reference_date - 14d`, exclusive: with today at 2026-11-19, 2026-11-05 is
+  kept and 2026-11-04 is removed.
+- Navidrome is deleted from **first**; the DB row is only dropped once that
+  succeeded, so a failed API call leaves the row for the next run to retry
+  rather than orphaning a playlist in Navidrome with no record of it.
+- Pruning is wrapped so it can never fail a run that already produced a
+  playlist: per-row errors are logged and skipped, and the whole step is in a
+  try/except that logs a warning.
+
+### Tests
+241 passing (14 new in `test_triggers.py`): date parsing (including impossible
+dates and nulls), window boundary at exactly 14 days, other series untouched,
+undated rows inside the prefix untouched, Navidrome failure keeps the row,
+rows without a Navidrome id dropped from the DB only, and a no-op run.

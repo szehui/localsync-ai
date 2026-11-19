@@ -13,7 +13,11 @@ from app.services.scheduler import (
     pause_trigger_job,
     resume_trigger_job,
     TRIGGER_JOBS,
+    PLAYLIST_RETENTION_DAYS,
     _get_cooldown_track_ids,
+    _playlist_date,
+    _prune_old_dated_playlists,
+    _stale_playlist_rows,
 )
 from app.models.database import SmartTrigger, GeneratedPlaylist
 
@@ -280,6 +284,201 @@ class TestRecencyTriggerCooldownPrefix:
         assert _cooldown_prefix_for("") == ""
 
 
+class TestPlaylistDateParsing:
+    """_playlist_date pulls the YYYY-MM-DD suffix out of a dated playlist name."""
+
+    def test_parses_default_recency_name(self):
+        assert _playlist_date("Fresh Discoveries 2026-11-05") == datetime(2026, 11, 5)
+
+    def test_parses_name_with_extra_whitespace(self):
+        assert _playlist_date("Fresh Discoveries  2026-11-05 ") == datetime(2026, 11, 5)
+
+    def test_undated_name_returns_none(self):
+        assert _playlist_date("Weekend Mix") is None
+
+    def test_null_name_returns_none(self):
+        assert _playlist_date(None) is None
+
+    def test_impossible_date_returns_none(self):
+        assert _playlist_date("Fresh Discoveries 2026-13-45") is None
+
+
+def _retention_db(rows):
+    """db mock for the single-filter prune query, with delete() recorded."""
+    db = MagicMock()
+    db.query.return_value.filter.return_value.all.return_value = rows
+    db.delete = MagicMock()
+    return db
+
+
+def _retention_row(name, navidrome_playlist_id=None):
+    row = MagicMock(spec=GeneratedPlaylist)
+    row.name = name
+    row.navidrome_playlist_id = navidrome_playlist_id
+    return row
+
+
+class TestPlaylistPruning:
+    """The recency trigger prunes dated playlists past the retention window.
+
+    'Fresh Discoveries' is dated, so one playlist accumulates per day. After a
+    new one is written, anything older than PLAYLIST_RETENTION_DAYS (14) must be
+    removed from Navidrome and from the generated_playlists table.
+    """
+
+    def test_retention_window_is_two_weeks(self):
+        assert PLAYLIST_RETENTION_DAYS == 14
+
+    def test_stale_rows_are_the_ones_past_the_window(self):
+        rows = [
+            _retention_row("Fresh Discoveries 2026-11-19"),  # today — keep
+            _retention_row("Fresh Discoveries 2026-11-05"),  # exactly 14d — keep
+            _retention_row("Fresh Discoveries 2026-11-04"),  # 15d — prune
+            _retention_row("Fresh Discoveries 2026-10-01"),  # 49d — prune
+        ]
+        stale = _stale_playlist_rows(
+            _retention_db(rows), "Fresh Discoveries 2026-11-19", PLAYLIST_RETENTION_DAYS
+        )
+        assert [r.name for r in stale] == [
+            "Fresh Discoveries 2026-11-04",
+            "Fresh Discoveries 2026-10-01",
+        ]
+
+    def test_other_series_untouched(self):
+        """A dated playlist from a different series must survive."""
+        rows = [
+            _retention_row("Fresh Discoveries 2026-10-01"),
+            _retention_row("Weekend Mix 2026-10-01"),
+        ]
+        stale = _stale_playlist_rows(
+            _retention_db(rows), "Fresh Discoveries 2026-11-19", PLAYLIST_RETENTION_DAYS
+        )
+        assert [r.name for r in stale] == ["Fresh Discoveries 2026-10-01"]
+
+    def test_custom_undated_reference_name_prunes_nothing(self):
+        """A trigger with a custom static name has no series to age against."""
+        rows = [_retention_row("Fresh Discoveries 2026-10-01")]
+        assert _stale_playlist_rows(_retention_db(rows), "My Mix", 14) == []
+
+    def test_bare_date_reference_name_prunes_nothing(self):
+        """An empty prefix would match every playlist — refuse instead."""
+        rows = [_retention_row("Fresh Discoveries 2026-10-01")]
+        assert _stale_playlist_rows(_retention_db(rows), "2026-11-19", 14) == []
+
+    def test_undated_row_inside_series_prefix_untouched(self):
+        rows = [
+            _retention_row("Fresh Discoveries 2026-10-01"),
+            _retention_row("Fresh Discoveries archive"),
+        ]
+        stale = _stale_playlist_rows(
+            _retention_db(rows), "Fresh Discoveries 2026-11-19", PLAYLIST_RETENTION_DAYS
+        )
+        assert [r.name for r in stale] == ["Fresh Discoveries 2026-10-01"]
+
+    @pytest.mark.asyncio
+    async def test_prune_deletes_in_navidrome_and_db(self):
+        rows = [
+            _retention_row("Fresh Discoveries 2026-10-01", "pid-old"),
+            _retention_row("Fresh Discoveries 2026-10-02", "pid-older"),
+        ]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock(
+            return_value=[{"id": "pid-old"}, {"id": "pid-older"}]
+        )
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 2
+        deleted_pids = [c.args[0] for c in client.delete_playlist.await_args_list]
+        assert deleted_pids == ["pid-old", "pid-older"]
+        assert db.delete.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_playlist_already_gone_from_navidrome_drops_row(self):
+        """A hand-deleted playlist must not leave a row retrying forever."""
+        rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-gone")]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock(return_value=[{"id": "something-else"}])
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 1
+        client.delete_playlist.assert_not_called()
+        db.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_listing_failure_still_attempts_deletes(self):
+        """A failed getPlaylists must not block pruning."""
+        rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-old")]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock(side_effect=RuntimeError("nav down"))
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 1
+        client.delete_playlist.assert_called_once_with("pid-old")
+
+    @pytest.mark.asyncio
+    async def test_navidrome_failure_keeps_row_for_retry(self):
+        """A failed API delete must not drop the DB row (else it's orphaned forever)."""
+        rows = [
+            _retention_row("Fresh Discoveries 2026-10-01", "pid-bad"),
+            _retention_row("Fresh Discoveries 2026-10-02", "pid-good"),
+        ]
+        db = _retention_db(rows)
+
+        async def delete_playlist(pid):
+            if pid == "pid-bad":
+                raise RuntimeError("navidrome 500")
+            return {}
+
+        client = MagicMock()
+        client.get_playlists = AsyncMock(
+            return_value=[{"id": "pid-bad"}, {"id": "pid-good"}]
+        )
+        client.delete_playlist = delete_playlist
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 1
+        assert [c.args[0] for c in db.delete.call_args_list] == [rows[1]]
+
+    @pytest.mark.asyncio
+    async def test_row_without_navidrome_id_dropped_from_db_only(self):
+        rows = [_retention_row("Fresh Discoveries 2026-10-01", None)]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock()
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 1
+        client.get_playlists.assert_not_called()
+        client.delete_playlist.assert_not_called()
+        db.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_prune_is_a_noop(self):
+        db = _retention_db([_retention_row("Fresh Discoveries 2026-11-18", "pid-y")])
+        client = MagicMock()
+        client.get_playlists = AsyncMock()
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 0
+        client.get_playlists.assert_not_called()
+        client.delete_playlist.assert_not_called()
+        db.delete.assert_not_called()
+
+
 class TestRecencyTriggerCooldownIntegration:
     """End-to-end: the recency trigger must exclude tracks that were in the
     last 2 days' 'Fresh Discoveries' playlists, so the same song doesn't
@@ -329,6 +528,8 @@ class TestRecencyTriggerCooldownIntegration:
                 # The cooldown helper (mocked) and same-name lookup both query this.
                 m.filter.return_value.first.return_value = existing
                 m.filter.return_value.filter.return_value.all.return_value = [existing]
+                # Retention pruning uses a single filter (name LIKE prefix).
+                m.filter.return_value.all.return_value = [existing]
             else:
                 m.filter.return_value.first.return_value = None
             return m
