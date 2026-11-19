@@ -348,6 +348,41 @@ async def _resolve_via_search(client: NavidromeClient, unresolved, cap: int = LB
     return found
 
 
+async def _lb_similar_for_track(
+    db: Session,
+    lb: ListenBrainzClient,
+    client: NavidromeClient,
+    song_id: str,
+    limit: int = 20,
+) -> list[str]:
+    """ListenBrainz similar tracks for one local track, resolved to Navidrome ids.
+
+    Requires the track's recording MBID from the local index (captured at sync
+    time), so this costs one Labs call at most — cached for 7 days.
+    """
+    row = db.query(Track).filter(Track.id == song_id).first()
+    mbid = (getattr(row, "recording_mbid", None) or "").strip() if row else ""
+    if not mbid:
+        return []
+
+    try:
+        rows = get_cached_similar(db, mbid)
+        if rows is None:
+            rows = await lb.get_similar_recordings(mbid)
+            put_similar(db, mbid, rows)
+    except Exception as e:
+        logger.warning("ListenBrainz similarity failed for track %s: %s", song_id, e)
+        return []
+
+    entries = [entry for entry in (_entry_from_similar(r) for r in rows) if entry]
+    if not entries:
+        return []
+
+    ids, unresolved = resolve_entries(db, entries)
+    ids.extend(await _resolve_via_search(client, unresolved))
+    return list(dict.fromkeys(ids))[:limit]
+
+
 # ─── Job Functions ───────────────────────────────────────────────────────────
 
 async def run_recency_trigger(trigger_id: int):
@@ -475,11 +510,16 @@ async def run_recency_trigger(trigger_id: int):
 
             # Recently added tracks (40% of playlist) with per-artist diversity
             newest_ids = []
-            # How many newest tracks to gather. With no listening history at all
-            # (fresh ListenBrainz account, Last.fm unset) a 20-track cap would be
-            # the entire playlist, so gather enough to still fill 50.
-            has_history = bool(similar_from_lb or similar_from_nav or similar_from_lastfm)
-            newest_target = 20 if has_history else 50
+            # How many newest tracks to gather. Thin history — a fresh
+            # ListenBrainz account, or Last.fm unset — must not shrink the
+            # playlist, so gather enough newest tracks to fill it outright.
+            history_available = len(similar_from_lb) + len(similar_from_nav) + len(similar_from_lastfm)
+            newest_target = 20 if history_available >= LB_CANDIDATE_TARGET else 50
+            if history_available < LB_CANDIDATE_TARGET:
+                logger.info(
+                    f"Thin history ({history_available} history tracks) — bootstrap mode: "
+                    f"gathering up to {newest_target} newest tracks"
+                )
             artist_counts = {}  # track how many tracks we've taken per artist
             max_per_artist = 4  # cap per artist to spread variety
             try:
@@ -611,7 +651,16 @@ async def run_heavy_rotation_trigger(trigger_id: int):
 
         threshold = trigger.threshold or 5
         client = _get_client_from_db()
-        # Initialize Last.fm client for diverse similarity lookups
+        # ListenBrainz client (primary similarity source) — one instance for the
+        # whole run so its rate limiter is shared across seeds.
+        lb_client = None
+        try:
+            lb_cfg = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+            if lb_cfg:
+                lb_client = ListenBrainzClient(lb_cfg.user_token, lb_cfg.username)
+        except Exception:
+            pass
+        # Last.fm client for diverse similarity lookups (fallback only)
         lastfm_client = None
         try:
             lastfm_cfg = db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
@@ -644,8 +693,23 @@ async def run_heavy_rotation_trigger(trigger_id: int):
             for track_id, track_name, track_artist in list(zip(hot_track_ids, hot_track_names, hot_track_artists))[:5]:
                 try:
                     # ── Gather candidate tracks ──────────────────────────────────────
+                    similar_from_lb: list[str] = []       # PRIMARY: ListenBrainz
                     similar_from_nav: list[str] = []      # PATH A: Navidrome similar songs
                     similar_from_lastfm: list[str] = []   # PATH B: Last.fm similar songs (cached)
+
+                    # PRIMARY: ListenBrainz similar-recordings for this seed
+                    if lb_client is not None:
+                        try:
+                            similar_from_lb = await _lb_similar_for_track(
+                                db, lb_client, client, track_id, limit=20,
+                            )
+                            if similar_from_lb:
+                                logger.debug(
+                                    f"ListenBrainz similarity for '{track_name}': "
+                                    f"{len(similar_from_lb)} tracks"
+                                )
+                        except Exception as e:
+                            logger.warning(f"ListenBrainz similarity failed for '{track_name}': {e}")
 
                     # PATH A: Navidrome similar songs
                     try:
@@ -656,8 +720,8 @@ async def run_heavy_rotation_trigger(trigger_id: int):
                     except Exception as e:
                         logger.warning(f"Navidrome similarity failed for '{track_name}': {e}")
 
-                    # PATH B: Last.fm similarity (cached) -> Navidrome lookup
-                    if lastfm_client:
+                    # PATH B: Last.fm similarity — fallback only, skipped when LB covered it
+                    if lastfm_client and not similar_from_lb:
                         try:
                             lfm_similar = await lastfm_client.get_similar(track_artist, track_name, limit=50)
                             if lfm_similar:
@@ -666,14 +730,20 @@ async def run_heavy_rotation_trigger(trigger_id: int):
                                     lfm_title = lfm_track.get("name", "")
                                     if lfm_artist and lfm_title:
                                         try:
-                                            nav_hits = await client.search(
+                                            search_result = await client.search(
                                                 query=f'{lfm_artist} {lfm_title}',
                                                 artist_count=0,
                                                 album_count=0,
                                                 song_count=1,
                                             )
-                                            if nav_hits:
-                                                nav_id = nav_hits[0]["id"]
+                                            # search3.view returns the response envelope,
+                                            # not a bare list — indexing it raised KeyError
+                                            # and the except below silently skipped it.
+                                            hits = (search_result or {}).get(
+                                                "searchResult3", {}
+                                            ).get("song", [])
+                                            if hits:
+                                                nav_id = hits[0]["id"]
                                                 if nav_id not in similar_from_nav and nav_id not in similar_from_lastfm:
                                                     similar_from_lastfm.append(nav_id)
                                         except Exception:
@@ -682,50 +752,28 @@ async def run_heavy_rotation_trigger(trigger_id: int):
                         except Exception as e:
                             logger.warning(f"Last.fm similarity failed for '{track_name}': {e}")
 
-                    # If we got nothing from either source, skip this seed
-                    if not similar_from_nav and not similar_from_lastfm:
+                    # If we got nothing from any source, skip this seed
+                    if not similar_from_lb and not similar_from_nav and not similar_from_lastfm:
                         logger.warning(f"No similarity results for '{track_name}' from any source")
                         continue
 
-                    # Blend the two sources: prefer Last.fm for diversity, fallback to Navidrome
-                    # We want 20 tracks total per seed track
+                    # Blend per-seed sources: ListenBrainz primary (60%),
+                    # Navidrome the safe remainder (40%), Last.fm only fills gaps.
                     target_per_seed = 20
-                    lastfm_weight = 0.6   # 60% from Last.fm (more diverse)
-                    nav_weight = 0.4      # 40% from Navidrome (more conservative)
+                    sim_ids = _blend_tracks(
+                        lb_similar=similar_from_lb,
+                        nav_similar=similar_from_nav,
+                        lfm_similar=similar_from_lastfm,
+                        newest_ids=[],
+                        target=target_per_seed,
+                        newest_share=0.0,
+                    )
 
-                    lastfm_target = int(target_per_seed * lastfm_weight)   # 12
-                    nav_target = target_per_seed - lastfm_target          # 8
-
-                    # Shuffle both lists for variety
-                    random.shuffle(similar_from_nav)
-                    random.shuffle(similar_from_lastfm)
-
-                    # Take from each source
-                    selected_nav = similar_from_nav[:nav_target]
-                    selected_lastfm = similar_from_lastfm[:lastfm_target]
-
-                    # If one source is short, fill from the other
-                    combined = selected_nav + selected_lastfm
-                    if len(combined) < target_per_seed:
-                        needed = target_per_seed - len(combined)
-                        # Fill from remaining Navidrome tracks
-                        if len(similar_from_nav) > len(selected_nav):
-                            remaining_nav = similar_from_nav[len(selected_nav):]
-                            take = min(needed, len(remaining_nav))
-                            combined.extend(remaining_nav[:take])
-                            needed -= take
-                        # Fill from remaining Last.fm tracks
-                        if needed > 0 and len(similar_from_lastfm) > len(selected_lastfm):
-                            remaining_lastfm = similar_from_lastfm[len(selected_lastfm):]
-                            take = min(needed, len(remaining_lastfm))
-                            combined.extend(remaining_lastfm[:take])
-
-                    # Final trim and shuffle
-                    final_similar = combined[:target_per_seed]
-                    random.shuffle(final_similar)
-                    sim_ids = final_similar
-
-                    logger.info(f"Seed '{track_name}': {len(selected_lastfm)} Last.fm + {len(selected_nav)} Navidrome = {len(sim_ids)} tracks")
+                    logger.info(
+                        f"Seed '{track_name}': {len(similar_from_lb)} LB + "
+                        f"{len(similar_from_nav)} Navidrome + "
+                        f"{len(similar_from_lastfm)} Last.fm -> {len(sim_ids)} tracks"
+                    )
                     playlist_name = trigger.playlist_name or f"More Like This: {track_name}"
 
                     existing = db.query(GeneratedPlaylist).filter(
@@ -761,6 +809,8 @@ async def run_heavy_rotation_trigger(trigger_id: int):
         finally:
             if lastfm_client:
                 await lastfm_client.close()
+            if lb_client is not None:
+                await lb_client.close()
             await client.close()
     except Exception as e:
         db.rollback()
