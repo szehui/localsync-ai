@@ -371,3 +371,28 @@ table. Before this, one playlist per day accumulated forever.
 dates and nulls), window boundary at exactly 14 days, other series untouched,
 undated rows inside the prefix untouched, Navidrome failure keeps the row,
 rows without a Navidrome id dropped from the DB only, and a no-op run.
+
+### Bug: first live run orphaned 78 playlists (2026-11-20)
+
+The 09:00 run reported **103 playlists pruned** but only **25 `deletePlaylist`
+calls** were made. 78 playlists were still live in Navidrome afterwards, with
+their `generated_playlists` rows already gone — invisible to the app and to any
+future prune.
+
+Cause: the first version reconciled by `navidrome_playlist_id`. For older
+entries those stored IDs no longer matched Navidrome's (Navidrome reissues
+playlist IDs after a metadata reset), so the code saw "ID not in the remote
+list", concluded the playlist had been deleted by hand, and dropped the row
+**without ever calling delete**. The 25 that worked were the recent rows whose
+IDs happened to still be valid.
+
+Fix: **Navidrome's own playlist list is now the source of truth, matched by
+name.** Every remote playlist named `<prefix> YYYY-MM-DD` past the window is
+deleted by its *actual* ID, whether or not a DB row exists; DB rows are dropped
+only once their playlist is confirmed gone. A `getPlaylists` failure falls back
+to deleting via stored IDs (unchanged behavior, name match cleans up next run).
+Name is stable across Navidrome resets; the ID is only a hint.
+
+Tests: 248 passing. Added the regression case explicitly (stale stored id, live
+playlist under a new id → must still be deleted), a remote playlist with no DB
+row at all, and recent/recent-remote/other-series guards that must not fire.

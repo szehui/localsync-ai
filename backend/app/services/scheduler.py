@@ -160,6 +160,15 @@ def _stale_playlist_rows(db: Session, reference_name: str, retention_days: int) 
     return stale
 
 
+def _is_stale_series_name(name: str | None, prefix: str, cutoff: datetime) -> bool:
+    """True when `name` belongs to the dated series and predates `cutoff`."""
+    name = (name or "").strip()
+    if not name.startswith(prefix):
+        return False
+    date = _playlist_date(name)
+    return date is not None and date < cutoff
+
+
 async def _prune_old_dated_playlists(
     db: Session,
     client: NavidromeClient,
@@ -168,38 +177,55 @@ async def _prune_old_dated_playlists(
 ) -> int:
     """Delete playlists in the same dated series older than `retention_days`.
 
-    Called after a new dated playlist is published. Deletion happens in
-    Navidrome first; the DB row is only removed once that succeeded (or there
-    was nothing to delete), so a failed API call leaves the row behind for the
-    next run to retry. Per-row failures are logged and skipped — pruning must
-    never take down a run that already produced a playlist.
+    Navidrome's own playlist list is the source of truth, matched **by name**:
+    stored `navidrome_playlist_id` values drift over time (a Navidrome metadata
+    reset reissues IDs), so trusting them silently orphans playlists that are
+    still live — the row gets dropped while the playlist stays in Navidrome.
+    Name is stable; the id is a hint at best.
 
-    Returns the number of playlists removed.
+    A DB row is only dropped once its playlist is confirmed gone (deleted now,
+    or absent from the listing). Deletes are attempted first so a failed API
+    call keeps the row for the next run to retry. Pruning must never take down
+    a run that already produced a playlist, so every failure is logged and
+    skipped rather than raised.
+
+    Returns the number of Navidrome playlists removed.
     """
-    stale = _stale_playlist_rows(db, reference_name, retention_days)
-    if not stale:
+    reference_date = _playlist_date(reference_name)
+    if reference_date is None:
         return 0
+    prefix = _cooldown_prefix_for(reference_name)
+    if not prefix:
+        # Degenerate name (bare date) — an empty prefix matches every playlist.
+        return 0
+    cutoff = reference_date - timedelta(days=retention_days)
 
-    # One listing call so rows whose playlist was already removed by hand are
-    # dropped cleanly — Subsonic raises on deletePlaylist with an unknown id,
-    # which would otherwise leave the row retrying every run forever.
-    existing_ids: set[str] | None = None
-    if any(row.navidrome_playlist_id for row in stale):
-        try:
-            existing_ids = {
-                str(p["id"]) for p in (await client.get_playlists() or []) if p.get("id")
-            }
-        except Exception as e:
-            logger.warning(
-                f"Prune: could not list Navidrome playlists ({e}) — deleting blind"
-            )
-            existing_ids = None
+    stale_rows = _stale_playlist_rows(db, reference_name, retention_days)
 
+    remote: list[dict] | None
+    try:
+        remote = list(await client.get_playlists() or [])
+    except Exception as e:
+        logger.warning(
+            f"Prune: could not list Navidrome playlists ({e}) — "
+            f"falling back to stored ids"
+        )
+        remote = None
+
+    deleted_ids: set[str] = set()
+    failed_ids: set[str] = set()
     pruned = 0
-    for row in stale:
-        name = row.name
-        pid = row.navidrome_playlist_id
-        if pid and (existing_ids is None or str(pid) in existing_ids):
+
+    if remote is not None:
+        # Anything in Navidrome named '<prefix> YYYY-MM-DD' past the window goes,
+        # whether or not the DB still has a row for it.
+        victims = [
+            p for p in remote
+            if p.get("id") and _is_stale_series_name(p.get("name"), prefix, cutoff)
+        ]
+        for p in victims:
+            pid = str(p["id"])
+            name = (p.get("name") or "").strip()
             try:
                 await client.delete_playlist(pid)
             except Exception as e:
@@ -207,10 +233,49 @@ async def _prune_old_dated_playlists(
                     f"Prune: could not delete Navidrome playlist '{name}' "
                     f"({pid}): {e} — keeping row for retry"
                 )
+                failed_ids.add(pid)
                 continue
+            deleted_ids.add(pid)
+            pruned += 1
+            logger.info(f"Pruned stale playlist '{name}' (older than {retention_days} days)")
+    else:
+        # No listing available: delete via stored ids and let name-matching on
+        # the next successful run clean up anything the ids missed.
+        for row in stale_rows:
+            pid = row.navidrome_playlist_id
+            if not pid or str(pid) in failed_ids:
+                continue
+            try:
+                await client.delete_playlist(str(pid))
+            except Exception as e:
+                logger.warning(
+                    f"Prune: could not delete Navidrome playlist '{row.name}' "
+                    f"({pid}): {e} — keeping row for retry"
+                )
+                failed_ids.add(str(pid))
+                continue
+            deleted_ids.add(str(pid))
+            pruned += 1
+            logger.info(
+                f"Pruned stale playlist '{row.name}' (older than {retention_days} days)"
+            )
+
+    # Drop stale DB rows, plus any row pointing at a playlist we just removed.
+    # A row is kept when its playlist is still live in Navidrome (delete failed).
+    live_names = {
+        (p.get("name") or "").strip()
+        for p in (remote or [])
+        if p.get("id") and str(p["id"]) not in deleted_ids
+    }
+    seen: set[int] = set()
+    for row in stale_rows:
+        if id(row) in seen:
+            continue
+        seen.add(id(row))
+        if remote is not None and (row.name or "").strip() in live_names:
+            continue
         db.delete(row)
-        pruned += 1
-        logger.info(f"Pruned stale playlist '{name}' (older than {retention_days} days)")
+
     return pruned
 
 

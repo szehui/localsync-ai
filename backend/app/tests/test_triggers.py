@@ -383,9 +383,11 @@ class TestPlaylistPruning:
         ]
         db = _retention_db(rows)
         client = MagicMock()
-        client.get_playlists = AsyncMock(
-            return_value=[{"id": "pid-old"}, {"id": "pid-older"}]
-        )
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-old", "name": "Fresh Discoveries 2026-10-01"},
+            {"id": "pid-older", "name": "Fresh Discoveries 2026-10-02"},
+            {"id": "pid-new", "name": "Fresh Discoveries 2026-11-19"},
+        ])
         client.delete_playlist = AsyncMock()
 
         pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
@@ -396,22 +398,79 @@ class TestPlaylistPruning:
         assert db.delete.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_playlist_already_gone_from_navidrome_drops_row(self):
-        """A hand-deleted playlist must not leave a row retrying forever."""
-        rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-gone")]
+    async def test_stale_stored_id_still_deletes_playlist_found_by_name(self):
+        """Regression: Navidrome reissued the playlist's id.
+
+        The DB row's navidrome_playlist_id no longer exists, but a playlist with
+        the same *name* is live in Navidrome. Matching on the stored id only
+        would drop the row and leave the playlist in Navidrome forever — this is
+        the bug that orphaned 78 playlists on 2026-11-20.
+        """
+        rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-dead")]
         db = _retention_db(rows)
         client = MagicMock()
-        client.get_playlists = AsyncMock(return_value=[{"id": "something-else"}])
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-reissued", "name": "Fresh Discoveries 2026-10-01"},
+        ])
         client.delete_playlist = AsyncMock()
 
         pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
 
         assert pruned == 1
+        client.delete_playlist.assert_called_once_with("pid-reissued")
+        db.delete.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_prunes_remote_playlist_with_no_db_row(self):
+        """A stale playlist in Navidrome with no DB row must still be deleted."""
+        db = _retention_db([])  # nothing tracked locally
+        client = MagicMock()
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-untracked", "name": "Fresh Discoveries 2026-08-01"},
+        ])
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 1
+        client.delete_playlist.assert_called_once_with("pid-untracked")
+
+    @pytest.mark.asyncio
+    async def test_recent_remote_playlist_not_deleted(self):
+        """Playlists inside the window stay, even with a stale-looking DB id."""
+        rows = [_retention_row("Fresh Discoveries 2026-11-18", "pid-x")]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-18", "name": "Fresh Discoveries 2026-11-18"},
+        ])
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 0
+        client.delete_playlist.assert_not_called()
+        db.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_row_dropped_when_playlist_genuinely_gone(self):
+        """Hand-deleted in Navidrome → row must not retry forever."""
+        rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-gone")]
+        db = _retention_db(rows)
+        client = MagicMock()
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-other", "name": "Weekend Mix"},
+        ])
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 0
         client.delete_playlist.assert_not_called()
         db.delete.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_listing_failure_still_attempts_deletes(self):
+    async def test_listing_failure_falls_back_to_stored_ids(self):
         """A failed getPlaylists must not block pruning."""
         rows = [_retention_row("Fresh Discoveries 2026-10-01", "pid-old")]
         db = _retention_db(rows)
@@ -423,6 +482,7 @@ class TestPlaylistPruning:
 
         assert pruned == 1
         client.delete_playlist.assert_called_once_with("pid-old")
+        db.delete.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_navidrome_failure_keeps_row_for_retry(self):
@@ -439,9 +499,10 @@ class TestPlaylistPruning:
             return {}
 
         client = MagicMock()
-        client.get_playlists = AsyncMock(
-            return_value=[{"id": "pid-bad"}, {"id": "pid-good"}]
-        )
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-bad", "name": "Fresh Discoveries 2026-10-01"},
+            {"id": "pid-good", "name": "Fresh Discoveries 2026-10-02"},
+        ])
         client.delete_playlist = delete_playlist
 
         pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
@@ -454,13 +515,12 @@ class TestPlaylistPruning:
         rows = [_retention_row("Fresh Discoveries 2026-10-01", None)]
         db = _retention_db(rows)
         client = MagicMock()
-        client.get_playlists = AsyncMock()
+        client.get_playlists = AsyncMock(return_value=[])
         client.delete_playlist = AsyncMock()
 
         pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
 
-        assert pruned == 1
-        client.get_playlists.assert_not_called()
+        assert pruned == 0
         client.delete_playlist.assert_not_called()
         db.delete.assert_called_once()
 
@@ -468,15 +528,33 @@ class TestPlaylistPruning:
     async def test_nothing_to_prune_is_a_noop(self):
         db = _retention_db([_retention_row("Fresh Discoveries 2026-11-18", "pid-y")])
         client = MagicMock()
-        client.get_playlists = AsyncMock()
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-y", "name": "Fresh Discoveries 2026-11-18"},
+        ])
         client.delete_playlist = AsyncMock()
 
         pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
 
         assert pruned == 0
-        client.get_playlists.assert_not_called()
         client.delete_playlist.assert_not_called()
         db.delete.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_other_series_in_navidrome_untouched(self):
+        db = _retention_db([])
+        client = MagicMock()
+        client.get_playlists = AsyncMock(return_value=[
+            {"id": "pid-mix", "name": "Weekend Mix"},
+            {"id": "pid-mlt", "name": "More Like This: Canned Heat"},
+            {"id": "pid-noDate", "name": "Fresh Discoveries archive"},
+            {"id": "pid-bad", "name": "Fresh Discoveries 2026-13-99"},
+        ])
+        client.delete_playlist = AsyncMock()
+
+        pruned = await _prune_old_dated_playlists(db, client, "Fresh Discoveries 2026-11-19")
+
+        assert pruned == 0
+        client.delete_playlist.assert_not_called()
 
 
 class TestRecencyTriggerCooldownIntegration:
