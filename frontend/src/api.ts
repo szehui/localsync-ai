@@ -20,6 +20,8 @@ import type {
   TokenResponse,
   UserResponse,
   ConnectionStatus,
+  DiscoveryFeed,
+  DiscoveryAddResult,
 } from './types';
 
 const BASE = '/api';
@@ -243,5 +245,28 @@ export const api = {
   clearLidarrConfig: () =>
     request<{ configured: boolean }>('/youtube-import/lidarr-config', {
       method: 'DELETE',
+    }),
+
+  // Discovery feed
+  getDiscoveryFeed: (limit?: number) => {
+    const qs = limit ? `?limit=${limit}` : '';
+    return request<DiscoveryFeed>(`/discovery/${qs}`);
+  },
+
+  refreshDiscovery: () =>
+    request<{ status: string; message: string }>('/discovery/refresh', {
+      method: 'POST',
+    }),
+
+  dismissDiscoveryOffer: (offerId: number) =>
+    request<{ status: string; message: string }>(
+      `/discovery/${offerId}/dismiss`,
+      { method: 'POST' },
+    ),
+
+  addDiscoveryOfferToLidarr: (offerId: number, search = false) =>
+    request<DiscoveryAddResult>(`/discovery/${offerId}/add`, {
+      method: 'POST',
+      body: JSON.stringify({ search }),
     }),
 };

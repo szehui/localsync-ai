@@ -396,3 +396,71 @@ Name is stable across Navidrome resets; the ID is only a hint.
 Tests: 248 passing. Added the regression case explicitly (stale stored id, live
 playlist under a new id → must still be deleted), a remote playlist with no DB
 row at all, and recent/recent-remote/other-series guards that must not fire.
+
+---
+
+## 2026-11-24 — Discovery Feed (recommendations you don't own)
+
+### What it does
+New **Discover** tab. It inverts the resolver: a candidate that fails to resolve
+to a local song id used to be a failure, and is now the product. Top-played
+library tracks become seeds, each seed is expanded through ListenBrainz Labs
+`similar-recordings`, and every neighbour is triaged against the library into
+three buckets — **owned** (dropped), **gap fill** (artist present, this
+recording missing) and **new artist** (nothing by them in the library).
+
+Each feed row is an artist with its best album, the seed tracks that explain
+why it appeared ("because you played The White Stripes — Fell in Love With a
+Girl"), and an **Add album** button that queues just that album in Lidarr.
+
+### Design
+- **Labs, not CF.** The collaborative-filtering endpoint returns recording MBIDs
+  only — no artist or title — so its output can neither be triaged by artist nor
+  shown in the UI without a MusicBrainz enrichment pass at 1 req/s. Labs gives
+  names, a score and a natural explanation, and needs no auth.
+- **Adaptive seed scanning.** Roughly half of all recording MBIDs have *no* Labs
+  neighbours. A fixed seed count therefore produced a feed dominated by
+  whichever two or three seeds happened to have data — the first live run showed
+  20 of 25 rows explained by a single White Stripes track. `gather_labs_candidates`
+  now takes a wide pool (30, max 60) and stops early once `TARGET_CANDIDATES=300`
+  have accumulated from at least `MIN_LIVE_SEEDS=6` distinct seeds, capped at
+  `MAX_SEED_CALLS=45`. Live effect: 8 live seeds instead of 4, 135 artists
+  instead of 40.
+- **`discovery_offers` is the dedupe ledger.** Unique on `recording_mbid`;
+  `upsert_offers` bumps `last_seen`/score and merges evidence instead of
+  re-inserting, and never resurrects a `dismissed` or `saved` row. Skipping
+  already-seen recordings is what keeps the feed from re-offering the same
+  albums every refresh.
+- **One row per artist in the UI**, but offers are stored per recording (capped
+  at `MAX_OFFERS_PER_ARTIST=4`) so the evidence survives and repeated
+  co-occurrence raises an artist's score.
+- **Lidarr: `POST /api/v1/album`, not `/artist`.** Verified against 3.1.6.5079 —
+  the album endpoint auto-creates a missing artist. The trap: Lidarr monitors
+  the artist's **entire discography** regardless of `addOptions.monitor`, which
+  only gates the artist flag. So every add is followed by a mandatory
+  `PUT /api/v1/album/monitor` collapse that unmonitors the siblings. `search`
+  defaults to **false** — discovery adds a silent wishlist entry, it does not
+  grab.
+- **Re-adding is a no-op.** `find_album_by_release_group` runs first, so an
+  already-present album returns `already_present` instead of a 400.
+
+### Verified against the real library
+- Cold run: 30 seeds scanned, 18 API calls, 306 candidates, 213 offers.
+- Warm run: 4 API calls (7d `lb_similar_cache`), 71 new offers, 135 artists.
+- **0 owned tracks leaked into the feed** (asserted directly against
+  `tracks.recording_mbid`, not eyeballed).
+
+### Tests
+290 passing (39 new). Coverage: artist-name folding, seed selection
+(one-per-artist, play-count order, MBID required), candidate dedupe and score
+merging, all three triage buckets including the case where an unknown MBID on a
+known artist must be a *gap fill* and not "owned", adaptive early-stop vs
+`max_calls`, upsert never resurrecting dismissed rows, feed grouping/ranking,
+and the Lidarr payload + monitoring collapse.
+
+### Known gaps
+- CF recommendations are not consumed yet (see above — needs MBID→artist
+  enrichment).
+- No scheduled refresh. The feed is refreshed on demand from the UI button.
+- `live_seeds` is reported in the run summary but not persisted to
+  `discovery_state`.

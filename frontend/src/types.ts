@@ -176,3 +176,67 @@ export interface UserResponse {
   navidrome_url: string;
   server_version?: string;
 }
+
+// ─── Discovery feed ──────────────────────────────────────────────────────────
+
+export type DiscoveryBucket = 'new_artist' | 'artist_known';
+
+export interface DiscoveryOfferSummary {
+  id: number;
+  recording_mbid: string;
+  track_title?: string;
+  release_name?: string;
+  release_mbid?: string;
+  score: number;
+  source: string;
+  status: string;
+  lidarr_album_id?: number;
+}
+
+export interface DiscoveryEvidence {
+  seed_artist: string;
+  seed_title: string;
+}
+
+export interface DiscoveryArtistGroup {
+  artist_name?: string;
+  bucket: DiscoveryBucket;
+  score: number;
+  evidence_count: number;
+  offer_count: number;
+  representative_offer_id: number;
+  representative_title?: string;
+  representative_release?: string;
+  evidence: DiscoveryEvidence[];
+  offers: DiscoveryOfferSummary[];
+}
+
+export interface DiscoveryState {
+  last_run?: string;
+  last_status?: string;
+  last_error?: string;
+  seeds_used: number;
+  candidates_seen: number;
+  offers_added: number;
+  calls_made: number;
+}
+
+export interface DiscoveryFeed {
+  artists: DiscoveryArtistGroup[];
+  state: DiscoveryState;
+  counts: {
+    new_artist: number;
+    artist_known: number;
+    total_offers: number;
+  };
+}
+
+export interface DiscoveryAddResult {
+  offer_id: number;
+  artist_name?: string;
+  release_name?: string;
+  album_id?: number;
+  already_present: boolean;
+  albums_unmonitored: number[];
+  message: string;
+}

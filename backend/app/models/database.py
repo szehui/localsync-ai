@@ -161,6 +161,53 @@ class LbSimilarCache(Base):
     fetched_at = Column(DateTime, default=datetime.utcnow)
 
 
+class DiscoveryOffer(Base):
+    """One candidate recording offered to the user in the discovery feed.
+
+    Novelty triage bins each candidate against the local library:
+      * already owned            -> never stored
+      * artist present, album missing -> bucket "artist_known"  (gap-fill)
+      * artist absent entirely        -> bucket "new_artist"    (true discovery)
+
+    `status` is the dedupe memory: `offered` shows in the feed, `saved` means the
+    album was pushed to Lidarr, `dismissed` never resurfaces. Without this the
+    same ~50 candidates would be re-offered on every run.
+    """
+    __tablename__ = "discovery_offers"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recording_mbid = Column(String, nullable=False, unique=True, index=True)
+    artist_name = Column(String, nullable=True, index=True)
+    track_title = Column(String, nullable=True)
+    release_name = Column(String, nullable=True)
+    release_mbid = Column(String, nullable=True)
+    source = Column(String, nullable=False, default="labs")  # labs | cf
+    score = Column(Float, default=0.0)
+    evidence = Column(Text, nullable=True)  # JSON [{seed_artist, seed_title}]
+    bucket = Column(String, nullable=False, default="new_artist")
+    status = Column(String, nullable=False, default="offered", index=True)
+    lidarr_album_id = Column(Integer, nullable=True)
+    lidarr_artist_name = Column(String, nullable=True)
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+
+
+class DiscoveryState(Base):
+    """Singleton row describing the last discovery refresh.
+
+    The refresh is a background job (rate-limited upstream calls), so the UI
+    polls this to know whether to show a spinner or the feed.
+    """
+    __tablename__ = "discovery_state"
+    id = Column(Integer, primary_key=True, default=1)
+    last_run = Column(DateTime, nullable=True)
+    last_status = Column(String, nullable=True)  # ok | running | error: ...
+    last_error = Column(Text, nullable=True)
+    seeds_used = Column(Integer, default=0)
+    candidates_seen = Column(Integer, default=0)
+    offers_added = Column(Integer, default=0)
+    calls_made = Column(Integer, default=0)
+
+
 def get_db():
     db = SessionLocal()
     try:

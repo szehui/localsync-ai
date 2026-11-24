@@ -6,11 +6,13 @@ import { SeedInterface } from './views/SeedInterface.tsx';
 import { PlaylistView } from './views/PlaylistView.tsx';
 import { AutomationHub } from './views/AutomationHub.tsx';
 import { YouTubeImport } from './views/YouTubeImport.tsx';
+import { DiscoveryFeedView } from './views/DiscoveryFeed.tsx';
 
-type Tab = 'source' | 'seed' | 'playlists' | 'automation' | 'youtube';
+type Tab = 'source' | 'discover' | 'seed' | 'playlists' | 'automation' | 'youtube';
 
 const TABS: { id: Tab; label: string; icon: string; description: string }[] = [
   { id: 'source', label: 'Source', icon: '🎵', description: 'Connect & sync your library' },
+  { id: 'discover', label: 'Discover', icon: '🔭', description: 'New music not in your library' },
   { id: 'seed', label: 'Seed', icon: '🌱', description: 'Generate from any track' },
   { id: 'playlists', label: 'Playlists', icon: '📋', description: 'View and manage' },
   { id: 'automation', label: 'Automation', icon: '⚡', description: 'Smart triggers' },
@@ -122,6 +124,7 @@ function MainApp() {
       {/* Content */}
       <main className="flex-1 max-w-6xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 animate-fade-in">
         {activeTab === 'source' && <SourceDashboard />}
+        {activeTab === 'discover' && <DiscoveryFeedView />}
         {activeTab === 'seed' && <SeedInterface />}
         {activeTab === 'playlists' && <PlaylistView />}
         {activeTab === 'automation' && <AutomationHub />}

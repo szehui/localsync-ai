@@ -210,3 +210,73 @@ class SyncStatus(BaseModel):
     album_count: int = 0
     artist_count: int = 0
     message: str = ""
+
+
+# --- Discovery feed ---
+
+class DiscoveryOfferSummary(BaseModel):
+    id: int
+    recording_mbid: str
+    track_title: Optional[str] = None
+    release_name: Optional[str] = None
+    release_mbid: Optional[str] = None
+    score: float = 0.0
+    source: str = "labs"
+    status: str = "offered"
+    lidarr_album_id: Optional[int] = None
+
+
+class DiscoveryArtistGroup(BaseModel):
+    artist_name: Optional[str] = None
+    bucket: str  # "new_artist" | "artist_known"
+    score: float = 0.0
+    evidence_count: int = 0
+    offer_count: int = 0
+    representative_offer_id: int
+    representative_title: Optional[str] = None
+    representative_release: Optional[str] = None
+    evidence: list[dict] = []
+    offers: list[DiscoveryOfferSummary] = []
+
+
+class DiscoveryStateResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    last_run: Optional[datetime] = None
+    last_status: Optional[str] = None
+    last_error: Optional[str] = None
+    seeds_used: int = 0
+    candidates_seen: int = 0
+    offers_added: int = 0
+    calls_made: int = 0
+
+
+class DiscoveryCounts(BaseModel):
+    new_artist: int = 0
+    artist_known: int = 0
+    total_offers: int = 0
+
+
+class DiscoveryFeedResponse(BaseModel):
+    artists: list[DiscoveryArtistGroup] = []
+    state: DiscoveryStateResponse
+    counts: DiscoveryCounts
+
+
+class DiscoveryRefreshResponse(BaseModel):
+    status: str
+    message: str = ""
+
+
+class DiscoveryAddRequest(BaseModel):
+    search: bool = False
+
+
+class DiscoveryAddResponse(BaseModel):
+    offer_id: int
+    artist_name: Optional[str] = None
+    release_name: Optional[str] = None
+    album_id: Optional[int] = None
+    already_present: bool = False
+    albums_unmonitored: list[int] = []
+    message: str = ""
