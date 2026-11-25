@@ -464,3 +464,90 @@ and the Lidarr payload + monitoring collapse.
 - No scheduled refresh. The feed is refreshed on demand from the UI button.
 - `live_seeds` is reported in the run summary but not persisted to
   `discovery_state`.
+
+---
+
+## 2026-11-24 — Lidarr add fixes (503, mis-pick, monitoring race)
+
+The discovery feed exposed three separate defects in the album-add path. All
+three were reproduced against the live Lidarr 3.1.6.5079 before being fixed.
+
+### 1. `503 Service Unavailable` on album lookup — transient throttling
+**Symptom:** adding Ellie Goulding / *Halcyon* failed with a raw
+`403`-style error page worth of detail:
+`Server error '503 Service Unavailable' ... /api/v1/album/lookup?term=Ellie%20Goulding%20Halcyon`.
+
+**Cause:** Lidarr proxies MusicBrainz through its own rate-limited metadata
+proxy (~1 req/s). Firing several adds in a row saturates it and it answers 503.
+The identical request six seconds later returned 10 results — so the request was
+never wrong. Not our bug, but our job to absorb.
+
+**Fix:** `_request` now retries `{429, 502, 503, 504}` with backoff
+`1s / 3s / 6s` plus jitter (~10s total) before failing. POST is retried too —
+Lidarr keys adds on the MusicBrainz id and short-circuits when the entity
+already exists. Client errors (400/404) are never retried. Confirmed live:
+`Lidarr: GET album/lookup -> 503, retrying in 1.2s (attempt 1/4)` followed by
+success.
+
+### 2. Wrong album picked — lookup matched on title only
+**Symptom:** the Blur offer created an artist called **sevenism** with **607
+albums**. A later run picked *"Essential Blur"* (a compilation) instead of the
+1997 album *"Blur"*.
+
+**Cause:** `_pick_album` compared titles and ignored the artist entirely.
+`album/lookup` is a fuzzy MusicBrainz search that happily returns other artists'
+releases — `"Blur Blur"` yields "Essential Blur" (Blur), "Massive Blur"
+(Melissa Ferrick), "Blur Licker" (Flex Blur) — and the cheap "title contains
+query" fallback then matched an unrelated artist's release.
+
+**Fix:** two parts.
+- `_pick_album` now takes the artist name and prefers artist+exact title →
+  artist+fuzzy title → any release by that artist → *then* title-only. A
+  different artist's album can no longer beat the requested artist.
+- New `lookup_album_for` tries `"artist album"` first and, absent an exact
+  artist+title match, retries with the album name alone. The combined query
+  never returns the self-titled *Blur* album; the album-only query does.
+
+### 3. Whole discographies silently monitored — async refresh race
+**Symptom:** after adding one album, the artist ended up with *all* albums
+monitored. Verified live on Ellie Goulding: the collapse un-monitored 5 siblings
+and reported success, then 3 were monitored again moments later.
+
+**Cause:** `POST /api/v1/album` queues a Lidarr `RefreshArtist` command that
+keeps creating the discography in the background. Each album it creates is
+monitored because a new artist defaults to `monitorNewItems: "all"` — which
+`addOptions.monitor: "none"` does not change (that only gates the artist flag).
+
+**Fix:** set `monitorNewItems: "none"` on the artist at creation *and* make
+`collapse_artist_monitoring` converge: re-read, re-apply, verify, for up to 4
+attempts. A single fire-and-forget PUT is not sufficient.
+`add_single_album` now re-reads `artist_monitored_albums` and returns
+`monitoring_ok` rather than trusting its own bookkeeping.
+
+**Related gap found while fixing this:** the "already in Lidarr" path returned
+early without monitoring anything, so pressing Add on an album Lidarr already
+knew about silently did nothing. It now monitors that album and collapses the
+artist too.
+
+### Also fixed: contradictory UI banners
+The success toast was not cleared when a new action started, so a stale
+"Passenger added" message sat next to a fresh Ellie Goulding error. All three
+handlers now clear both banners first.
+
+### Data repair
+The bugs left real damage in Lidarr, which was repaired:
+`monitorNewItems` set to `none` and exactly the intended album monitored for all
+10 discovery-created artists (474–480, 482–484), and the wrong "Essential Blur"
+album entry removed (no files were ever downloaded).
+
+Left for the user to decide: artist **481 "sevenism"** — created by the
+title-only mis-pick, 607 albums, 0 monitored, 0 files. Unmonitored so it cannot
+download, but it is clutter and should probably be deleted.
+
+### Tests
+308 passing (17 new). Retry: 503/429/502 retried, 400/404 not, backoff bounded.
+Pick: artist beats title-only, never selects a different artist, exact
+artist+title wins, title fallback only when artist absent. Lookup: falls back to
+album-name query, first query wins when exact. Collapse: converges when a
+refresh re-monitors, reports non-convergence instead of claiming success.
+Already-present: album actually gets monitored.

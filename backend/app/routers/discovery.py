@@ -11,6 +11,7 @@ allows 1 call/sec), so a cold run takes ~15-20s. The UI polls `GET /` and reads
 import logging
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,7 @@ from app.models.database import (
     SessionLocal,
     get_db,
 )
+from app.services import lidarr
 from app.models.schemas import (
     DiscoveryAddRequest,
     DiscoveryAddResponse,
@@ -194,9 +196,33 @@ async def add_to_lidarr(offer_id: int, request: DiscoveryAddRequest,
             offer.artist_name, offer.release_name, search=request.search)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        # The retry loop in LidarrService already absorbed transient 5xx, so
+        # anything reaching here survived ~10s of retries.
+        logger.exception("Lidarr album add failed for offer %s", offer_id)
+        status = exc.response.status_code
+        if status in lidarr.RETRY_STATUSES:
+            detail = (
+                "Lidarr is busy indexing MusicBrainz right now "
+                f"(HTTP {status} after retries). Wait a few seconds and try again."
+            )
+        elif status == 401 or status == 403:
+            detail = "Lidarr rejected the API key. Re-check the Lidarr config."
+        else:
+            detail = f"Lidarr returned HTTP {status}. Check the Lidarr logs."
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except httpx.HTTPError as exc:
+        logger.exception("Lidarr album add failed for offer %s", offer_id)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not reach Lidarr. Is it running?",
+        ) from exc
     except Exception as exc:  # noqa: BLE001
         logger.exception("Lidarr album add failed for offer %s", offer_id)
-        raise HTTPException(status_code=502, detail=f"Lidarr error: {exc}") from exc
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unexpected error talking to Lidarr: {type(exc).__name__}",
+        ) from exc
 
     offer.status = discovery.STATUS_SAVED
     offer.lidarr_album_id = result.get("album_id")

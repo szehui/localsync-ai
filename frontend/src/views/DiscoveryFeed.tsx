@@ -56,6 +56,7 @@ export function DiscoveryFeedView() {
   async function handleRefresh() {
     setRefreshing(true);
     setError(null);
+    setToast(null);
     try {
       await api.refreshDiscovery();
       await load();
@@ -67,6 +68,10 @@ export function DiscoveryFeedView() {
   }
 
   async function handleAdd(group: DiscoveryArtistGroup) {
+    // Clear any prior banner first: a stale success message sitting next to a
+    // new error reads as "it worked AND it failed".
+    setToast(null);
+    setError(null);
     setBusyOffer(group.representative_offer_id);
     try {
       const result = await api.addDiscoveryOfferToLidarr(group.representative_offer_id);
@@ -82,6 +87,8 @@ export function DiscoveryFeedView() {
   }
 
   async function handleDismiss(group: DiscoveryArtistGroup) {
+    setToast(null);
+    setError(null);
     setBusyOffer(group.representative_offer_id);
     try {
       await api.dismissDiscoveryOffer(group.representative_offer_id);
