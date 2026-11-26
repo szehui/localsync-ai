@@ -173,21 +173,67 @@ class LidarrService:
                 if title and wanted_title and (title in wanted_title
                                                or wanted_title in title):
                     return row
-            # 3. any release by the artist beats another artist's exact title
+            # 3. Artist matches but the title doesn't: only accept a genuinely
+            #    similar title. "Any release by this artist" is how the Shang-Chi
+            #    soundtrack resolved to Savage Mode — an album the user never
+            #    asked for, queued for download under the right artist's name.
             for row in results:
-                if self._norm(self._row_artist(row)) == wanted_artist:
+                if self._norm(self._row_artist(row)) != wanted_artist:
+                    continue
+                if self._title_agrees(row.get("title"), release_name):
                     return row
 
-        # 4. No artist signal at all: fall back to title matching.
+        # 4. Title evidence plus a *similar* artist name. MusicBrainz spells acts
+        #    differently ("BTS (방탄소년단)" vs "BTS"), so an exact fold is too
+        #    strict here — but a completely different artist must never win on
+        #    title alone, which is how a stranger's album gets downloaded. When
+        #    no artist was supplied at all, the title is all the evidence there is.
         for row in results:
-            if self._norm(row.get("title")) == wanted_title:
+            if not self._title_agrees(row.get("title"), release_name):
+                continue
+            if not artist_name or self._artist_agrees(
+                    self._row_artist(row), artist_name):
                 return row
-        for row in results:
-            title = self._norm(row.get("title"))
-            if title and wanted_title and (title in wanted_title
-                                           or wanted_title in title):
-                return row
-        return results[0]
+        # Nothing matched on evidence. Returning a best-guess here means adding
+        # an arbitrary album; the caller is better off treating it as unattributed.
+        return None
+
+    @staticmethod
+    def _artist_agrees(candidate: Optional[str], wanted: str) -> bool:
+        """True if a candidate artist name plausibly means the wanted artist."""
+        import difflib
+        import re
+
+        def fold(text: Optional[str]) -> str:
+            return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+        a, b = fold(candidate), fold(wanted)
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        if (len(b) >= 3 and (a in b or b in a)):
+            return True
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.7
+
+    @staticmethod
+    def _title_agrees(candidate: Optional[str], wanted: str) -> bool:
+        """True if two release titles are the same after folding, or close.
+
+        Substring containment alone is not enough ("Blur" is inside
+        "Blurred Lines"), so a similarity floor backs it up.
+        """
+        import difflib
+        import re
+        a = re.sub(r"[^a-z0-9]+", "", (candidate or "").lower())
+        b = re.sub(r"[^a-z0-9]+", "", (wanted or "").lower())
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        if len(b) >= 6 and (a in b or b in a):
+            return True
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
 
     async def get_album_defaults(self) -> Dict[str, Any]:
         """Quality profile / metadata profile / root folder for a new artist."""

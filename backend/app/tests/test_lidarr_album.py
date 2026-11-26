@@ -100,7 +100,11 @@ class TestPickAlbum:
             rows, "Blur", "Blur")["foreignAlbumId"] == "studio"
 
     def test_never_selects_a_different_artist(self):
-        """A wrong-artist album must never win over the right artist."""
+        """A wrong-artist album must never win over the right artist.
+
+        And when the right artist has no album with an agreeing title, the
+        honest answer is "no match" — not an arbitrary album by that artist.
+        """
         service = LidarrService("http://x", "k")
         rows = [
             {"title": "Halcyon", "foreignAlbumId": "impostor",
@@ -108,8 +112,7 @@ class TestPickAlbum:
             {"title": "Lights", "foreignAlbumId": "real",
              "artist": {"artistName": "Ellie Goulding"}},
         ]
-        picked = service._pick_album(rows, "Halcyon", "Ellie Goulding")
-        assert picked["foreignAlbumId"] == "real"
+        assert service._pick_album(rows, "Halcyon", "Ellie Goulding") is None
 
     def test_exact_artist_and_title_wins(self):
         service = LidarrService("http://x", "k")
@@ -130,18 +133,50 @@ class TestPickAlbum:
             rows, "Halcyon", "ellie goulding")["foreignAlbumId"] == "a"
 
     def test_title_fallback_when_no_artist_matches(self):
-        """If the requested artist is absent, still return a usable guess."""
+        """Title alone can't justify installing a stranger's album.
+
+        The artist must at least plausibly be the same act — spelled differently
+        is fine, a different act is not.
+        """
         service = LidarrService("http://x", "k")
         rows = [{"title": "Halcyon", "foreignAlbumId": "x",
                  "artist": {"artistName": "Someone Else"}}]
-        assert service._pick_album(
-            rows, "Halcyon", "Ellie Goulding")["foreignAlbumId"] == "x"
+        assert service._pick_album(rows, "Halcyon", "Ellie Goulding") is None
 
-    def test_first_row_when_nothing_matches(self):
+    def test_title_fallback_accepts_spelling_variant(self):
+        """MusicBrainz appends native-script names; that's the same act."""
+        service = LidarrService("http://x", "k")
+        rows = [{"title": "Proof", "foreignAlbumId": "proof",
+                 "artist": {"artistName": "BTS (방탄소년단)"}}]
+        assert service._pick_album(
+            rows, "Proof", "BTS")["foreignAlbumId"] == "proof"
+
+    def test_returns_none_when_nothing_matches(self):
+        """No evidence means no album: a coin-flip pick adds a stranger's album."""
         service = LidarrService("http://x", "k")
         rows = [{"title": "Totally Different", "foreignAlbumId": "a"},
                 {"title": "Also Different", "foreignAlbumId": "b"}]
-        assert service._pick_album(rows, "Room on Fire")["foreignAlbumId"] == "a"
+        assert service._pick_album(rows, "Room on Fire") is None
+
+    def test_title_must_agree_not_merely_be_similar_artist(self):
+        """The Shang-Chi regression: right artist, wrong album."""
+        service = LidarrService("http://x", "k")
+        rows = [
+            {"title": "Savage Mode", "foreignAlbumId": "savage",
+             "artist": {"artistName": "21 Savage"}},
+            {"title": "I Am > I Was", "foreignAlbumId": "iam",
+             "artist": {"artistName": "21 Savage"}},
+        ]
+        assert service._pick_album(
+            rows, "Shang-Chi and The Legend of The Ten Rings: The Album",
+            "21 Savage") is None
+
+    def test_korean_title_is_not_guessed_by_artist(self):
+        """PSY 9th lives under 싸다9; refusing beats downloading the wrong album."""
+        service = LidarrService("http://x", "k")
+        rows = [{"title": "Psy From the Psycho World!", "foreignAlbumId": "old",
+                 "artist": {"artistName": "PSY"}}]
+        assert service._pick_album(rows, "PSY 9th", "PSY") is None
 
     def test_empty(self):
         service = LidarrService("http://x", "k")
@@ -448,7 +483,9 @@ class TestLookupAlbumFor:
 
         service.lookup_album = fake_lookup  # type: ignore[assignment]
         rows = await service.lookup_album_for("Ellie Goulding", "Halcyon")
-        assert service._row_artist(rows[0]) == "Ellie Goulding"
+        # Neither row is Halcyon by Ellie Goulding, so there is no match to
+        # return; the importer then leaves the track unattributed.
+        assert service._pick_album(rows, "Halcyon", "Ellie Goulding") is None
 
     async def test_handles_empty_results(self):
         service = LidarrService("http://x", "k")
