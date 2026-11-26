@@ -24,6 +24,7 @@ async def create_trigger(trigger: TriggerCreate, db: Session = Depends(get_db)):
         trigger_type=trigger.trigger_type,
         cron_expression=trigger.cron_expression,
         threshold=trigger.threshold,
+        mix_kind=trigger.mix_kind,
         playlist_name=trigger.playlist_name,
     )
     db.add(db_trigger)

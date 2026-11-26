@@ -114,17 +114,23 @@ export interface GeneratedPlaylist {
 
 export interface TriggerCreate {
   name: string;
-  trigger_type: 'recency' | 'heavy_rotation' | 'scheduled';
+  trigger_type: 'recency' | 'heavy_rotation' | 'scheduled' | 'library_mix';
   cron_expression?: string;
   threshold?: number;
+  /** library_mix only: which local mix to build */
+  mix_kind?: MixKind;
   playlist_name?: string;
 }
+
+/** Local-only mixes built from the library and play counts — no upstream API. */
+export type MixKind = 'deep_cuts' | 'on_repeat' | 'rewind' | 'rediscover' | 'unplayed';
 
 export interface TriggerUpdate {
   name?: string;
   enabled?: boolean;
   cron_expression?: string;
   threshold?: number;
+  mix_kind?: MixKind;
   playlist_name?: string;
 }
 
@@ -135,6 +141,7 @@ export interface Trigger {
   enabled: boolean;
   cron_expression?: string;
   threshold?: number;
+  mix_kind?: MixKind | null;
   playlist_name?: string;
   navidrome_playlist_id?: string;
   last_run?: string;

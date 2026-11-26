@@ -4,17 +4,27 @@ import {
   Card, Button, Badge, Input, Select, Spinner, EmptyState, 
   formatDate, SectionHeader 
 } from '../components';
-import type { Trigger, TriggerCreate } from '../types';
+import type { Trigger, TriggerCreate, MixKind } from '../types';
 
 const TRIGGER_TYPES = [
   { value: 'recency', label: 'Fresh Discoveries (daily)' },
   { value: 'heavy_rotation', label: 'Heavy Rotation (every 6h)' },
+  { value: 'library_mix', label: 'Library Mix (local, daily)' },
   { value: 'scheduled', label: 'Scheduled (custom cron)' },
+];
+
+const MIX_KINDS: { value: MixKind; label: string }[] = [
+  { value: 'deep_cuts', label: 'Deep Cuts — lesser-known tracks by artists you play most' },
+  { value: 'on_repeat', label: 'On Repeat — what you have been playing lately' },
+  { value: 'rewind', label: 'Rewind — heavy rotation from earlier this year' },
+  { value: 'rediscover', label: 'Rediscover — favourites untouched for a year+' },
+  { value: 'unplayed', label: 'Unplayed — never-played tracks by artists you know' },
 ];
 
 const TRIGGER_ICONS: Record<string, string> = {
   recency: '🆕',
   heavy_rotation: '🔄',
+  library_mix: '📚',
   scheduled: '⏰',
 };
 
@@ -29,6 +39,7 @@ export function AutomationHub() {
   const [formType, setFormType] = useState('recency');
   const [formCron, setFormCron] = useState('');
   const [formThreshold, setFormThreshold] = useState('5');
+  const [formMixKind, setFormMixKind] = useState<MixKind>('deep_cuts');
   const [formPlaylistName, setFormPlaylistName] = useState('');
   const [lastfmConfig, setLastfmConfig] = useState<{ configured: boolean; username?: string } | null>(null);
   const [lastfmUsername, setLastfmUsername] = useState('');
@@ -141,6 +152,7 @@ export function AutomationHub() {
     setFormName('');
     setFormCron('');
     setFormThreshold('5');
+    setFormMixKind('deep_cuts');
     setFormPlaylistName('');
   };
 
@@ -156,6 +168,12 @@ export function AutomationHub() {
     }
     if (formType === 'heavy_rotation') {
       create.threshold = parseInt(formThreshold) || 5;
+    }
+    if (formType === 'library_mix') {
+      create.mix_kind = formMixKind;
+      if (formCron) {
+        create.cron_expression = formCron;
+      }
     }
     try {
       await api.createTrigger(create);
@@ -357,6 +375,22 @@ export function AutomationHub() {
                 label="Play Threshold"
               />
             )}
+            {formType === 'library_mix' && (
+              <>
+                <Select
+                  value={formMixKind}
+                  onChange={(v) => setFormMixKind(v as MixKind)}
+                  options={MIX_KINDS}
+                  label="Mix"
+                />
+                <Input
+                  value={formCron}
+                  onChange={setFormCron}
+                  placeholder="Default 06:30 daily"
+                  label="Cron Expression (optional)"
+                />
+              </>
+            )}
           </div>
           <div className="flex justify-end">
             <Button onClick={handleCreate}>Create Trigger</Button>
@@ -397,6 +431,12 @@ export function AutomationHub() {
                         <span>Threshold: <span className="text-gray-400">{trigger.threshold} plays</span></span>
                       </>
                     )}
+                    {trigger.mix_kind && (
+                      <>
+                        <span className="text-gray-600">|</span>
+                        <span>Mix: <span className="text-gray-400">{trigger.mix_kind.replace('_', ' ')}</span></span>
+                      </>
+                    )}
                     {trigger.cron_expression && (
                       <>
                         <span className="text-gray-600">|</span>
@@ -412,6 +452,11 @@ export function AutomationHub() {
                   {trigger.trigger_type === 'recency' && (
                     <p className="text-xs text-gray-600 mt-1">
                       Prunes dated playlists older than 14 days after each run
+                    </p>
+                  )}
+                  {trigger.trigger_type === 'library_mix' && (
+                    <p className="text-xs text-gray-600 mt-1">
+                      Replaces the same named playlist each run; the draw reseeds weekly
                     </p>
                   )}
                   <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-600">

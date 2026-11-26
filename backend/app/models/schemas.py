@@ -118,9 +118,11 @@ class PlaylistDetailResponse(BaseModel):
 
 class TriggerCreate(BaseModel):
     name: str
-    trigger_type: str  # "recency" | "heavy_rotation" | "scheduled"
+    trigger_type: str  # "recency" | "heavy_rotation" | "scheduled" | "library_mix"
     cron_expression: Optional[str] = None
     threshold: Optional[int] = None
+    # library_mix only: deep_cuts | on_repeat | rewind | rediscover | unplayed
+    mix_kind: Optional[str] = None
     playlist_name: Optional[str] = None
 
 
@@ -129,6 +131,7 @@ class TriggerUpdate(BaseModel):
     enabled: Optional[bool] = None
     cron_expression: Optional[str] = None
     threshold: Optional[int] = None
+    mix_kind: Optional[str] = None
     playlist_name: Optional[str] = None
 
 
@@ -141,6 +144,7 @@ class TriggerResponse(BaseModel):
     enabled: bool
     cron_expression: Optional[str] = None
     threshold: Optional[int] = None
+    mix_kind: Optional[str] = None
     playlist_name: Optional[str] = None
     navidrome_playlist_id: Optional[str] = None
     last_run: Optional[datetime] = None

@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from app.models.database import Artist, Album, Track, SessionLocal
 from app.services.navidrome import NavidromeClient
@@ -199,6 +199,9 @@ class SyncService:
                             track.play_count = song_data.get("playCount", track.play_count)
                             track.rating = song_data.get("rating", track.rating)
                             track.starred = _parse_starred(song_data.get("starred"))
+                            played = _parse_naive_utc(song_data.get("played"))
+                            if played is not None:
+                                track.last_played_at = played
                             track.last_synced = datetime.utcnow()
                 except Exception:
                     continue
@@ -257,6 +260,7 @@ def _build_track(song_data: dict, album: dict) -> Track:
         rating=song_data.get("rating", 0),
         starred=_parse_starred(song_data.get("starred")),
         created_at=_parse_datetime(song_data.get("created")),
+        last_played_at=_parse_naive_utc(song_data.get("played")),
         last_synced=datetime.utcnow(),
         recording_mbid=mbid,
         search_key=build_search_key(artist, title),
@@ -316,3 +320,35 @@ def _parse_starred(value) -> bool:
     if isinstance(value, str) and value:
         return True
     return False
+
+
+def _parse_naive_utc(value) -> datetime | None:
+    """Parse Navidrome's `played` timestamp into a naive UTC datetime.
+
+    Subsonic returns e.g. ``2026-10-02T01:22:45.697086102Z``. SQLite's DATETIME
+    type silently drops tzinfo on write, so an aware datetime would read back
+    naive and blow up when compared to `datetime.utcnow()`. Normalising at the
+    boundary keeps every stored timestamp comparable.
+
+    Also tolerates >6 fractional digits (Python's `fromisoformat` rejects 9).
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip().replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            # Truncate over-long fractional seconds and retry once.
+            match = re.match(r"^(.*\.\d{6})\d*(\+\d{2}:\d{2})?$", text)
+            if not match:
+                return None
+            try:
+                parsed = datetime.fromisoformat(match.group(1) + (match.group(2) or ""))
+            except ValueError:
+                return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed

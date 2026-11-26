@@ -551,3 +551,65 @@ artist+title wins, title fallback only when artist absent. Lookup: falls back to
 album-name query, first query wins when exact. Collapse: converges when a
 refresh re-monitors, reports non-convergence instead of claiming success.
 Already-present: album actually gets monitored.
+
+## 2026-11-26 — Curation (diversity, aging) + local-only Library Mixes
+
+### Why
+Aurral 3.0's Discover / New to You / Deep Cuts are built from the **Deezer
+catalog** and filtered with `withoutOwned()` — by construction they are the
+music you *don't* own, so they can never be played from Navidrome. What was
+worth taking from that codebase is the machinery underneath, plus its second,
+library-resident system (`mixes.ts`): Daily Mix, On Repeat, Rewind, Rediscover,
+Unplayed.
+
+### What changed
+- **`services/curation.py`** (new, pure): `seeded_rng`, `weighted_sample`
+  (Efraimidis–Spirakis), `familiarity_weight`, `aging_penalty`, `diversify`
+  (greedy artist/genre penalties), `normalize_scores`, `apply_artist_cap`,
+  `interleave`, `MIN_PLAYLIST_TRACKS`.
+- **`services/mixes.py`** (new, DB read only): Deep Cuts, On Repeat, Rewind,
+  Rediscover, Unplayed. All computed from `tracks` + play counts + last-played.
+- **`tracks.last_played_at`** — captured from Navidrome's `played` field at sync
+  time (it is returned on played songs only; the column stays NULL until a
+  resync). New `smart_triggers.mix_kind` selects which mix a trigger builds.
+  Both migrated in `init_db()`, following the `recording_mbid` pattern.
+- **Recency trigger** now seeds its RNG from `(trigger.id, playlist_name)` and
+  runs `_curate` between blend and publish.
+- **`_publish_playlist`** extracted — the delete-then-create dance and the
+  pruning step existed in three places; scheduled triggers now share it.
+- **Publish gate**: fewer than 10 tracks and the previous playlist is left
+  untouched instead of being replaced with a stub.
+- Trigger type `library_mix` (default 06:30 daily, or a custom cron), with a
+  mix picker in AutomationHub.
+
+### Two bugs the tests caught
+1. **Aging ran backwards.** First implementation grew the penalty with age
+   (`days × 0.45`). It is a *repeat suppressant*: yesterday must cost the most,
+   decaying to zero at 30 days. Fixed to `cap × (1 - days/horizon)`.
+2. **The penalty was applied on the wrong scale.** `_curate` subtracted it from
+   raw blend positions while `normalize_scores` then discarded magnitudes, so a
+   3-point penalty only moved a track ~3 ranks and yesterday's playlist led
+   again. Now scores are normalised first, then penalised, so the aging penalty
+   and the diversity penalties share one 0–10 scale.
+
+Also bounded the genre penalty to a 3-track window: cumulative genre penalties
+would have banned a dominant tag ("Rock" is a third of this library) after ~10
+tracks rather than interleaving it. The artist penalty stays cumulative but caps
+at 3 repeats.
+
+### Verification (real data, not mocks)
+- Full sync: 878 artists / 3,127 albums / 30,356 tracks; 599 tracks got a
+  `last_played_at`.
+- Dry-run against a copy of the live DB: Deep Cuts 30 tracks / 10 artists,
+  Unplayed 50 / 35, On Repeat 6, Rewind 4, Rediscover 0 (no play history older
+  than a year yet — correct, and it says so in the log).
+- End-to-end: a throwaway `library_mix` trigger published a 30-track playlist to
+  Navidrome, verified the entry list, then removed both playlist and row.
+- 387 tests passing (79 new across `test_curation.py`, `test_mixes.py`,
+  `test_curation_pipeline.py`).
+
+### Known limitation
+On Repeat / Rewind / Rediscover stay empty until `last_played_at` is populated
+by a sync, and they will not clear the 10-track publish gate on a library with
+thin play counts (599 of 30k tracks here). Deep Cuts and Unplayed carry the
+feature today.

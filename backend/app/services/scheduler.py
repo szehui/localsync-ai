@@ -22,6 +22,14 @@ from app.services.lb_cache import (
     put_similar,
 )
 from app.services.resolver import resolve_entries
+from app.services.curation import (
+    MIN_PLAYLIST_TRACKS,
+    aging_penalty,
+    diversify,
+    normalize_scores,
+    seeded_rng,
+)
+from app.services.mixes import DEFAULT_MIX, MIX_SPECS, select_mix
 from app.routers.playlists import _passes_strictness
 
 logger = logging.getLogger(__name__)
@@ -397,6 +405,210 @@ def _blend_tracks(
     return final[:target]
 
 
+# ─── Curation: diversity, aging, publish ────────────────────────────────────
+
+def _track_meta(db: Session, track_ids) -> dict:
+    """Map track id -> (artist, genre) with one query.
+
+    Only what the diversity pass needs. Missing ids simply do not appear, which
+    `_curate` treats as "unknown artist, no genre" rather than an error.
+    """
+    ids = [sid for sid in dict.fromkeys(track_ids) if sid]
+    if not ids:
+        return {}
+    meta: dict = {}
+    # SQLite caps bound parameters, so batch the IN clause.
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        rows = (
+            db.query(Track.id, Track.artist_name, Track.genre)
+            .filter(Track.id.in_(batch))
+            .all()
+        )
+        for track_id, artist, genre in rows:
+            meta[track_id] = ((artist or "").strip(), (genre or "").strip())
+    return meta
+
+
+def _aging_penalty(db: Session, track_ids, reference: datetime, lookback_days: int = 30) -> dict:
+    """Map track id -> score penalty based on how recently it was offered.
+
+    There is no "last offered" column; `GeneratedPlaylist.track_ids` already
+    stores each run's track list as JSON, so the most recent appearance can be
+    derived without a schema change. The penalty is linear in age up to a cap,
+    which is what stops the same handful of Deep Cuts recurring every week —
+    the 2-day cooldown alone is far too short at a weekly cadence.
+    """
+    ids = set(sid for sid in track_ids if sid)
+    if not ids:
+        return {}
+    cutoff = reference - timedelta(days=lookback_days)
+    rows = (
+        db.query(GeneratedPlaylist.updated_at, GeneratedPlaylist.track_ids)
+        .filter(GeneratedPlaylist.updated_at >= cutoff)
+        .all()
+    )
+    last_seen: dict = {}
+    for updated_at, raw in rows:
+        if not raw or updated_at is None:
+            continue
+        try:
+            stored = json.loads(str(raw))
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(stored, list):
+            continue
+        for sid in stored:
+            if sid in ids and (sid not in last_seen or updated_at > last_seen[sid]):
+                last_seen[sid] = updated_at
+
+    penalties = {}
+    for sid, seen_at in last_seen.items():
+        days = (reference - seen_at).total_seconds() / 86400.0
+        penalties[sid] = aging_penalty(days)
+    return penalties
+
+
+def _curate(db: Session, track_ids, target: int, rng, artist_cap: int = 5) -> list[str]:
+    """Re-rank a blended track list for diversity, then trim to `target`.
+
+    The blend happens on bare ids, so one artist can own half the playlist (a
+    single well-connected similarity seed floods the pool). This applies a
+    per-artist cap and then a greedy pass that penalises repeating an artist or
+    a genre, with a decaying penalty for tracks served in recent runs.
+
+    The cap is applied only when it leaves enough tracks to fill `target` —
+    dropping 30 tracks to enforce variety would just ship a short playlist, so
+    a pool dominated by three artists keeps its repeats and lets the penalty
+    decide the running order instead.
+    """
+    ids = [sid for sid in dict.fromkeys(track_ids) if sid]
+    if not ids:
+        return []
+
+    try:
+        meta = _track_meta(db, ids)
+    except Exception as e:
+        # Curation is an enhancement, not a requirement: a missing/stale index
+        # must never take down a trigger run that otherwise produced a playlist.
+        logger.warning(f"Curation skipped, could not read track metadata: {e}")
+        meta = {}
+    if not meta:
+        # Nothing in the local index (e.g. a fresh install) — no basis for
+        # curation, so don't reorder what the blend produced.
+        return ids[:target]
+
+    penalized = _aging_penalty(db, ids, datetime.utcnow())
+
+    capped: list[str] = []
+    seen_artist: dict = {}
+    dropped = 0
+    for sid in ids:
+        artist = meta.get(sid, ("", ""))[0]
+        if artist and artist_cap > 0:
+            if seen_artist.get(artist, 0) >= artist_cap:
+                dropped += 1
+                continue
+            seen_artist[artist] = seen_artist.get(artist, 0) + 1
+        capped.append(sid)
+
+    if len(capped) < target:
+        # Capping starved the playlist — keep every candidate and let the
+        # diversity penalty handle the ordering instead.
+        capped = ids
+        dropped = 0
+
+    # Blend order is the base score: earlier picks came from the higher
+    # priority pools, so they should still win ties after curation. Normalise
+    # *before* subtracting the aging penalty so the penalty is expressed on the
+    # same 0..BASE_SCORE_SPAN scale as the diversity penalties — otherwise a
+    # 3-point penalty against pre-normalisation scores only shifts a track a
+    # couple of ranks and yesterday's playlist leads again.
+    candidates = normalize_scores([
+        {
+            "id": sid,
+            "artist": meta.get(sid, ("", ""))[0],
+            "genre": meta.get(sid, ("", ""))[1],
+            "score": float(len(capped) - i),
+        }
+        for i, sid in enumerate(capped)
+    ])
+    for candidate in candidates:
+        candidate["score"] -= penalized.get(candidate["id"], 0.0)
+    curated = diversify(candidates, target, rng=rng)
+    if dropped:
+        logger.info(
+            f"Curation: capped {dropped} track(s) past {artist_cap}/artist; "
+            f"{len(ids)} -> {len(curated)}"
+        )
+    return curated
+
+
+def _publish_gate_ok(track_ids, name: str) -> bool:
+    """Refuse to publish a stub playlist.
+
+    A 6-track "Daily Mix" is worse than yesterday's playlist still being there,
+    so short runs are skipped and the previous one is left alone.
+    """
+    if len(track_ids) >= MIN_PLAYLIST_TRACKS:
+        return True
+    logger.warning(
+        f"'{name}': only {len(track_ids)} track(s), below the {MIN_PLAYLIST_TRACKS} "
+        f"minimum — leaving the existing playlist untouched"
+    )
+    return False
+
+
+async def _publish_playlist(
+    db: Session,
+    client: NavidromeClient,
+    name: str,
+    track_ids: list[str],
+    prune: bool = False,
+) -> bool:
+    """Create or replace `name` in Navidrome and record it locally.
+
+    Shared by every trigger so the delete-then-create dance (updatePlaylist
+    appends rather than replaces) exists in exactly one place. Returns False
+    when the publish gate rejected the run.
+    """
+    if not _publish_gate_ok(track_ids, name):
+        return False
+
+    existing = db.query(GeneratedPlaylist).filter(GeneratedPlaylist.name == name).first()
+    if existing and existing.navidrome_playlist_id:
+        try:
+            await client.delete_playlist(existing.navidrome_playlist_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete old playlist '{name}': {e}")
+        result = await client.create_playlist(name, track_ids)
+        existing.navidrome_playlist_id = result.get("playlist", {}).get("id", "")
+        existing.track_ids = json.dumps(track_ids)
+        existing.track_count = len(track_ids)
+        existing.updated_at = datetime.utcnow()
+    else:
+        result = await client.create_playlist(name, track_ids)
+        db.add(GeneratedPlaylist(
+            name=name,
+            navidrome_playlist_id=result.get("playlist", {}).get("id", ""),
+            track_count=len(track_ids),
+            track_ids=json.dumps(track_ids),
+        ))
+    db.commit()
+
+    if prune:
+        try:
+            pruned = await _prune_old_dated_playlists(db, client, name)
+            if pruned:
+                logger.info(
+                    f"Pruned {pruned} playlist(s) older than {PLAYLIST_RETENTION_DAYS} days"
+                )
+        except Exception as e:
+            logger.warning(f"Playlist pruning failed (new playlist was created): {e}")
+
+    return True
+
+
 # ─── DB-backed Navidrome Client ─────────────────────────────────────────────
 
 def _get_client_from_db() -> NavidromeClient:
@@ -763,61 +975,34 @@ async def run_recency_trigger(trigger_id: int):
             # --- Build the playlist: ListenBrainz-primary blend ---
             # 60% listening history / 40% newest; within history ListenBrainz
             # holds 60% and Navidrome similarity 40%, Last.fm only fills gaps.
-            track_ids = _blend_tracks(
+            #
+            # The RNG is seeded from (trigger, playlist name) so re-running the
+            # same day's trigger reproduces the same playlist instead of churning
+            # it — the dated name is the identity of the run.
+            rng = seeded_rng("recency", trigger.id, playlist_name)
+            blended = _blend_tracks(
                 lb_similar=similar_from_lb,
                 nav_similar=similar_from_nav,
                 lfm_similar=similar_from_lastfm,
                 newest_ids=newest_ids,
                 target=50,
+                rng=rng,
             )
+            track_ids = _curate(db, blended, target=50, rng=rng)
             logger.info(
                 f"Blend: {len(similar_from_lb)} LB + {len(similar_from_nav)} nav + "
                 f"{len(similar_from_lastfm)} lastfm history, {len(newest_ids)} newest "
-                f"-> {len(track_ids)} tracks"
+                f"-> {len(blended)} blended -> {len(track_ids)} after curation"
             )
             # ── Push to Navidrome ────────────────────────────────────────────
-            # playlist_name was computed at the top of the function (used for cooldown prefix too)
-
-            existing = db.query(GeneratedPlaylist).filter(
-                GeneratedPlaylist.name == playlist_name
-            ).first()
-
-            if existing and existing.navidrome_playlist_id:
-                # Delete the old Navidrome playlist first (updatePlaylist appends, doesn't replace)
-                try:
-                    await client.delete_playlist(existing.navidrome_playlist_id)
-                except Exception as e:
-                    logger.warning(f"Failed to delete old playlist: {e}")
-                result = await client.create_playlist(playlist_name, track_ids)
-                new_playlist_id = result.get("playlist", {}).get("id", "")
-                existing.navidrome_playlist_id = new_playlist_id
-                existing.track_ids = json.dumps(track_ids)
-                existing.track_count = len(track_ids)
-                existing.updated_at = datetime.utcnow()
-            else:
-                result = await client.create_playlist(playlist_name, track_ids)
-                playlist_id = result.get("playlist", {}).get("id", "")
-                playlist = GeneratedPlaylist(
-                    name=playlist_name,
-                    navidrome_playlist_id=playlist_id,
-                    track_count=len(track_ids),
-                    track_ids=json.dumps(track_ids),
-                )
-                db.add(playlist)
-
-            # ── Prune stale playlists in this dated series ───────────────────
-            # A dated series ('Fresh Discoveries YYYY-MM-DD') grows by one
-            # playlist a day, so drop anything past the retention window once
-            # the new one is safely published. Never fatal to the run.
-            try:
-                pruned = await _prune_old_dated_playlists(db, client, playlist_name)
-                if pruned:
-                    logger.info(
-                        f"Pruned {pruned} playlist(s) older than "
-                        f"{PLAYLIST_RETENTION_DAYS} days"
-                    )
-            except Exception as e:
-                logger.warning(f"Playlist pruning failed (new playlist was created): {e}")
+            published = await _publish_playlist(
+                db, client, playlist_name, track_ids, prune=True
+            )
+            if not published:
+                # Publish gate rejected the run; yesterday's playlist stays put.
+                trigger.last_run = datetime.utcnow()
+                db.commit()
+                return
 
             trigger.last_run = datetime.utcnow()
             db.commit()
@@ -1041,25 +1226,11 @@ async def run_scheduled_trigger(trigger_id: int):
 
             playlist_name = trigger.playlist_name or "Scheduled Mix"
 
-            existing = db.query(GeneratedPlaylist).filter(
-                GeneratedPlaylist.name == playlist_name
-            ).first()
-
-            if existing and existing.navidrome_playlist_id:
-                await client.update_playlist(existing.navidrome_playlist_id, track_ids, name=playlist_name)
-                existing.track_ids = json.dumps(track_ids)
-                existing.track_count = len(track_ids)
-                existing.updated_at = datetime.utcnow()
-            else:
-                result = await client.create_playlist(playlist_name, track_ids)
-                playlist_id = result.get("playlist", {}).get("id", "")
-                playlist = GeneratedPlaylist(
-                    name=playlist_name,
-                    navidrome_playlist_id=playlist_id,
-                    track_count=len(track_ids),
-                    track_ids=json.dumps(track_ids),
-                )
-                db.add(playlist)
+            published = await _publish_playlist(db, client, playlist_name, track_ids)
+            if not published:
+                trigger.last_run = datetime.utcnow()
+                db.commit()
+                return
 
             trigger.last_run = datetime.utcnow()
             db.commit()
@@ -1073,11 +1244,76 @@ async def run_scheduled_trigger(trigger_id: int):
         db.close()
 
 
+async def run_library_mix_trigger(trigger_id: int):
+    """Library Mix Trigger: publish one of the local-only mixes.
+
+    Everything here is computed from the local library and play counts — no
+    similarity API, no rate limit, no listening-history window. That is what
+    makes these mixes reliable: they cannot come back empty because an upstream
+    service is thin or down, only because the library genuinely lacks the data.
+
+    Which mix to build comes from `trigger.mix_kind` (see services/mixes.py).
+    The playlist name defaults to the mix's label, undated, so each run replaces
+    the previous version instead of piling up one playlist per day.
+    """
+    logger.info(f"Running library mix trigger {trigger_id}")
+    db = SessionLocal()
+    try:
+        trigger = db.query(SmartTrigger).filter(SmartTrigger.id == trigger_id).first()
+        if not trigger or not trigger.enabled:
+            return
+
+        kind = (trigger.mix_kind or DEFAULT_MIX).strip().lower()
+        spec = MIX_SPECS.get(kind) or MIX_SPECS[DEFAULT_MIX]
+        playlist_name = trigger.playlist_name or spec["label"]
+
+        # Weekly seed on the undated name: a stable playlist within the week,
+        # a different draw next week, and no churn if the job reruns.
+        iso_year, iso_week, _ = datetime.utcnow().isocalendar()
+        rng = seeded_rng("library_mix", trigger.id, kind, f"{iso_year}-W{iso_week}")
+
+        entries = select_mix(db, kind, rng=rng)
+        track_ids = _curate(
+            db, [entry["id"] for entry in entries], target=spec.get("limit", 50), rng=rng
+        )
+        logger.info(
+            f"Library mix '{kind}': {len(entries)} candidate(s) -> "
+            f"{len(track_ids)} track(s) after curation"
+        )
+
+        if not track_ids:
+            # An empty mix is a real answer (no play history yet, nothing
+            # unplayed, ...) — leave whatever is already in Navidrome alone.
+            logger.info(f"Library mix '{kind}' produced nothing — nothing published")
+            trigger.last_run = datetime.utcnow()
+            db.commit()
+            return
+
+        client = _get_client_from_db()
+        try:
+            await _publish_playlist(db, client, playlist_name, track_ids)
+        finally:
+            await client.close()
+
+        trigger.last_run = datetime.utcnow()
+        db.commit()
+        logger.info(
+            f"Trigger '{trigger.name}': published '{playlist_name}' "
+            f"({kind}) with {len(track_ids)} tracks"
+        )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Library mix trigger {trigger_id} failed: {e}")
+    finally:
+        db.close()
+
+
 # Trigger type → job function mapping
 TRIGGER_JOBS = {
     "recency": run_recency_trigger,
     "heavy_rotation": run_heavy_rotation_trigger,
     "scheduled": run_scheduled_trigger,
+    "library_mix": run_library_mix_trigger,
 }
 
 
@@ -1095,7 +1331,7 @@ def add_trigger_job(trigger: SmartTrigger):
     job_func = TRIGGER_JOBS[trigger.trigger_type]
 
     if trigger.trigger_type == "scheduled" and trigger.cron_expression:
-        parts = trigger.cron_expression.strip().split()
+        parts = trigger.cron_expression.strip().split(" ")
         if len(parts) == 5:
             sched.add_job(
                 job_func,
@@ -1113,6 +1349,37 @@ def add_trigger_job(trigger: SmartTrigger):
         else:
             logger.warning(f"Invalid cron expression for trigger {trigger.id}: {trigger.cron_expression}")
             return
+    elif trigger.trigger_type == "library_mix" and trigger.cron_expression:
+        # Mixes are cheap (local queries only), but the seed rotates weekly, so
+        # a daily run is the useful default and a custom cron is honoured.
+        parts = trigger.cron_expression.strip().split(" ")
+        if len(parts) != 5:
+            logger.warning(
+                f"Invalid cron expression for library_mix trigger {trigger.id}: "
+                f"{trigger.cron_expression}"
+            )
+            return
+        sched.add_job(
+            job_func,
+            trigger=CronTrigger(
+                minute=parts[0],
+                hour=parts[1],
+                day=parts[2],
+                month=parts[3],
+                day_of_week=parts[4],
+            ),
+            id=job_id,
+            args=[trigger.id],
+            replace_existing=True,
+        )
+    elif trigger.trigger_type == "library_mix":
+        sched.add_job(
+            job_func,
+            trigger=CronTrigger(hour=6, minute=30),
+            id=job_id,
+            args=[trigger.id],
+            replace_existing=True,
+        )
     elif trigger.trigger_type == "recency":
         sched.add_job(
             job_func,

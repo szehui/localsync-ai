@@ -592,7 +592,9 @@ class TestRecencyTriggerCooldownIntegration:
         pushed_tracks = []
         created_playlist_row = None
 
-        def fake_query(model):
+        def fake_query(model, *columns):
+            # SQLAlchemy accepts column lists (db.query(Track.id, Track.genre));
+            # the fake must too or the curation metadata lookup raises TypeError.
             m = MagicMock()
             if model is SmartTrigger:
                 m.filter.return_value.first.return_value = trigger
@@ -636,7 +638,9 @@ class TestRecencyTriggerCooldownIntegration:
             {"id": "album-2", "name": "Album Two"},
         ])
         # Album 1 contains: "fresh1", "fresh2", "blocked1" (must be filtered)
-        # Album 2 contains: "fresh3", "blocked2" (must be filtered), "fresh4"
+        # Album 2 contains "fresh3", "blocked2" (must be filtered), "fresh4",
+        # plus enough extras that the run clears the 10-track publish gate —
+        # the gate exists so a 4-track "Daily Mix" never replaces yesterday's.
         async def fake_get_album(album_id):
             if album_id == "album-1":
                 return {"album": {"song": [
@@ -648,6 +652,10 @@ class TestRecencyTriggerCooldownIntegration:
                 {"id": "fresh3", "artist_name": "Artist A"},
                 {"id": "blocked2", "artist_name": "Artist D"},
                 {"id": "fresh4", "artist_name": "Artist E"},
+                *[
+                    {"id": f"fresh{n}", "artist_name": f"Artist F{n}"}
+                    for n in range(5, 20)
+                ],
             ]}}
         fake_client.get_album = fake_get_album
 

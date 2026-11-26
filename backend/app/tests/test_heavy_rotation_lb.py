@@ -27,7 +27,9 @@ def trigger():
 
 
 def _make_db(trigger, *, lb_configured: bool, lastfm_configured: bool):
-    def fake_query(model):
+    def fake_query(model, *columns):
+        # SQLAlchemy accepts column lists (db.query(Track.id, Track.genre));
+        # the fake must too or the metadata lookup raises TypeError.
         m = MagicMock()
         if model is SmartTrigger:
             m.filter.return_value.first.return_value = trigger

@@ -57,6 +57,11 @@ class Track(Base):
     rating = Column(Integer, default=0)  # 0-5 star rating
     starred = Column(Boolean, default=False)
     created_at = Column(DateTime, nullable=True)
+    # Last time Navidrome played this track ("played" in the Subsonic song
+    # object). The time-window mixes (On Repeat / Rewind / Rediscover) are built
+    # from this; it stays NULL until the library has been synced once after the
+    # column was added.
+    last_played_at = Column(DateTime, nullable=True)
     last_synced = Column(DateTime, default=datetime.utcnow)
     # MusicBrainz recording ID from Navidrome's Subsonic musicBrainzId field.
     # NULL when the album wasn't tagged (tagging in Sze's library is per-album).
@@ -94,10 +99,13 @@ class SmartTrigger(Base):
     __tablename__ = "smart_triggers"
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String, nullable=False)
-    trigger_type = Column(String, nullable=False)  # "recency" | "heavy_rotation" | "scheduled"
+    trigger_type = Column(String, nullable=False)  # "recency" | "heavy_rotation" | "scheduled" | "library_mix"
     enabled = Column(Boolean, default=True)
     cron_expression = Column(String, nullable=True)  # For scheduled triggers
     threshold = Column(Integer, nullable=True)  # For heavy_rotation: play count threshold
+    # For library_mix: which local mix to build (deep_cuts | on_repeat | rewind
+    # | rediscover | unplayed). See services/mixes.py MIX_SPECS.
+    mix_kind = Column(String, nullable=True)
     playlist_name = Column(String, nullable=True)  # Target playlist name
     navidrome_playlist_id = Column(String, nullable=True)
     last_run = Column(DateTime, nullable=True)
@@ -238,13 +246,28 @@ def init_db():
         if "search_key" not in track_columns:
             conn.execute(sa.text("ALTER TABLE tracks ADD COLUMN search_key VARCHAR"))
             added.append("search_key")
+        if "last_played_at" not in track_columns:
+            # Populated from Navidrome's `played` field on the next library
+            # sync; the time-window mixes stay empty until then.
+            conn.execute(sa.text("ALTER TABLE tracks ADD COLUMN last_played_at DATETIME"))
+            added.append("last_played_at")
         conn.execute(sa.text(
             "CREATE INDEX IF NOT EXISTS ix_tracks_recording_mbid ON tracks (recording_mbid)"
         ))
         conn.execute(sa.text(
             "CREATE INDEX IF NOT EXISTS ix_tracks_search_key ON tracks (search_key)"
         ))
+        conn.execute(sa.text(
+            "CREATE INDEX IF NOT EXISTS ix_tracks_last_played_at ON tracks (last_played_at)"
+        ))
         conn.commit()
+
+    # Library-mix triggers need to remember which local mix they build.
+    trigger_columns = [c["name"] for c in inspector.get_columns("smart_triggers")]
+    if "mix_kind" not in trigger_columns:
+        with engine.connect() as conn:
+            conn.execute(sa.text("ALTER TABLE smart_triggers ADD COLUMN mix_kind VARCHAR"))
+            conn.commit()
 
     # Backfill search_key from existing rows (no Navidrome calls needed).
     # recording_mbid CANNOT be backfilled — it requires a library resync.
