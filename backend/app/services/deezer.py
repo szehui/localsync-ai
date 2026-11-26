@@ -9,6 +9,7 @@ Deezer is only ever used to *name* a release. Lidarr still resolves the actual
 release group against MusicBrainz, so a bad attribution can only produce a
 missing album, never a wrong download.
 """
+import asyncio
 import logging
 import re
 import unicodedata
@@ -17,6 +18,15 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 logger = logging.getLogger(__name__)
+
+
+class DeezerUnavailable(Exception):
+    """Deezer could not be reached / kept throttling.
+
+    Distinct from "Deezer answered and had no such album": a caller must retry
+    the former and must not confuse it with a real miss, or a transient 503
+    silently turns a resolvable track into an artist-wide subscription.
+    """
 
 
 def _norm(text: Optional[str]) -> str:
@@ -52,6 +62,12 @@ class DeezerService:
     """Track -> album attribution backed by Deezer's public search."""
 
     BASE_URL = "https://api.deezer.com"
+    # Deezer throttles anonymous callers (HTTP 429) well before a 300-track
+    # playlist is done. A missed lookup is not harmless: the track silently
+    # loses its album and falls through to the artist fallback, which subscribes
+    # to a whole discography. Retry rather than lose the attribution.
+    RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+    RETRY_BACKOFF = (1.0, 2.5, 5.0)
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
@@ -63,6 +79,9 @@ class DeezerService:
         """Return the release a track belongs to, or None if not confident.
 
         Result: ``{"album", "album_artist", "deezer_album_id", "score"}``.
+
+        Raises `DeezerUnavailable` when Deezer could not be reached, so the
+        caller can retry rather than mistake an outage for "no such album".
         """
         key = (_norm(artist), _norm(title))
         if key in self._cache:
@@ -115,20 +134,45 @@ class DeezerService:
             queries.append(title)
 
         for query in queries:
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout) as client:
-                    resp = await client.get(
-                        f"{self.BASE_URL}/search", params={"q": query, "limit": 10}
-                    )
-                if resp.status_code != 200:
-                    logger.warning(
-                        "Deezer search HTTP %s for %r", resp.status_code, query
-                    )
-                    continue
-                data = resp.json().get("data") or []
-                if data:
-                    return data
-            except Exception as e:
-                logger.warning("Deezer search failed for %r: %s", query, e)
+            rows = await self._get(f"{self.BASE_URL}/search",
+                                   {"q": query, "limit": 10})
+            if not rows:
+                continue
+            # Note: an empty result is `{"data": [], "total": 0}` — a truthy
+            # dict. Checking `if rows` here silently skipped the fallback query
+            # and lost real albums; the data list is what matters.
+            data = rows.get("data") or []
+            if data:
+                return data
 
         return []
+
+    async def _get(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """GET with retry on throttling. Returns parsed JSON, or None on a 4xx."""
+        last = None
+        for wait in self.RETRY_BACKOFF:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    resp = await client.get(url, params=params)
+                if resp.status_code in self.RETRY_STATUSES:
+                    logger.info(
+                        "Deezer HTTP %s for %r, retrying in %.1fs",
+                        resp.status_code, params.get("q"), wait)
+                    last = f"HTTP {resp.status_code}"
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    logger.warning(
+                        "Deezer search HTTP %s for %r",
+                        resp.status_code, params.get("q"))
+                    return None  # a real "no", not a failure
+                return resp.json()
+            except Exception as e:
+                logger.warning("Deezer request failed for %r: %s",
+                               params.get("q"), e)
+                last = f"{type(e).__name__}: {e}"
+                await asyncio.sleep(wait)
+
+        raise DeezerUnavailable(
+            f"Deezer unavailable for {params.get('q')!r} after "
+            f"{len(self.RETRY_BACKOFF)} attempts ({last})")

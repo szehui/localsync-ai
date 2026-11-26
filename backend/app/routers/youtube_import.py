@@ -24,7 +24,7 @@ from app.services.youtube_music import (
     clean_track_title,
 )
 from app.services.lidarr import LidarrService
-from app.services.deezer import DeezerService
+from app.services.deezer import DeezerService, DeezerUnavailable
 from app.services.navidrome import NavidromeClient
 from app.routers.auth import get_navidrome_client, get_current_user
 
@@ -92,6 +92,24 @@ def _match_score(title1: str, artist1: str, title2: str, artist2: str) -> float:
 # The Gang must not resolve to They Might Be Giants just because the title is
 # exact. Require some artist agreement whenever we know the artist at all.
 _ARTIST_GATE = 0.45
+
+
+# A one-word generic channel name ("Release", "Topic") is not an artist, and
+# subscribing to whatever Lidarr thinks it is would queue a stranger's
+# discography.
+_GENERIC_ARTIST_NAMES = {
+    "release", "topic", "vevo", "music", "official", "channel", "records",
+    "unknown", "various artists", "artist", "audio",
+}
+
+# The track-matching gate (0.45) is deliberately loose: a track match costs one
+# song. The artist-fallback gate must be stricter, because it subscribes to an
+# entire discography. 0.6 still rejects the real false positive — "Penn Masala"
+# vs "Pennsylvania Mass Choir" scores 0.47 — while accepting the spelling
+# variants the same artist really has ("i-dle (아이들)" vs "(G)I-DLE" scores
+# 0.63). Cross-script names (이영지 vs "Lee Young Ji", 0.0) are rejected: a
+# track left unresolved beats a stranger's discography.
+_FALLBACK_ARTIST_GATE = 0.6
 
 
 def _artist_similarity(artist1: str, artist2: str) -> float:
@@ -198,6 +216,53 @@ def _group_by_album(
     return albums, unresolved
 
 
+async def _attribute_tracks(
+    deezer: "DeezerService",
+    tracks: List["TrackMatchResult"],
+    concurrency: int = 3,
+) -> List[Optional[Dict[str, Any]]]:
+    """Resolve each track to a release, retrying anything Deezer failed on.
+
+    Pass 1 runs concurrently (bounded). Deezer throttles and occasionally drops
+    connections, and a failure is NOT the same as "no album": the first costs an
+    album add, the second falls through to an artist-wide subscription. So the
+    tracks that errored are retried serially, slower, before being given up on.
+    """
+    hits: List[Optional[Dict[str, Any]]] = [None] * len(tracks)
+    errors: List[int] = []
+    sem = asyncio.Semaphore(concurrency)
+
+    async def attempt(index: int) -> None:
+        tr = tracks[index]
+        async with sem:
+            try:
+                hits[index] = await deezer.lookup_album(
+                    clean_artist_name(tr.artist),
+                    clean_track_title(tr.title),
+                )
+            except DeezerUnavailable as e:
+                logger.info("Album attribution deferred (%s): %s", tr.title, e)
+                errors.append(index)
+            except Exception as e:
+                logger.warning("Album attribution failed for %s - %s: %s",
+                               tr.artist, tr.title, e)
+                errors.append(index)
+
+    await asyncio.gather(*[attempt(i) for i in range(len(tracks))])
+
+    for index in errors:
+        tr = tracks[index]
+        await asyncio.sleep(1.0)
+        try:
+            hits[index] = await deezer.lookup_album(
+                clean_artist_name(tr.artist), clean_track_title(tr.title))
+        except Exception as e:
+            logger.warning("Album attribution gave up for %s - %s: %s",
+                           tr.artist, tr.title, e)
+
+    return hits
+
+
 async def _add_artists_for_unresolved(
     lidarr: "LidarrService",
     unresolved: List["TrackMatchResult"],
@@ -227,12 +292,23 @@ async def _add_artists_for_unresolved(
     }
 
     for artist_name in by_artist:
+        normalized = " ".join(artist_name.lower().split())
+        if normalized in _GENERIC_ARTIST_NAMES or len(normalized) < 2:
+            logger.info("Lidarr: skipping generic artist name '%s'", artist_name)
+            continue
         try:
             results = await lidarr.lookup_artist(artist_name)
             if not results:
                 logger.info("Lidarr: no artist match for '%s'", artist_name)
                 continue
             artist_data = results[0]
+            found_name = (artist_data.get("artistName")
+                          or artist_data.get("name") or "")
+            if _artist_similarity(artist_name, found_name) < _FALLBACK_ARTIST_GATE:
+                logger.info(
+                    "Lidarr: artist fallback rejected for '%s' "
+                    "(lookup returned '%s')", artist_name, found_name)
+                continue
             if artist_data.get("foreignArtistId") in existing_ids:
                 logger.info("Lidarr: artist already present: %s", artist_name)
                 continue
@@ -408,23 +484,7 @@ async def import_youtube_playlist(
     if lidarr and missing_results:
         try:
             deezer = DeezerService()
-            sem = asyncio.Semaphore(5)
-
-            async def _attribute(tr: TrackMatchResult):
-                async with sem:
-                    try:
-                        return await deezer.lookup_album(
-                            clean_artist_name(tr.artist),
-                            clean_track_title(tr.title),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Album attribution failed for %s - %s: %s",
-                            tr.artist, tr.title, e)
-                        return None
-
-            hits = await asyncio.gather(
-                *[_attribute(tr) for tr in missing_results])
+            hits = await _attribute_tracks(deezer, missing_results)
 
             albums, unresolved = _group_by_album(missing_results, hits)
 

@@ -437,6 +437,72 @@ def test_single_album_add_is_never_artist_level():
     assert "_add_artists_for_unresolved" in source
 
 
+# ---- Album attribution: an outage is retried, a miss is not ----
+
+class FlakyDeezer:
+    """Fails the first time for chosen titles, as a throttled API does."""
+
+    def __init__(self, failing=(), hits=None):
+        self.failing = set(failing)
+        self.hits = hits or {}
+        self.calls = []
+
+    async def lookup_album(self, artist, title):
+        from app.services.deezer import DeezerUnavailable
+
+        self.calls.append((artist, title))
+        if title in self.failing:
+            self.failing.discard(title)  # fails once, then works
+            raise DeezerUnavailable(f"throttled for {title}")
+        return self.hits.get(title)
+
+
+async def test_attribution_retries_after_an_outage():
+    from app.routers.youtube_import import _attribute_tracks
+
+    deezer = FlakyDeezer(
+        failing=["DNA"],
+        hits={"DNA": {"album": "Proof", "album_artist": "BTS",
+                      "deezer_album_id": 1, "score": 1.0}})
+    tracks = [_missing("DNA", "BTS")]
+
+    hits = await _attribute_tracks(deezer, tracks)
+
+    assert hits[0]["album"] == "Proof"
+    assert len(deezer.calls) == 2  # first failed, retry succeeded
+
+
+async def test_attribution_leaves_a_real_miss_unresolved():
+    from app.routers.youtube_import import _attribute_tracks
+
+    deezer = FlakyDeezer()  # answers None: no such album
+    tracks = [_missing("Obscure Mashup", "Nobody")]
+
+    hits = await _attribute_tracks(deezer, tracks)
+
+    assert hits == [None]
+    assert len(deezer.calls) == 1  # a miss is not retried
+
+
+async def test_attribution_keeps_order_when_one_retries():
+    """Retries must not shuffle hits out of alignment with their tracks."""
+    from app.routers.youtube_import import _attribute_tracks
+
+    deezer = FlakyDeezer(
+        failing=["B"],
+        hits={"A": {"album": "Album A", "album_artist": "X", "deezer_album_id": 1,
+                    "score": 1.0},
+               "B": {"album": "Album B", "album_artist": "Y", "deezer_album_id": 2,
+                     "score": 1.0},
+               "C": {"album": "Album C", "album_artist": "Z", "deezer_album_id": 3,
+                     "score": 1.0}})
+    tracks = [_missing("A", "X"), _missing("B", "Y"), _missing("C", "Z")]
+
+    hits = await _attribute_tracks(deezer, tracks)
+
+    assert [h["album"] for h in hits] == ["Album A", "Album B", "Album C"]
+
+
 # ---- Artist fallback for tracks with no addable album ----
 
 class FakeLidarrArtists:
@@ -521,6 +587,65 @@ async def test_fallback_ignores_unknown_artist():
     assert added == []
     assert lidarr.added == []
     assert tracks[0].lidarr_artist_added is False
+
+
+async def test_fallback_rejects_unrelated_lookup_hit():
+    """Lidarr will fuzzy-match any name; a wrong artist is worse than a gap."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"Penn Masala": {"artistName": "Pennsylvania Mass Choir",
+                                "foreignArtistId": "wrong-mbid"}})
+    tracks = [_missing("Aadat / Apologize", "Penn Masala")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == []
+    assert lidarr.added == []
+    assert tracks[0].lidarr_artist_added is False
+
+
+async def test_fallback_skips_generic_single_words():
+    """'Release' is a YouTube -Topic channel, not a band worth subscribing to."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"Release": {"artistName": "Release", "foreignArtistId": "x"}})
+    tracks = [_missing("Can't Get You Out of My Head", "Release")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == []
+    assert lidarr.looked_up == []  # never even asked
+    assert lidarr.added == []
+
+
+async def test_fallback_accepts_agreeing_name_variation():
+    """Punctuation/spacing differences must not block a real artist."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"TOMORROW X TOGETHER": {"artistName": "TOMORROW X TOGETHER",
+                                        "foreignArtistId": "txt-mbid"}})
+    tracks = [_missing("Tinnitus", "TOMORROW X TOGETHER")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == ["TOMORROW X TOGETHER"]
+
+
+async def test_fallback_accepts_cross_spelling_of_same_group():
+    """'(G)I-DLE' is the same act as YouTube's 'i-dle (아이들)'."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"i-dle (아이들)": {"artistName": "(G)I-DLE",
+                                   "foreignArtistId": "idle-mbid"}})
+    tracks = [_missing("Mono", "i-dle (아이들)")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == ["i-dle (아이들)"]
 
 
 async def test_fallback_does_not_flag_matched_tracks():
