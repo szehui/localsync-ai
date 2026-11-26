@@ -12,10 +12,13 @@ from app.services.lidarr import LidarrService
 
 @pytest.fixture(autouse=True)
 def no_real_sleep(monkeypatch):
+    delays = []
+
     async def fake_sleep(delay):
-        return None
+        delays.append(delay)
 
     monkeypatch.setattr(lidarr_module.asyncio, "sleep", fake_sleep)
+    return delays
 
 
 class FakeLidarr:
@@ -221,3 +224,41 @@ class TestAddAlbums:
         for artist_id in fake.artist_ids.values():
             assert fake.artists[artist_id]["monitorNewItems"] == "none"
         assert all(a["monitored"] for a in fake.albums.values())
+
+
+class TestRateLimiting:
+    """Lidarr's metadata proxy is ~1 req/s; back-to-back adds get 503s."""
+
+    async def test_adds_are_spaced_out(self, enhypen, no_real_sleep):
+        service = enhypen.make_service()
+        await service.add_albums([
+            ("ENHYPEN", "DARK BLOOD"),
+            ("ENHYPEN", "ORANGE BLOOD"),
+            ("ENHYPEN", "ROMANCE : UNTOLD"),
+        ])
+
+        # n adds -> n-1 gaps, no pointless sleep after the last one
+        assert no_real_sleep == [1.5, 1.5]
+
+    async def test_delay_is_configurable(self, enhypen, no_real_sleep):
+        service = enhypen.make_service()
+        await service.add_albums(
+            [("ENHYPEN", "DARK BLOOD"), ("ENHYPEN", "ORANGE BLOOD")],
+            delay=0.25)
+
+        assert no_real_sleep == [0.25]
+
+    async def test_single_album_does_not_sleep(self, enhypen, no_real_sleep):
+        service = enhypen.make_service()
+        await service.add_albums([("ENHYPEN", "DARK BLOOD")])
+
+        assert no_real_sleep == []
+
+    async def test_failed_add_still_paces_the_next_one(self, enhypen, no_real_sleep):
+        service = enhypen.make_service()
+        await service.add_albums([
+            ("ENHYPEN", "NOT REAL"),
+            ("ENHYPEN", "DARK BLOOD"),
+        ])
+
+        assert no_real_sleep == [1.5]

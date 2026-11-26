@@ -30,6 +30,7 @@ class TrackMatchResult(BaseModel):
     album: str
     status: str  # "matched" | "missing" | "queued_to_lidarr"
     lidarr_album_added: bool = False
+    lidarr_artist_added: bool = False
     error: Optional[str] = None
 
 
@@ -40,6 +41,7 @@ class YouTubeImportResult(BaseModel):
     missing_count: int
     lidarr_queued_count: int  # number of albums added (not artists)
     lidarr_albums: List[str] = []
+    lidarr_artists: List[str] = []  # fallback adds for unattributable tracks
     tracks: List[TrackMatchResult]
 
 

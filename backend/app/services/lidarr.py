@@ -448,6 +448,7 @@ class LidarrService:
         }
 
     async def add_albums(self, items: Iterable[tuple], search: bool = False,
+                         delay: float = 1.5,
                          ) -> Dict[str, Any]:
         """Add several albums at once, collapsing monitoring ONCE per artist.
 
@@ -457,14 +458,19 @@ class LidarrService:
         single collapse that keeps all of *our* albums.
 
         `items` is an iterable of `(artist_name, release_name)` pairs.
+        `delay` seconds are inserted between adds: Lidarr fronts MusicBrainz
+        through a metadata proxy rate-limited to ~1 req/s; hammering lookup/
+        album endpoints back-to-back yields 503s, which the caller doesn't need
+        to know about.
 
         Returns ``{"added", "already_present", "failed", "monitoring_ok",
         "results"}``.
         """
         results: List[Dict[str, Any]] = []
         by_artist: Dict[int, List[int]] = {}
+        items = list(items)
 
-        for artist_name, release_name in items:
+        for index, (artist_name, release_name) in enumerate(items):
             try:
                 res = await self._add_album_core(
                     artist_name, release_name, search=search)
@@ -480,6 +486,9 @@ class LidarrService:
                     "release_name": release_name,
                     "error": str(e),
                 })
+
+            if index < len(items) - 1:
+                await asyncio.sleep(delay)
 
         monitored_ok = True
         for artist_id, album_ids in by_artist.items():

@@ -198,6 +198,59 @@ def _group_by_album(
     return albums, unresolved
 
 
+async def _add_artists_for_unresolved(
+    lidarr: "LidarrService",
+    unresolved: List["TrackMatchResult"],
+    all_tracks: List["TrackMatchResult"],
+) -> List[str]:
+    """Artist-level fallback for tracks that resolved to no release.
+
+    A handful of tracks (mashups, repackage-only singles) have no addable album
+    in MusicBrainz at all. Leaving them to rot means they never arrive, so
+    subscribe to the artist instead — a deliberate exception to the album-level
+    rule, and only for tracks album attribution already failed on.
+
+    Returns the artist names added.
+    """
+    by_artist: Dict[str, str] = {}
+    for tr in unresolved:
+        by_artist.setdefault(tr.artist, tr.title)
+
+    added: List[str] = []
+    if not by_artist:
+        return added
+
+    root_folder = await lidarr.get_root_folder()
+    existing = await lidarr.get_artists()
+    existing_ids = {
+        a.get("foreignArtistId") for a in existing if a.get("foreignArtistId")
+    }
+
+    for artist_name in by_artist:
+        try:
+            results = await lidarr.lookup_artist(artist_name)
+            if not results:
+                logger.info("Lidarr: no artist match for '%s'", artist_name)
+                continue
+            artist_data = results[0]
+            if artist_data.get("foreignArtistId") in existing_ids:
+                logger.info("Lidarr: artist already present: %s", artist_name)
+                continue
+            await lidarr.add_artist(artist_data, root_folder)
+            added.append(artist_name)
+            logger.info("Lidarr: added artist as fallback: %s", artist_name)
+        except Exception as e:
+            logger.warning("Lidarr: artist fallback failed for %s: %s",
+                           artist_name, e)
+
+    added_set = set(added)
+    for tr in all_tracks:
+        if tr.status == "missing" and tr.artist in added_set:
+            tr.lidarr_artist_added = True
+
+    return added
+
+
 @router.post("/import", response_model=YouTubeImportResult)
 async def import_youtube_playlist(
     request: YouTubeImportRequest,
@@ -348,6 +401,7 @@ async def import_youtube_playlist(
     # once per album, which in a loop would un-monitor its own earlier adds.
     lidarr_queued_count = 0
     lidarr_albums: List[str] = []
+    lidarr_artists: List[str] = []
     unresolved_tracks: List[TrackMatchResult] = []
 
     missing_results = [r for r in track_results if r.status == "missing"]
@@ -411,6 +465,11 @@ async def import_youtube_playlist(
     if lidarr and unresolved_tracks:
         logger.info("Lidarr: %d track(s) left unresolved (no album found)",
                     len(unresolved_tracks))
+        try:
+            lidarr_artists = await _add_artists_for_unresolved(
+                lidarr, unresolved_tracks, track_results)
+        except Exception as e:
+            logger.error(f"Lidarr artist fallback failed: {e}")
 
     # Step 4: Create or update Navidrome playlist
     navidrome_playlist_id = None
@@ -452,6 +511,7 @@ async def import_youtube_playlist(
         missing_count=missing_count,
         lidarr_queued_count=lidarr_queued_count,
         lidarr_albums=lidarr_albums,
+        lidarr_artists=lidarr_artists,
         tracks=track_results,
     )
 

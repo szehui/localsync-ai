@@ -422,10 +422,10 @@ def test_group_by_album_records_the_album_on_each_track():
 
 
 def test_single_album_add_is_never_artist_level():
-    """Guard the regression: the importer must not call add_artist.
+    """The importer must not subscribe artists wholesale.
 
-    One missing BTS track used to subscribe the user to all 30 of the artist's
-    albums. Album-level adds are the whole point of this path.
+    Album-level adds are the default; the only artist-level path is the
+    explicit fallback helper, for tracks that resolved to no release at all.
     """
     import inspect
 
@@ -434,3 +434,106 @@ def test_single_album_add_is_never_artist_level():
     source = inspect.getsource(youtube_import.import_youtube_playlist)
     assert ".add_artist(" not in source
     assert ".add_albums(" in source
+    assert "_add_artists_for_unresolved" in source
+
+
+# ---- Artist fallback for tracks with no addable album ----
+
+class FakeLidarrArtists:
+    def __init__(self, lookup=None, existing=None):
+        self.lookup = lookup or {}
+        self.existing = existing or []
+        self.added = []
+        self.looked_up = []
+
+    async def get_root_folder(self):
+        return {"path": "/data/music", "defaultQualityProfileId": 1,
+                "defaultMetadataProfileId": 1}
+
+    async def get_artists(self):
+        return [{"foreignArtistId": mbid} for mbid in self.existing]
+
+    async def lookup_artist(self, name):
+        self.looked_up.append(name)
+        hit = self.lookup.get(name)
+        return [hit] if hit else []
+
+    async def add_artist(self, artist_data, root_folder):
+        self.added.append(artist_data["artistName"])
+        return {"id": 1}
+
+
+async def test_fallback_adds_artist_when_no_album_resolved():
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"VaVa": {"artistName": "VaVa", "foreignArtistId": "vava-mbid"}})
+    tracks = [_missing("My New Swag", "VaVa")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == ["VaVa"]
+    assert lidarr.added == ["VaVa"]
+    assert tracks[0].lidarr_artist_added is True
+    # still missing from the library, and honestly reported as such
+    assert tracks[0].status == "missing"
+
+
+async def test_fallback_skips_artist_already_in_lidarr():
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"VaVa": {"artistName": "VaVa", "foreignArtistId": "vava-mbid"}},
+        existing=["vava-mbid"])
+    tracks = [_missing("My New Swag", "VaVa")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == []
+    assert lidarr.added == []
+    assert tracks[0].lidarr_artist_added is False
+
+
+async def test_fallback_looks_up_each_artist_once():
+    """Two unresolved tracks by one artist are one artist subscription."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists(
+        lookup={"Penn Masala": {"artistName": "Penn Masala",
+                                "foreignArtistId": "pm-mbid"}})
+    tracks = [_missing("Song A", "Penn Masala"), _missing("Song B", "Penn Masala")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == ["Penn Masala"]
+    assert lidarr.looked_up == ["Penn Masala"]
+    assert all(t.lidarr_artist_added for t in tracks)
+
+
+async def test_fallback_ignores_unknown_artist():
+    from app.routers.youtube_import import _add_artists_for_unresolved
+
+    lidarr = FakeLidarrArtists()
+    tracks = [_missing("Obscure", "Nobody At All")]
+
+    added = await _add_artists_for_unresolved(lidarr, tracks, tracks)
+
+    assert added == []
+    assert lidarr.added == []
+    assert tracks[0].lidarr_artist_added is False
+
+
+async def test_fallback_does_not_flag_matched_tracks():
+    """Only the unresolved tracks are marked, never a matched one."""
+    from app.routers.youtube_import import _add_artists_for_unresolved
+    from app.models.schemas_youtube import TrackMatchResult
+
+    lidarr = FakeLidarrArtists(
+        lookup={"VaVa": {"artistName": "VaVa", "foreignArtistId": "vava-mbid"}})
+    unresolved = [_missing("My New Swag", "VaVa")]
+    matched = TrackMatchResult(title="Bite Me", artist="VaVa", album="X",
+                               status="matched")
+
+    await _add_artists_for_unresolved(lidarr, unresolved, unresolved + [matched])
+
+    assert matched.lidarr_artist_added is False
