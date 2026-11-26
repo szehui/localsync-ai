@@ -360,3 +360,77 @@ def test_preference_falls_back_to_raw_score():
     clean_other = clean_track_title(other)
     # Neither needed no cleaning, so raw proximity decides.
     assert _preference_key(same, clean_same, 1.0) > _preference_key(other, clean_other, 0.8)
+
+
+# ---- Album grouping: one add per release, not per track ----
+
+def _missing(title, artist):
+    from app.models.schemas_youtube import TrackMatchResult
+
+    return TrackMatchResult(title=title, artist=artist, album="", status="missing")
+
+
+def _hit(album, album_artist):
+    return {"album": album, "album_artist": album_artist,
+            "deezer_album_id": 1, "score": 0.95}
+
+
+def test_group_by_album_collapses_tracks_of_one_release():
+    """Two ENHYPEN tracks from DARK BLOOD are one album add, not two."""
+    from app.routers.youtube_import import _group_by_album
+
+    tracks = [_missing("Bite Me", "ENHYPEN"), _missing("Sacrifice", "ENHYPEN")]
+    albums, unresolved = _group_by_album(
+        tracks, [_hit("DARK BLOOD", "ENHYPEN"), _hit("DARK BLOOD", "ENHYPEN")])
+
+    assert unresolved == []
+    assert len(albums) == 1
+    group = next(iter(albums.values()))
+    assert group["album"] == "DARK BLOOD"
+    assert len(group["tracks"]) == 2
+
+
+def test_group_by_album_is_case_insensitive():
+    from app.routers.youtube_import import _group_by_album
+
+    albums, _ = _group_by_album(
+        [_missing("Bite Me", "ENHYPEN"), _missing("Sacrifice", "ENHYPEN")],
+        [_hit("Dark Blood", "ENHYPEN"), _hit("DARK BLOOD", "enhypen")])
+
+    assert len(albums) == 1
+
+
+def test_group_by_album_keeps_unattributed_tracks_aside():
+    from app.routers.youtube_import import _group_by_album
+
+    tracks = [_missing("Bite Me", "ENHYPEN"), _missing("Mystery", "Nobody")]
+    albums, unresolved = _group_by_album(
+        tracks, [_hit("DARK BLOOD", "ENHYPEN"), None])
+
+    assert len(albums) == 1
+    assert [t.title for t in unresolved] == ["Mystery"]
+
+
+def test_group_by_album_records_the_album_on_each_track():
+    """The UI shows which release a queued track came from."""
+    from app.routers.youtube_import import _group_by_album
+
+    track = _missing("Bite Me", "ENHYPEN")
+    _group_by_album([track], [_hit("DARK BLOOD", "ENHYPEN")])
+
+    assert track.album == "DARK BLOOD"
+
+
+def test_single_album_add_is_never_artist_level():
+    """Guard the regression: the importer must not call add_artist.
+
+    One missing BTS track used to subscribe the user to all 30 of the artist's
+    albums. Album-level adds are the whole point of this path.
+    """
+    import inspect
+
+    from app.routers import youtube_import
+
+    source = inspect.getsource(youtube_import.import_youtube_playlist)
+    assert ".add_artist(" not in source
+    assert ".add_albums(" in source

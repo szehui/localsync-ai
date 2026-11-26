@@ -214,12 +214,13 @@ export const api = {
       matched_count: number;
       missing_count: number;
       lidarr_queued_count: number;
+      lidarr_albums: string[];
       tracks: Array<{
         title: string;
         artist: string;
         album: string;
         status: 'matched' | 'missing' | 'queued_to_lidarr';
-        lidarr_artist_added: boolean;
+        lidarr_album_added: boolean;
         error?: string;
       }>;
     }>('/youtube-import/import', {

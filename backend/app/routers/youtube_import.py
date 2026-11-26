@@ -1,4 +1,5 @@
 """YouTube Music import router."""
+import asyncio
 import re
 import logging
 from typing import Dict, List, Any, Optional
@@ -23,6 +24,7 @@ from app.services.youtube_music import (
     clean_track_title,
 )
 from app.services.lidarr import LidarrService
+from app.services.deezer import DeezerService
 from app.services.navidrome import NavidromeClient
 from app.routers.auth import get_navidrome_client, get_current_user
 
@@ -164,6 +166,38 @@ async def parse_youtube_playlist(request: YouTubeImportRequest):
         )
 
 
+def _group_by_album(
+    tracks: List["TrackMatchResult"],
+    hits: List[Optional[Dict[str, Any]]],
+) -> tuple[Dict[tuple, Dict[str, Any]], List["TrackMatchResult"]]:
+    """Group tracks by the release they belong to.
+
+    Returns ``(albums, unresolved)`` where ``albums`` maps a case-folded
+    ``(album_artist, album)`` key to ``{"album_artist", "album", "tracks"}``.
+    Tracks with no attribution land in ``unresolved``.
+
+    Grouping matters: a 300-track playlist wants ~90 albums, not 130, and each
+    duplicate add costs a Lidarr lookup plus a monitoring collapse.
+    """
+    albums: Dict[tuple, Dict[str, Any]] = {}
+    unresolved: List[TrackMatchResult] = []
+
+    for track, hit in zip(tracks, hits):
+        if not hit:
+            unresolved.append(track)
+            continue
+        track.album = hit["album"]
+        key = (hit["album_artist"].casefold(), hit["album"].casefold())
+        group = albums.setdefault(key, {
+            "album_artist": hit["album_artist"],
+            "album": hit["album"],
+            "tracks": [],
+        })
+        group["tracks"].append(track)
+
+    return albums, unresolved
+
+
 @router.post("/import", response_model=YouTubeImportResult)
 async def import_youtube_playlist(
     request: YouTubeImportRequest,
@@ -194,7 +228,6 @@ async def import_youtube_playlist(
     # Step 2: Search Navidrome for each track
     matched_track_ids: List[str] = []
     track_results: List[TrackMatchResult] = []
-    missing_artists: Dict[str, Dict[str, Any]] = {}
 
     for track in playlist_data["tracks"]:
         try:
@@ -284,12 +317,6 @@ async def import_youtube_playlist(
                     )
                 )
             else:
-                artist_name = track["artist"]
-                if artist_name and artist_name not in missing_artists:
-                    missing_artists[artist_name] = {
-                        "artist_name": artist_name,
-                        "album_name": track["album"],
-                    }
                 track_results.append(
                     TrackMatchResult(
                         title=track["title"],
@@ -311,46 +338,79 @@ async def import_youtube_playlist(
                 )
             )
 
-    # Step 3: Add unique missing artists to Lidarr
+    # Step 3: Attribute missing tracks to albums, then add those albums
+    #
+    # Album-level, never artist-level: `add_artist` subscribes to a whole
+    # discography (one missing BTS track would queue all 30 albums). The flat
+    # YouTube feed carries no album metadata, so each missing track is resolved
+    # to a release via Deezer first, then the distinct releases go to Lidarr in
+    # one batch — `add_albums` collapses monitoring once per artist instead of
+    # once per album, which in a loop would un-monitor its own earlier adds.
     lidarr_queued_count = 0
-    added_artist_names: set[str] = set()
+    lidarr_albums: List[str] = []
+    unresolved_tracks: List[TrackMatchResult] = []
 
-    if lidarr and missing_artists:
+    missing_results = [r for r in track_results if r.status == "missing"]
+    if lidarr and missing_results:
         try:
-            root_folder = await lidarr.get_root_folder()
-            existing_artists = await lidarr.get_artists()
-            existing_ids = {
-                a.get("foreignArtistId")
-                for a in existing_artists
-                if a.get("foreignArtistId")
-            }
+            deezer = DeezerService()
+            sem = asyncio.Semaphore(5)
 
-            for artist_name, artist_info in missing_artists.items():
-                try:
-                    lookup_results = await lidarr.lookup_artist(artist_name)
+            async def _attribute(tr: TrackMatchResult):
+                async with sem:
+                    try:
+                        return await deezer.lookup_album(
+                            clean_artist_name(tr.artist),
+                            clean_track_title(tr.title),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Album attribution failed for %s - %s: %s",
+                            tr.artist, tr.title, e)
+                        return None
 
-                    if lookup_results:
-                        artist_data = lookup_results[0]
+            hits = await asyncio.gather(
+                *[_attribute(tr) for tr in missing_results])
 
-                        if artist_data.get("foreignArtistId") in existing_ids:
-                            logger.info(f"Artist already in Lidarr: {artist_name}")
-                            continue
+            albums, unresolved = _group_by_album(missing_results, hits)
 
-                        await lidarr.add_artist(artist_data, root_folder)
-                        lidarr_queued_count += 1
-                        added_artist_names.add(artist_name)
-                        logger.info(f"Added artist to Lidarr: {artist_name}")
+            if albums:
+                outcome = await lidarr.add_albums(
+                    [(g["album_artist"], g["album"]) for g in albums.values()],
+                    search=True,
+                )
+                added_keys = {
+                    (r.get("artist_name", "").casefold(),
+                     (r.get("release_name") or "").casefold())
+                    for r in outcome["results"] if r.get("album_id")
+                }
+                for group in albums.values():
+                    name = f'{group["album_artist"]} — {group["album"]}'
+                    if (group["album_artist"].casefold(),
+                            group["album"].casefold()) in added_keys:
+                        lidarr_albums.append(name)
+                        for tr in group["tracks"]:
+                            tr.lidarr_album_added = True
+                            tr.status = "queued_to_lidarr"
+                    else:
+                        unresolved_tracks.extend(group["tracks"])
 
-                except Exception as e:
-                    logger.warning(f"Failed to add artist to Lidarr: {artist_name}: {e}")
+                lidarr_queued_count = len(lidarr_albums)
+                logger.info(
+                    "Lidarr: %d album(s) added for %d missing track(s), "
+                    "%d failed, monitoring_ok=%s",
+                    len(outcome["added"]) + len(outcome["already_present"]),
+                    len(missing_results), len(outcome["failed"]),
+                    outcome["monitoring_ok"],
+                )
 
         except Exception as e:
             logger.error(f"Lidarr integration failed: {e}")
 
-    # Flag tracks whose artist was added to Lidarr
-    for tr in track_results:
-        if tr.status == "missing" and tr.artist in added_artist_names:
-            tr.lidarr_artist_added = True
+    # Tracks we could neither find on an album nor resolve stay missing
+    if lidarr and unresolved_tracks:
+        logger.info("Lidarr: %d track(s) left unresolved (no album found)",
+                    len(unresolved_tracks))
 
     # Step 4: Create or update Navidrome playlist
     navidrome_playlist_id = None
@@ -380,7 +440,10 @@ async def import_youtube_playlist(
             logger.error(f"Failed to create/update Navidrome playlist: {e}")
 
     matched_count = sum(1 for r in track_results if r.status == "matched")
-    missing_count = sum(1 for r in track_results if r.status == "missing")
+    # "Missing" stays truthful: queued-to-Lidarr tracks are still not in the
+    # library, they just have a download on the way.
+    missing_count = sum(
+        1 for r in track_results if r.status in ("missing", "queued_to_lidarr"))
 
     return YouTubeImportResult(
         playlist_name=playlist_name,
@@ -388,6 +451,7 @@ async def import_youtube_playlist(
         matched_count=matched_count,
         missing_count=missing_count,
         lidarr_queued_count=lidarr_queued_count,
+        lidarr_albums=lidarr_albums,
         tracks=track_results,
     )
 

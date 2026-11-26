@@ -15,7 +15,7 @@ interface TrackMatchResult {
   artist: string;
   album: string;
   status: 'matched' | 'missing' | 'queued_to_lidarr';
-  lidarr_artist_added: boolean;
+  lidarr_album_added: boolean;
   error?: string;
 }
 
@@ -31,6 +31,7 @@ interface YouTubeImportResult {
   matched_count: number;
   missing_count: number;
   lidarr_queued_count: number;
+  lidarr_albums: string[];
   tracks: TrackMatchResult[];
 }
 
@@ -394,7 +395,7 @@ export function YouTubeImport() {
               </div>
               <div className="bg-surface-overlay rounded-lg p-4">
                 <div className="text-2xl font-bold text-blue-400">{importResult.lidarr_queued_count}</div>
-                <div className="text-xs text-gray-500">Added to Lidarr</div>
+                <div className="text-xs text-gray-500">Albums queued</div>
               </div>
             </div>
 
@@ -419,11 +420,11 @@ export function YouTubeImport() {
                         {track.status === 'matched' && (
                           <Badge variant="success">✅ Found</Badge>
                         )}
-                        {track.status === 'missing' && !track.lidarr_artist_added && (
+                        {track.status === 'missing' && !track.lidarr_album_added && (
                           <Badge variant="warning">❌ Missing</Badge>
                         )}
-                        {track.status === 'missing' && track.lidarr_artist_added && (
-                          <Badge variant="info">📥 Added to Lidarr</Badge>
+                        {track.lidarr_album_added && (
+                          <Badge variant="info">📥 Album queued</Badge>
                         )}
                         {track.error && (
                           <Badge variant="danger">⚠️ Error</Badge>

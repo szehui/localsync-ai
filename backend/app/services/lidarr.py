@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import logging
 import random
-from typing import Dict, List, Any, Optional
+from typing import Dict, Iterable, List, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -277,10 +277,18 @@ class LidarrService:
         return None
 
     async def collapse_artist_monitoring(self, artist_id: int,
-                                         keep_album_id: int,
+                                         keep_album_id: Optional[int] = None,
                                          attempts: int = 4,
-                                         delay: float = 1.5) -> List[int]:
-        """Un-monitor every album under an artist except the one we want.
+                                         delay: float = 1.5,
+                                         *,
+                                         keep_album_ids: Optional[Iterable[int]] = None,
+                                         ) -> List[int]:
+        """Un-monitor every album under an artist except the ones we want.
+
+        Pass a single album id (`keep_album_id`) for the one-album case, or a
+        set (`keep_album_ids`) when a batch add legitimately wants several
+        releases by the same artist — otherwise each add in the loop would
+        un-monitor the one before it.
 
         Returns the album ids that were turned off.
 
@@ -292,6 +300,13 @@ class LidarrService:
         moments later. Callers should also set `monitorNewItems: "none"` on the
         artist, which stops the refresh from re-monitoring at all.
         """
+        if keep_album_ids is not None:
+            keep = set(keep_album_ids)
+        elif keep_album_id is not None:
+            keep = {keep_album_id}
+        else:
+            raise ValueError("keep_album_id or keep_album_ids is required")
+
         unset: set[int] = set()
         remaining: list[int] = []
         for attempt in range(attempts):
@@ -299,13 +314,13 @@ class LidarrService:
             if not isinstance(rows, list):
                 return sorted(unset)
             extra = [r["id"] for r in rows
-                     if r.get("monitored") and r.get("id") != keep_album_id]
+                     if r.get("monitored") and r.get("id") not in keep]
             if not extra:
                 if unset:
                     logger.info(
-                        "Lidarr: artist %s monitoring converged on album %s "
-                        "after %d attempt(s) (unset %d)",
-                        artist_id, keep_album_id, attempt + 1, len(unset))
+                        "Lidarr: artist %s monitoring converged on %s after "
+                        "%d attempt(s) (unset %d)",
+                        artist_id, sorted(keep), attempt + 1, len(unset))
                 return sorted(unset)
             await self._request("PUT", "album/monitor",
                                 json={"albumIds": extra, "monitored": False})
@@ -315,8 +330,8 @@ class LidarrService:
                 await asyncio.sleep(delay)
 
         logger.warning(
-            "Lidarr: artist %s still has %s monitored besides album %s after "
-            "%d attempts", artist_id, remaining, keep_album_id, attempts)
+            "Lidarr: artist %s still has %s monitored besides %s after "
+            "%d attempts", artist_id, remaining, sorted(keep), attempts)
         return sorted(unset)
 
     async def artist_monitored_albums(self, artist_id: int) -> List[int]:
@@ -329,23 +344,28 @@ class LidarrService:
     async def _ensure_single_album_monitored(self, artist_id: int,
                                              album_id: int) -> List[int]:
         """Monitor exactly one album under an artist; unmonitor the rest."""
+        return await self._monitor_only(artist_id, [album_id])
+
+    async def _monitor_only(self, artist_id: int,
+                            keep_album_ids: Iterable[int]) -> List[int]:
+        """Make `keep_album_ids` the artist's monitored set, and nothing else."""
+        keep = list(keep_album_ids)
         artist = await self._request("GET", f"artist/{artist_id}")
         if artist.get("monitorNewItems") != "none":
             artist["monitorNewItems"] = "none"
             await self._request("PUT", f"artist/{artist_id}", json=artist)
         await self._request("PUT", "album/monitor",
-                            json={"albumIds": [album_id], "monitored": True})
-        return await self.collapse_artist_monitoring(artist_id, album_id)
+                            json={"albumIds": keep, "monitored": True})
+        return await self.collapse_artist_monitoring(
+            artist_id, keep_album_ids=keep)
 
-    async def add_single_album(self, artist_name: str, release_name: str,
-                               search: bool = False) -> Dict[str, Any]:
-        """Add ONE album to Lidarr's wanted list without subscribing to the artist.
+    async def _add_album_core(self, artist_name: str, release_name: str,
+                              search: bool = False) -> Dict[str, Any]:
+        """Add one album's wanted entry. Does NOT touch artist monitoring.
 
-        Steps: lookup release group -> inject profile fields the lookup omits ->
-        POST album (creates artist) -> collapse monitoring to just this album ->
-        optionally trigger a search for this album alone.
-
-        `search=False` leaves a silent wishlist entry; nothing is downloaded.
+        Split out from `add_single_album` so batch callers can defer the
+        monitoring collapse to a single pass at the end: collapsing per add
+        makes each album un-monitor the one before it.
         """
         if not artist_name or not release_name:
             raise ValueError(
@@ -367,26 +387,16 @@ class LidarrService:
         if existing is not None:
             # The album is already in Lidarr — but that does not mean it is
             # *wanted*. It may have been created unmonitored by an earlier
-            # artist refresh. Clicking "Add" must still make it monitored and
-            # collapse the artist, otherwise the button silently does nothing.
-            album_id = existing.get("id")
-            artist_id = existing.get("artistId")
-            if album_id and artist_id:
-                await self._ensure_single_album_monitored(artist_id, album_id)
+            # artist refresh. Clicking "Add" must still make it monitored.
             logger.info("Lidarr: '%s' already in library (album %s)",
-                        album.get("title"), album_id)
+                        album.get("title"), existing.get("id"))
             return {
-                "album_id": album_id,
-                "artist_id": artist_id,
+                "album_id": existing.get("id"),
+                "artist_id": existing.get("artistId"),
                 "artist_name": (existing.get("artist") or {}).get("artistName")
                                or artist_name,
                 "release_name": existing.get("title"),
                 "already_present": True,
-                "albums_unmonitored": [],
-                "monitoring_ok": (
-                    await self.artist_monitored_albums(artist_id) == [album_id]
-                    if artist_id and album_id else False
-                ),
             }
 
         artist = dict(album.get("artist") or {})
@@ -421,24 +431,12 @@ class LidarrService:
         if not artist_id:
             raise ValueError(f"Lidarr did not return an artist id: {created!r}")
 
-        unmonitored = await self.collapse_artist_monitoring(artist_id, album_id)
-
-        # Trust the API, not our own bookkeeping: re-read what Lidarr actually
-        # has monitored before claiming the add is clean.
-        monitored_now = await self.artist_monitored_albums(artist_id)
-        monitoring_ok = monitored_now == [album_id]
-        if not monitoring_ok:
-            logger.warning(
-                "Lidarr: album %s added but monitoring is not clean; "
-                "artist %s monitors %s", album_id, artist_id, monitored_now)
-
         if search:
             await self.search_album(album_id)
 
-        logger.info(
-            "Lidarr: added album '%s' by %s (album %s, artist %s), %d siblings un-monitored",
-            album.get("title"), artist.get("artistName"), album_id, artist_id,
-            len(unmonitored))
+        logger.info("Lidarr: added album '%s' by %s (album %s, artist %s)",
+                    album.get("title"), artist.get("artistName"),
+                    album_id, artist_id)
 
         return {
             "album_id": album_id,
@@ -447,6 +445,97 @@ class LidarrService:
                            or artist.get("artistName"),
             "release_name": album.get("title"),
             "already_present": False,
+        }
+
+    async def add_albums(self, items: Iterable[tuple], search: bool = False,
+                         ) -> Dict[str, Any]:
+        """Add several albums at once, collapsing monitoring ONCE per artist.
+
+        `add_single_album` in a loop is wrong for this job: each add un-monitors
+        the artist's other albums, so adding eight ENHYPEN albums leaves only
+        the eighth monitored (34 of 88 in a live run). Here every artist gets a
+        single collapse that keeps all of *our* albums.
+
+        `items` is an iterable of `(artist_name, release_name)` pairs.
+
+        Returns ``{"added", "already_present", "failed", "monitoring_ok",
+        "results"}``.
+        """
+        results: List[Dict[str, Any]] = []
+        by_artist: Dict[int, List[int]] = {}
+
+        for artist_name, release_name in items:
+            try:
+                res = await self._add_album_core(
+                    artist_name, release_name, search=search)
+                results.append(res)
+                artist_id, album_id = res.get("artist_id"), res.get("album_id")
+                if artist_id and album_id:
+                    by_artist.setdefault(int(artist_id), []).append(int(album_id))
+            except Exception as e:
+                logger.warning("Lidarr: could not add %s - %s: %s",
+                               artist_name, release_name, e)
+                results.append({
+                    "artist_name": artist_name,
+                    "release_name": release_name,
+                    "error": str(e),
+                })
+
+        monitored_ok = True
+        for artist_id, album_ids in by_artist.items():
+            try:
+                await self._monitor_only(artist_id, album_ids)
+                # Trust the API over our bookkeeping.
+                now = set(await self.artist_monitored_albums(artist_id))
+                if not set(album_ids).issubset(now):
+                    monitored_ok = False
+                    logger.warning(
+                        "Lidarr: artist %s monitors %s, expected %s",
+                        artist_id, sorted(now), sorted(album_ids))
+            except Exception as e:
+                monitored_ok = False
+                logger.warning(
+                    "Lidarr: monitoring pass failed for artist %s: %s",
+                    artist_id, e)
+
+        added = [r for r in results if r.get("album_id") and not r.get("error")]
+        return {
+            "added": [r for r in added if not r.get("already_present")],
+            "already_present": [r for r in added if r.get("already_present")],
+            "failed": [r for r in results if r.get("error")],
+            "monitoring_ok": monitored_ok,
+            "results": results,
+        }
+
+    async def add_single_album(self, artist_name: str, release_name: str,
+                               search: bool = False) -> Dict[str, Any]:
+        """Add ONE album to Lidarr's wanted list without subscribing to the artist.
+
+        Steps: lookup release group -> inject profile fields the lookup omits ->
+        POST album (creates artist) -> collapse monitoring to just this album ->
+        optionally trigger a search for this album alone.
+
+        `search=False` leaves a silent wishlist entry; nothing is downloaded.
+
+        For several albums in one go use `add_albums`, which collapses once per
+        artist instead of once per album.
+        """
+        res = await self._add_album_core(artist_name, release_name, search=search)
+        artist_id, album_id = res.get("artist_id"), res.get("album_id")
+
+        unmonitored: List[int] = []
+        monitoring_ok = False
+        if artist_id and album_id:
+            unmonitored = await self._monitor_only(artist_id, [album_id])
+            monitored_now = await self.artist_monitored_albums(artist_id)
+            monitoring_ok = monitored_now == [album_id]
+            if not monitoring_ok:
+                logger.warning(
+                    "Lidarr: album %s added but monitoring is not clean; "
+                    "artist %s monitors %s", album_id, artist_id, monitored_now)
+
+        return {
+            **res,
             "albums_unmonitored": unmonitored,
             "monitoring_ok": monitoring_ok,
         }

@@ -29,7 +29,7 @@ class TrackMatchResult(BaseModel):
     artist: str
     album: str
     status: str  # "matched" | "missing" | "queued_to_lidarr"
-    lidarr_artist_added: bool = False
+    lidarr_album_added: bool = False
     error: Optional[str] = None
 
 
@@ -38,7 +38,8 @@ class YouTubeImportResult(BaseModel):
     navidrome_playlist_id: Optional[str] = None
     matched_count: int
     missing_count: int
-    lidarr_queued_count: int
+    lidarr_queued_count: int  # number of albums added (not artists)
+    lidarr_albums: List[str] = []
     tracks: List[TrackMatchResult]
 
 

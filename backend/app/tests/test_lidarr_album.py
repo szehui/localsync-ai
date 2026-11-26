@@ -163,6 +163,10 @@ class TestAddSingleAlbum:
                 return [{"path": "/data/music"}]
             if endpoint == "album/lookup":
                 return LOOKUP_RESULT
+            if endpoint.startswith("artist/"):
+                # _monitor_only reads the artist to set monitorNewItems=none.
+                return {"id": 474, "artistName": "The Strokes",
+                        "monitorNewItems": "all", "monitored": False}
             if endpoint == "album" and method == "GET" and "foreignAlbumId" in kwargs.get("params", {}):
                 return []  # not already present
             if endpoint == "album" and method == "POST":
@@ -203,9 +207,11 @@ class TestAddSingleAlbum:
         assert artist["rootFolderPath"] == "/data/music"
         # Without this Lidarr's RefreshArtist re-monitors every album it creates.
         assert artist["monitorNewItems"] == "none"
-        # collapse happened, keeping only the target album
-        monitor = next(c for c in calls if c[1] == "album/monitor")
-        assert monitor[2]["json"] == {"albumIds": [3864, 3865], "monitored": False}
+        # the target album is explicitly monitored, then the collapse runs
+        monitors = [c[2]["json"] for c in calls if c[1] == "album/monitor"]
+        assert monitors[0] == {"albumIds": [3863], "monitored": True}
+        collapse = next(m for m in monitors if m["monitored"] is False)
+        assert collapse["albumIds"] == [3864, 3865]
 
     async def test_collapse_converges_when_refresh_re_monitors(self):
         """The real-world race: RefreshArtist re-monitors after our PUT lands.
@@ -314,6 +320,9 @@ class TestAddSingleAlbum:
                 return [{"path": "/data/music"}]
             if endpoint == "album/lookup":
                 return LOOKUP_RESULT
+            if endpoint.startswith("artist/"):
+                return {"id": 474, "artistName": "The Strokes",
+                        "monitorNewItems": "all", "monitored": False}
             if endpoint == "album" and method == "GET" and "foreignAlbumId" in kwargs.get("params", {}):
                 return []
             if endpoint == "album" and method == "POST":
