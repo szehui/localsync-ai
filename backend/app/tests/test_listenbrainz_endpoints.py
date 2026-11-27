@@ -16,11 +16,14 @@ def client():
 
 @pytest.fixture(autouse=True)
 def reset_globals():
-    import app.routers.auth as auth_module
+    """Drop the per-user client registry between tests."""
+    import app.services.users as users_service
 
-    auth_module._current_client = None
-    auth_module._current_sync_service = None
+    users_service._clients.clear()
+    users_service._sync_services.clear()
     yield
+    users_service._clients.clear()
+    users_service._sync_services.clear()
     app.dependency_overrides.pop(get_db, None)
 
 
@@ -78,7 +81,7 @@ class TestGetConfig:
         token = _login(client, monkeypatch, mock_navidrome_client)
 
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = None
+        db.get.return_value = None
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.get("/api/auth/listenbrainz", headers=_headers(token))
@@ -92,7 +95,7 @@ class TestGetConfig:
         row.username = "szeis4cookie"
         row.user_token = "super-secret-token"
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = row
+        db.get.return_value = row
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.get("/api/auth/listenbrainz", headers=_headers(token))
@@ -110,7 +113,7 @@ class TestPutConfig:
         token = _login(client, monkeypatch, mock_navidrome_client)
 
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = None
+        db.get.return_value = None
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.put(
@@ -128,7 +131,7 @@ class TestPutConfig:
 
         row = MagicMock()
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = row
+        db.get.return_value = row
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.put(
@@ -157,12 +160,14 @@ class TestDeleteConfig:
         token = _login(client, monkeypatch, mock_navidrome_client)
 
         db = MagicMock()
+        db.get.return_value = MagicMock()  # a saved row for this user
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.delete("/api/auth/listenbrainz", headers=_headers(token))
         assert response.status_code == 200
         assert response.json() == {"configured": False, "username": None}
-        db.query.return_value.filter.return_value.delete.assert_called_once()
+        # The caller's own row goes away; nothing global is touched.
+        db.delete.assert_called_once_with(db.get.return_value)
         db.commit.assert_called_once()
 
 
@@ -176,7 +181,7 @@ class TestTestEndpoint:
     def test_requires_config(self, client, monkeypatch, mock_navidrome_client):
         token = _login(client, monkeypatch, mock_navidrome_client)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = None
+        db.get.return_value = None
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.post("/api/auth/listenbrainz/test", headers=_headers(token))
@@ -187,7 +192,7 @@ class TestTestEndpoint:
 
         token = _login(client, monkeypatch, mock_navidrome_client)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = self._config_row()
+        db.get.return_value = self._config_row()
         app.dependency_overrides[get_db] = lambda: db
 
         lb = AsyncMock()
@@ -208,7 +213,7 @@ class TestTestEndpoint:
 
         token = _login(client, monkeypatch, mock_navidrome_client)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = self._config_row()
+        db.get.return_value = self._config_row()
         app.dependency_overrides[get_db] = lambda: db
 
         lb = AsyncMock()
@@ -227,7 +232,7 @@ class TestTestEndpoint:
 
         token = _login(client, monkeypatch, mock_navidrome_client)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = self._config_row()
+        db.get.return_value = self._config_row()
         app.dependency_overrides[get_db] = lambda: db
 
         lb = AsyncMock()
@@ -246,7 +251,7 @@ class TestTestEndpoint:
 
         token = _login(client, monkeypatch, mock_navidrome_client)
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = self._config_row()
+        db.get.return_value = self._config_row()
         app.dependency_overrides[get_db] = lambda: db
 
         lb = AsyncMock()

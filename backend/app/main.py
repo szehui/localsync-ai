@@ -64,13 +64,6 @@ async def lifespan(app: FastAPI):
     # Load existing trigger jobs from DB
     load_existing_triggers()
 
-    # Try to restore Navidrome connection from saved config
-    db = SessionLocal()
-    try:
-        await auth._auto_connect(db)
-    finally:
-        db.close()
-
     # Try to restore Lidarr connection from saved config
     from app.models.database import LidarrConfig
     db = SessionLocal()
