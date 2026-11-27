@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Text
+from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -15,6 +15,16 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 
+if "sqlite" in settings.database_url:
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+        # SQLite ignores FK constraints (and their ON DELETE CASCADE) unless
+        # this pragma is set per-connection.
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
 class Artist(Base):
     __tablename__ = "artists"
     id = Column(String, primary_key=True)  # Navidrome artist ID
@@ -22,6 +32,56 @@ class Artist(Base):
     album_count = Column(Integer, default=0)
     cover_art = Column(String, nullable=True)
     last_synced = Column(DateTime, default=datetime.utcnow)
+
+
+class User(Base):
+    """One tenant. Credentials are per-user because each user may point at a
+    different Navidrome instance; auth itself is still delegated to Navidrome,
+    so the password here is only replayed when the backend talks upstream.
+
+    (navidrome_url, username) is unique rather than username alone: the same
+    username on two servers is two distinct tenants.
+    """
+    __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("navidrome_url", "username", name="uq_users_url_username"),)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, nullable=False)
+    display_name = Column(String, nullable=True)
+    navidrome_url = Column(String, nullable=False)
+    navidrome_password = Column(String, nullable=False)
+    is_owner = Column(Boolean, default=False)  # first user; can manage others
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_login = Column(DateTime, nullable=True)
+
+
+class TrackAnnotation(Base):
+    """Per-user state layered over the shared library.
+
+    Tracks are global (one Navidrome library row per song) but play counts,
+    ratings, and stars are personal, so they live here keyed by
+    (user, track) instead of on Track. The composite PK both enforces
+    one-row-per-user-per-track and gives the natural lookup index.
+
+    Rows vanish with either parent: a deleted user takes their annotations
+    with them, and a track dropped from the library takes every user's
+    annotation for it.
+    """
+    __tablename__ = "track_annotations"
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    track_id = Column(
+        String,
+        ForeignKey("tracks.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    play_count = Column(Integer, default=0)
+    rating = Column(Integer, default=0)  # 0-5 star rating
+    starred = Column(Boolean, default=False)
+    last_played_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Album(Base):
