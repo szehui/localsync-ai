@@ -405,3 +405,120 @@ That yields the design:
 Deezer remains unnecessary: its `PSY 9th` result (12 tracks) matches the MB release
 exactly, but it carries no MBID and adds nothing the release titles do not already
 give us.
+
+---
+
+# MBID coverage: how to close the 63% gap
+
+Scripts: `docs/research/mbid-backfill-probe{,-v2,-v3,-v4}.py`,
+`untagged-composition.py`, `untagged-detail.py`, `oracle-intersection.py`.
+All read-only against live Navidrome, Lidarr and MusicBrainz.
+
+## Result in one table
+
+| Stage | Method | MB calls | Albums with RG MBID | Coverage |
+| --- | --- | --- | --- | --- |
+| Today | Navidrome tags only | 0 | 1,334 | 36.8% |
+| + Lidarr oracle | fold artist+title -> `foreignAlbumId` | **0** | 2,544 | **70.2%** |
+| + MB tail pass | artist browse, 314 albums | ~400 | ~2,730 | ~75% (est.) |
+| Ceiling | API-only | - | ~2,830 | ~78% |
+| Floor removed only by file-level fixes | beets / AcoustID | - | 3,626 | 100% |
+
+The single biggest win costs **zero MusicBrainz calls** and is already in the house.
+
+## 1. The oracle: Lidarr already knows the answer
+
+Lidarr holds 4,753 album rows, each with `foreignAlbumId` — the release-group MBID that
+Lidarr itself resolved when it added the album. Most of this library *was* downloaded
+through Lidarr, so for those albums the id already exists on our own network.
+
+Method: fold `artist|title` on both sides, copy the id where the key maps to exactly one
+release group, skip anything ambiguous. Result: **1,210 of the 1,524 matchable untagged
+albums (79.4%)**, i.e. 36.8% -> **70.2%**.
+
+Validation (20 sampled copies, each checked against the MusicBrainz release group it
+points at): 18 exact title+artist agreement, 1 edition variant, 1 artist-credit variant
+(`Pharrell` vs `Pharrell Williams`). **Zero wrong release groups.** That is a 99%+-
+precision source, not a guess — which is the point: a one-time, auditable match that
+yields an exact MBID, rather than a runtime title guess.
+
+Two caveats worth writing down:
+
+- **Ambiguity must be skipped, not resolved.** Folded keys mapping to more than one
+  release group (14 found) are the Greatest-Hits collision. Those albums go to the tail.
+- **Release-group granularity is edition-blind.** Owning the deluxe edition marks the
+  standard release group as owned. That is the same granularity Seerr uses for films and
+  is correct for a request system; it is wrong for "do I have this exact pressing", which
+  we do not claim to answer.
+
+## 2. Why the rest is hard: composition of the 2,292 untagged albums
+
+| Bucket | Count | Note |
+| --- | --- | --- |
+| Multi-track, parseable title (the **target**) | 1,524 | worth backfilling |
+| Single-track | 716 | 31% of untagged; MB often has no release group, and nobody requests them |
+| `[Unknown Album]` | 135 | untaggable without fingerprinting |
+| Garbled / mojibake tags | ~15 | e.g. `EÌˆiÌˆNÌ€aÌ€` style tag corruption, `[Unknown Album]` |
+| Leading `(1982)` / embedded-year junk | 3 / 8 | rare, but worth stripping |
+
+Also a trap for anyone re-running this: **Navidrome's album object has no `year` field.**
+`year` reads as `None` for all 3,626 albums. The usable date fields are `date`
+(1,918/2,292 untagged), `maxYear`, `releaseDate` (199), `originalDate` (4). A scoring rule
+that reads `year` silently disables its own date check — which is exactly how a
+`Taylor Swift — 1989 [nightcore]` false positive got through the first probe.
+
+## 3. The tail: 314 albums, 177 artists
+
+Sample of 12 artists / 18 albums, artist-search + discography browse:
+**6 title+artist matches (33%)**, 10 "no title match", 2 "artist unresolved". Every match
+found was plausible (Run DMC *Back From Hell* and *Raising Hell*; three Notorious B.I.G.
+albums; Timbaland and Magoo *Indecent Proposal*), so precision on the candidate set looks
+high — the problem is recall.
+
+Five of the ten misses are known normalisation gaps, not missing data:
+
+| Local | MusicBrainz | Cause |
+| --- | --- | --- |
+| U2 — `Joshua Tree` | `The Joshua Tree` | leading article |
+| Usher — `My Way: 25th Anniversary Edition` | `My Way` | edition phrase outside brackets |
+| Smashing Pumpkins — `ATUM ... - Act 1/2/3` | one `ATUM` release group | act split into fake albums |
+| J Balvin and Bad Bunny — `OASIS` | two separate artists | collaboration credit is not an MB artist |
+| Jay Chou — `八度空间` | 周杰倫 (alias Jay Chou) | CJK primary name, alias search needed |
+
+Add those and the tail should recover ~55-65%, i.e. +170-200 albums, about +5 points.
+
+## 4. The scoring rule that a strict gate gets wrong
+
+Measured counter-examples where a "verify year and track count" gate rejects a correct
+match:
+
+| Album | Local | Release group | Why the gate fires |
+| --- | --- | --- | --- |
+| Run DMC — *Raising Hell* | `maxYear` 1999 | 1986 | local file is a reissue |
+| Notorious B.I.G. — *Doing It Real Big* | 4 tracks | 14 | partial rip |
+| Timbaland and Magoo — *Indecent Proposal* | 15 tracks | 19 | partial rip |
+
+So: **title+artist establishes identity; year and track count only disambiguate between
+multiple same-title candidates and never veto a unique match.** The strict version cut
+the tail from ~60% to 33% while rejecting albums it had already matched correctly.
+
+## 5. What this does not fix
+
+API-only resolution plateaus around 75-78%. The remaining ~800 albums are single-track
+rips, `[Unknown Album]` tags and mojibake, and they need file-level repair
+(`beet mbsync`, AcoustID fingerprinting) — a library-hygiene project, not an app feature.
+
+That is acceptable because **the name-match tier needs no MBID.** An untagged rip still
+answers "probably in your library" for a request, so the floor is a dedupe inconvenience,
+not a correctness hole. The MBID exists to make dedupe exact and the badge trustworthy; it
+is not a precondition for the user-facing answer.
+
+## 6. Recommended sequence
+
+1. **Tags** — Task 1.9 native pass. 1,334 albums, free.
+2. **Lidarr oracle** — Task 1.10 tier 2. 1,210 albums, zero MusicBrainz calls, one
+   validation query per newly copied id. Run once at sync, re-run when Lidarr changes.
+3. **MB tail** — Task 1.10 tier 3. 314 albums / 177 artists, ~400 calls, 10-15 min,
+   resumable via `mbid_checked_at`. Do it after the first two, never instead of them.
+4. **Stop** — record the floor, do not chase it with API calls. File-level retagging is a
+   separate project.

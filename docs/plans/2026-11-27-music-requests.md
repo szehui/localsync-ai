@@ -80,9 +80,10 @@ Baseline: **551 passing as of 2026-11-27**. Do not drop below it without explain
 7. **Deezer is not in the request path.** It has no MBIDs (probed: album and artist
    objects contain none). Optional previews later; not v1.
 8. **Availability needs two signals.** Navidrome `mbzReleaseGroupId` (measured **36.8%**
-   on the real 3,626-album library) is authoritative; a folded artist+title+track-count
-   match is the fallback for untagged albums. A false "available" is worse than
-   "finishing up".
+   on the real 3,626-album library) plus the Lidarr oracle (Task 1.10) takes it to
+   **70.2%**; a MusicBrainz tail pass adds ~5 more. The name+track-count fallback covers
+   the floor, which is 716 single-track rips and 135 `[Unknown Album]` tags. A false
+   "available" is worse than "finishing up".
 
 ---
 
@@ -410,10 +411,16 @@ Response card:
 ```
 
 Ownership lookup:
-1. `albums.release_group_mbid == rgid` → owned, `owned_via="mbid"`.
+1. `albums.release_group_mbid == rgid` → owned, `owned_via="mbid"` (any
+   `mbid_source`; tags and the Lidarr oracle are equally authoritative once validated).
 2. folded `artist|album` match in `albums` → owned, `owned_via="name"` (shown with a
-   "probably" tooltip; this is the ~63% untagged slice).
+   "probably" tooltip; this is the untagged floor — 716 single-track rips and 135
+   `[Unknown Album]` tags that no MBID backfill will ever reach).
 3. `requests` open row for the RGID → attach status + requester display name.
+
+Name matching here needs no MBID, which is why the untagged floor is a dedupe
+inconvenience rather than a correctness hole: a user requesting an album they own as an
+untagged rip still gets "probably in your library" instead of a silent duplicate.
 
 `search(db, user, query)` = MB search → filter → CAA batch (top 10 only) → annotate.
 `artist_detail(db, user, artist_mbid)` = MB artist + browse album/ep + annotate +
@@ -472,17 +479,72 @@ duplicate/absent ids tolerated.
 
 ---
 
-### Task 1.10: Backfill + report on the real library
+### Task 1.10: Three-tier MBID resolution (tags → Lidarr oracle → MB tail)
 
-**Files:** Create `scripts/spikes/backfill_rg_mbids.py` (reuses Task 0.2 auth)
+Measured on the real library (research doc, "MBID coverage" appendix): Navidrome tags
+cover 36.8 %, the Lidarr oracle adds 33.4 points for zero API calls, and a MusicBrainz
+tail pass is worth another ~5. Do them in that order.
 
-Run once against production; print `{total, with_rg, with_mbz_album, mismatch,
-no_mbids}`. Append the numbers to the research doc.
+**Files:**
+- Create: `backend/app/services/mbid_backfill.py`
+- Modify: `backend/app/models/database.py` (columns below), `services/sync.py`
+- Test: `test_mbid_backfill.py`
 
-**Acceptance:** `with_rg / total` recorded; the app's `/api/library/albums` response gains
-`release_group_mbid` so the UI can show the badge.
+**Schema:**
 
-**Commit:** `chore(sync): backfill album release-group MBIDs`
+```python
+release_group_mbid = Column(String, nullable=True, index=True)
+mbz_album_id = Column(String, nullable=True)
+mbid_source = Column(String, nullable=True)      # navidrome_tag|lidarr_oracle|musicbrainz_backfill
+mbid_confidence = Column(String, nullable=True)  # high|medium|low
+mbid_checked_at = Column(DateTime, nullable=True)  # NULL = never attempted
+```
+
+`mbid_checked_at` is what makes the job resumable and is the only way to distinguish
+"never looked" from "looked, found nothing" — without it every run re-queries the tail.
+
+**Tier 1 — tags.** Task 1.9. 1,334 / 3,626.
+
+**Tier 2 — Lidarr oracle.** Every Lidarr album carries `foreignAlbumId`, the release
+group Lidarr itself resolved. Fold `artist|title` on both sides and copy the id where
+exactly one RG maps to that key; skip keys with more than one candidate. Measured:
+**1,210 of the 1,524 matchable untagged albums (79.4 %)**, zero MusicBrainz calls.
+Validation on 20 sampled copies: 18 exact, 1 edition variant, 1 artist-credit variant
+(`Pharrell` vs `Pharrell Williams`) — **zero wrong release groups.**
+
+**Tier 3 — MusicBrainz tail.** 314 albums across 177 artists. Search the artist once,
+browse `release-group?artist=<mbid>&type=album|ep` (one type per call), then score
+locally. ~400 calls at 1 req/s, resumable, 10–15 minutes.
+
+**Scoring — title+artist is identity, year and track count are disambiguators:**
+
+- Normalise: strip disc/act splits (`(CD 1)`, `- Act 1`), trailing edition phrases
+  ("25th Anniversary Edition"), and leading articles (`The Joshua Tree`).
+- Accept on normalised title + artist equality. Use year (`date`/`maxYear` — Navidrome's
+  album object has **no `year` field**) and track count only to choose between
+  *multiple* same-title candidates.
+- **Never let year or track count veto a unique match.** Measured counter-examples: Run
+  DMC's *Raising Hell* has local `maxYear` 1999 against RG 1986 (a reissue); Notorious
+  B.I.G.'s *Doing It Real Big* has 4 local tracks against 14 (partial rip). Strict gating
+  rejected both correct matches and cut the tail hit rate from ~60 % to 33 %.
+- Ambiguity guard as in the oracle: more than one strong candidate → store nothing.
+
+**Acceptance:** after tiers 1–2, `release_group_mbid` non-null on ≥70 % of albums with no
+MusicBrainz calls; tier 3 raises it into the mid-70s and stores nothing below `high`
+without a confidence label. `/api/library/albums` exposes `release_group_mbid`,
+`mbid_source`, `mbid_confidence`.
+
+**Commit:** `feat(sync): three-tier MBID backfill (tags, Lidarr oracle, MB tail)`
+
+---
+
+### Task 1.10b: Report the floor honestly
+
+The API-only ceiling is ~75–78 %. The remaining ~800 albums are 716 single-track rips,
+135 `[Unknown Album]` tags, and ~15 mojibake titles; they need file-level fixes
+(`beet mbsync`, AcoustID) and are out of scope. Log them as `mbid_checked_at` set with a
+NULL mbid so they are never re-queried, and rely on the name-match tier — which needs no
+MBID — to catch them for availability.
 
 ---
 
