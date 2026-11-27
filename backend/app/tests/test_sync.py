@@ -64,7 +64,7 @@ def mock_client():
 
 @pytest.fixture
 def sync_service(mock_client):
-    return SyncService(mock_client)
+    return SyncService(mock_client, user_id=1)
 
 
 class TestParseDatetime:

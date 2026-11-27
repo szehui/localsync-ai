@@ -5,15 +5,20 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
-from app.models.database import Artist, Album, Track, SessionLocal
+from app.models.database import Artist, Album, Track, TrackAnnotation, SessionLocal
 from app.services.navidrome import NavidromeClient
 
 logger = logging.getLogger(__name__)
 
 
 class SyncService:
-    def __init__(self, client: NavidromeClient):
+    def __init__(self, client: NavidromeClient, user_id: int = 1):
+        # Play counts / ratings / stars are per Subsonic account, so every sync
+        # is attributed to exactly one user. Defaults to the owner for the
+        # legacy singleton connection paths, which have not been given a user
+        # identity yet.
         self.client = client
+        self.user_id = user_id
         self.is_syncing = False
         self.last_sync: datetime | None = None
         self.last_stats: dict | None = None
@@ -87,6 +92,10 @@ class SyncService:
                     album = album_detail.get("album", {})
                     for song_data in album.get("song", []):
                         db.merge(_build_track(song_data, album))
+                        # TrackAnnotation FKs tracks.id; SQLAlchemy's unit of
+                        # work sorts by table dependency, so the track insert
+                        # lands first within the same flush.
+                        db.merge(_annotation_from_song(self.user_id, song_data))
                         seen_track_ids.add(song_data["id"])
                         stats["tracks"] += 1
                 except Exception as e:
@@ -164,6 +173,7 @@ class SyncService:
                     inner_album = album_detail.get("album", {})
                     for song_data in songs:
                         db.merge(_build_track(song_data, inner_album))
+                        db.merge(_annotation_from_song(self.user_id, song_data))
                         stats["tracks"] += 1
                 except Exception as e:
                     logger.warning(f"Failed to sync new album {album_id}: {e}")
@@ -185,7 +195,13 @@ class SyncService:
             self.is_syncing = False
 
     async def _update_play_counts(self, db: Session):
-        """Refresh play counts and ratings from recent albums."""
+        """Refresh play counts and ratings from recent albums.
+
+        Play counts are per Subsonic account — the same library row has a
+        different number for each listener — so this is deliberately scoped to
+        self.user_id. Another user's sync must never overwrite these numbers,
+        which is why the state goes to TrackAnnotation and not onto Track.
+        """
         try:
             recent = await self.client.get_album_list2(type_="recent", size=50)
             for album_data in recent:
@@ -194,15 +210,16 @@ class SyncService:
                     album_detail = await self.client.get_album(album_id)
                     songs = album_detail.get("album", {}).get("song", [])
                     for song_data in songs:
-                        track = db.query(Track).filter(Track.id == song_data["id"]).first()
-                        if track:
-                            track.play_count = song_data.get("playCount", track.play_count)
-                            track.rating = song_data.get("rating", track.rating)
-                            track.starred = _parse_starred(song_data.get("starred"))
-                            played = _parse_naive_utc(song_data.get("played"))
-                            if played is not None:
-                                track.last_played_at = played
-                            track.last_synced = datetime.utcnow()
+                        # Annotation FKs tracks.id: skip songs the library
+                        # sync has not stored yet or an FK violation aborts
+                        # the whole batch.
+                        exists = (
+                            db.query(Track.id)
+                            .filter(Track.id == song_data["id"])
+                            .first()
+                        )
+                        if exists:
+                            db.merge(_annotation_from_song(self.user_id, song_data))
                 except Exception:
                     continue
         except Exception as e:
@@ -232,6 +249,18 @@ def _normalize_text(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", text.lower())
 
 
+def _annotation_from_song(user_id: int, song_data: dict) -> TrackAnnotation:
+    """The per-listener half of a Navidrome song object."""
+    return TrackAnnotation(
+        user_id=user_id,
+        track_id=song_data["id"],
+        play_count=song_data.get("playCount", 0) or 0,
+        rating=song_data.get("rating", 0) or 0,
+        starred=_parse_starred(song_data.get("starred")),
+        last_played_at=_parse_naive_utc(song_data.get("played")),
+    )
+
+
 def _build_track(song_data: dict, album: dict) -> Track:
     """Build a Track from a Subsonic song dict.
 
@@ -240,6 +269,10 @@ def _build_track(song_data: dict, album: dict) -> Track:
 
     `album` is the inner album dict from a getAlbum response
     ({"album": {...}}), used as a fallback for album_name.
+
+    Library metadata only: play_count / rating / starred / last_played_at are
+    per Subsonic account, so they are captured separately by
+    `_annotation_from_song` and stored on TrackAnnotation.
     """
     title = song_data.get("title")
     artist = song_data.get("artist")
@@ -256,11 +289,7 @@ def _build_track(song_data: dict, album: dict) -> Track:
         duration=song_data.get("duration"),
         track_number=song_data.get("track"),
         disc_number=song_data.get("discNumber"),
-        play_count=song_data.get("playCount", 0),
-        rating=song_data.get("rating", 0),
-        starred=_parse_starred(song_data.get("starred")),
         created_at=_parse_datetime(song_data.get("created")),
-        last_played_at=_parse_naive_utc(song_data.get("played")),
         last_synced=datetime.utcnow(),
         recording_mbid=mbid,
         search_key=build_search_key(artist, title),

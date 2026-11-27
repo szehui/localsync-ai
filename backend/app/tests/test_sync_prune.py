@@ -7,18 +7,32 @@ resolver uses to map listens to Navidrome IDs.
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from app.models.database import Artist, Album, Base, Track
+from app.models.database import Artist, Album, Base, Track, User
 from app.services.sync import SyncService, _prune
 
 
 @pytest.fixture
 def db():
     engine = create_engine("sqlite:///:memory:")
+
+    # Mirror production so an annotation whose user or track is missing fails
+    # loudly here instead of silently in prod.
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
+    session.add(
+        User(id=1, username="sze", navidrome_url="https://navidrome.example.com",
+             navidrome_password="secret")
+    )
+    session.commit()
     try:
         yield session
     finally:
@@ -93,7 +107,7 @@ class TestFullSyncPrune:
             {"al1": [{"id": "new-song-id", "title": "Bag", "artist": "Lil' Kim",
                       "album": "9", "parent": "al1"}]},
         )
-        svc = SyncService(client)
+        svc = SyncService(client, user_id=1)
 
         stats = await svc.full_sync(db)
 
@@ -115,7 +129,7 @@ class TestFullSyncPrune:
             ["ar1"], ["al1"],
             {"al1": [{"id": "t1", "title": "T", "artist": "A", "album": "Al1", "parent": "al1"}]},
         )
-        svc = SyncService(client)
+        svc = SyncService(client, user_id=1)
 
         stats = await svc.full_sync(db)
 
@@ -133,7 +147,7 @@ class TestFullSyncPrune:
         db.commit()
 
         client = self._client([], [], {})
-        svc = SyncService(client)
+        svc = SyncService(client, user_id=1)
 
         stats = await svc.full_sync(db)
 
@@ -148,7 +162,7 @@ class TestFullSyncPrune:
                       "album": "Senior", "parent": "al1",
                       "musicBrainzId": "mbid-123"}]},
         )
-        svc = SyncService(client)
+        svc = SyncService(client, user_id=1)
 
         await svc.full_sync(db)
 
