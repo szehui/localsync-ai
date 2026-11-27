@@ -79,9 +79,10 @@ Baseline: **551 passing as of 2026-11-27**. Do not drop below it without explain
    resolver by MBID.
 7. **Deezer is not in the request path.** It has no MBIDs (probed: album and artist
    objects contain none). Optional previews later; not v1.
-8. **Availability needs two signals.** Navidrome `mbzReleaseGroupId` (≈42% of albums,
-   measured) is authoritative; a folded artist+title+track-count match is the fallback
-   for untagged albums. A false "available" is worse than "finishing up".
+8. **Availability needs two signals.** Navidrome `mbzReleaseGroupId` (measured **36.8%**
+   on the real 3,626-album library) is authoritative; a folded artist+title+track-count
+   match is the fallback for untagged albums. A false "available" is worse than
+   "finishing up".
 
 ---
 
@@ -107,16 +108,34 @@ Baseline: **551 passing as of 2026-11-27**. Do not drop below it without explain
 8. **MusicBrainz search is token-based, not typo-tolerant.** A typo query returns
    six-figure `count` with the right answer ranked #1 by `score`. Trust ordering, show
    metadata, and cap `limit` at 25.
-9. **Some release groups are not addable even by MBID** (Various Artists soundtracks,
-   Korean-titled K-pop). Phase 0 measures this; the UI must surface "Lidarr can't resolve
-   this" as a real state, not a spinner.
+9. **Various Artists and Korean-titled albums ARE addable by MBID** (Phase 0, live).
+   The old "unreachable" note described *title* lookup failing to bridge a script or
+   an artist-credit difference — not a limitation of MusicBrainz or Lidarr. What
+   remains is release-group spelling: the UI must show year, type and localized titles
+   so the user picks the right RG. There is no refused-at-creation category; the
+   failure state to design for is "Lidarr could not resolve this MBID at all".
 
 ---
 
-# Phase 0 — Spikes (do first; may invalidate the design)
+# Phase 0 — Spikes (DONE 2026-11-27)
 
-No app code. Scripts in `scripts/spikes/`, results appended to
-`docs/research/2026-11-27-request-system.md`. **Stop and report if a spike fails.**
+**Outcome: the design holds. See "Phase 0 spike results" in
+`docs/research/2026-11-27-request-system.md` for the full evidence.**
+
+- MBID add + collapse works, including the Various Artists soundtrack and the
+  Korean-titled `싸다9`. Both were already in Lidarr, which means the old
+  "unreachable" note was a title-lookup artifact.
+- Real release-group MBID coverage is **36.8%** (1,334 / 3,626 albums); the name +
+  track-count fallback is required.
+- `POST /album` creates the artist's discography metadata as a side effect, so the
+  reconciler must never treat "an unmonitored row exists" as "added".
+- K-pop is solved by MB-native mechanisms: search normalization, an `also_known_as`
+  list from the release-group's releases, and artist-first browse (Task 1.11).
+
+Tasks 0.1–0.3 below are kept as the record of what was run.
+
+No app code. Scripts in `scripts/spikes/`, `docs/research/`. **Stop and report if a
+spike fails.**
 
 ### Task 0.1: Prove MBID add end-to-end, including the known-unreachable cases
 
@@ -144,8 +163,8 @@ false}`, artist patched with `monitorNewItems: "none"`, `monitored: false`,
 after collapse, and whether a search returns releases.
 
 **Acceptance:** All three either add cleanly or produce a specific, documented failure
-mode. If Various Artists cannot be added at all, requests for them must be refused at
-creation time with a clear message (add that rule to Task 2.2).
+mode. **Result: all three added; two were already present. No refused-at-creation
+category is needed** — see the Phase 0 results section.
 
 **Commit:** `chore(spike): prove Lidarr MBID add path`
 
@@ -171,6 +190,7 @@ print the password), `POST /auth/login`, then page `/api/album?_start=&_end=200`
 
 **Acceptance:** A percentage and a page count. If native-API auth fails, stop and report
 — Task 1.10 depends on this working.
+**Result: 3,626 albums over 19 pages; 1,334 with a release-group MBID (36.8%).**
 
 **Commit:** `chore(spike): measure Navidrome release-group MBID coverage`
 
@@ -195,6 +215,9 @@ secondary types. Check whether soundtrack albums (secondary type `Soundtrack`) w
 excluded by that rule — they should be *included by choice*, not by accident.
 
 **Acceptance:** A written rule + counts for two artists.
+**Result: `type` works one value per call (repeat → 503); album/EP fit in one page,
+singles cap at 100 of 145. Daft Punk 51 albums / 8 EPs. ENHYPEN name collision means
+artist search must not take `results[0]`.**
 
 ---
 
@@ -252,6 +275,7 @@ class AsyncRateLimiter:
 
 Methods:
 - `search_release_groups(query, limit=10, offset=0)` → `GET /release-group/?query=…&fmt=json`
+  with `normalize_query()` applied (Task 1.11)
 - `get_release_group(mbid)` → `GET /release-group/{mbid}?inc=artist-credits+releases&fmt=json`
 - `get_artist(mbid)` → `GET /artist/{mbid}?inc=url-rels&fmt=json`
 - `browse_artist_release_groups(artist_mbid, type_="album", limit=100, offset=0)` →
@@ -388,7 +412,7 @@ Response card:
 Ownership lookup:
 1. `albums.release_group_mbid == rgid` → owned, `owned_via="mbid"`.
 2. folded `artist|album` match in `albums` → owned, `owned_via="name"` (shown with a
-   "probably" tooltip; this is the ~58% untagged slice).
+   "probably" tooltip; this is the ~63% untagged slice).
 3. `requests` open row for the RGID → attach status + requester display name.
 
 `search(db, user, query)` = MB search → filter → CAA batch (top 10 only) → annotate.
@@ -459,6 +483,81 @@ no_mbids}`. Append the numbers to the research doc.
 `release_group_mbid` so the UI can show the badge.
 
 **Commit:** `chore(sync): backfill album release-group MBIDs`
+
+---
+
+### Task 1.11: Non-Latin titles (the K-pop problem)
+
+**Objective:** A user who knows "PSY 9th" or "BTS The Most Beautiful Moment in Life"
+finds `싸다9` / `화양연화 pt.1` — and can tell which one they are looking at.
+
+Phase 0 proved this is a presentation and query-shaping problem, not a catalog gap: the
+`싸다9` release group literally contains a release titled `PSY 9th`, and MB's
+release-group search indexes release titles.
+
+**Files:**
+- Modify: `backend/app/services/musicbrainz.py` (`normalize_query`, `also_known_as`)
+- Modify: `backend/app/services/catalog.py`, `backend/app/models/database.py`
+- Test: `test_musicbrainz_query.py`, `test_catalog_aliases.py`
+
+**Step 1: query normalization**
+
+```python
+CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+
+def normalize_query(text: str) -> str:
+    """Shape a user query for MB's Lucene parser.
+
+    `releasegroup:"화양연화 pt.1"` returns 503: punctuation inside a quoted
+    field trips the analyzer. Dropping punctuation and scoping the field
+    returns all three 화양연화 release groups instead.
+    """
+    text = " ".join(text.split())
+    if CJK.search(text):
+        stripped = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        return f"releasegroup:({stripped.strip()})"
+    return text
+```
+
+Keep `score` ordering; do not re-rank Latin results (Phase 0: `PSY 9th` puts the target
+at rank 2, ahead of a cover act).
+
+**Step 2: `also_known_as`**
+
+On album detail (`get_release_group(mbid, inc="artist-credits+releases")`), collect the
+distinct `release.title` values that differ from the release-group title after folding.
+Return them as `also_known_as: [str]`. For `싸다9` that yields `["PSY 9th"]`.
+
+Persist in a new table (aliases are a property of the release group, not the user):
+
+```python
+class AlbumAlias(Base):
+    __tablename__ = "album_aliases"
+    release_group_mbid = Column(String, primary_key=True)
+    alias = Column(String, primary_key=True)
+    source = Column(String, nullable=False, default="release_title")
+    created_at = Column(DateTime, default=datetime.utcnow)
+```
+
+**Step 3: local matching**
+
+`catalog.search` first checks `album_aliases` for a folded substring match and merges
+those hits above upstream results (they are already owned/known MBIDs, zero API cost).
+This is what makes a later typeahead for "psy 9th" instant.
+
+**Step 4: artist-first fallback**
+
+When an album search yields no requestable rows, search `/artist?query=` and return
+`artist_suggestions: [{artist_mbid, name, disambiguation, score}]` so the UI can say
+"no albums matched — see PSY's discography". Artist results must be ranked by score and
+disambiguation shown: MB contains several artists named ENHYPEN and `results[0]` picked
+one with 3 albums.
+
+**Tests:** Hangul query gets fielded + punctuation-stripped; `also_known_as` excludes
+the identical title and dedupes; alias match surfaces a card without an MB call; no-hit
+search returns artist suggestions; Latin query is passed through unchanged.
+
+**Commit:** `feat(catalog): non-Latin titles and alias fallback`
 
 ---
 
@@ -625,8 +724,13 @@ both flags and a `PATCH /api/auth/users/{id}` owner-only toggle.
 **Files:** Modify `backend/app/services/requests.py`; test `test_artist_requests.py`
 
 `create_artist_request(db, user, artist_mbid, scope="studio")`:
-1. Browse MB for `album` (and `ep` when scope is `studio_eps`/`everything`).
+1. Browse MB for `album` (and `ep` when scope is `studio_eps`/`everything`). **One type
+   per call** — repeating `type` returns 503 (Phase 0).
 2. Filter with `is_requestable`; for `studio` also drop secondary types entirely.
+   Soundtracks and compilations (`['Compilation', 'Soundtrack']` on the Shang-Chi album)
+   therefore fall outside a studio request by design — the UI must say "17 studio
+   albums (soundtracks and compilations excluded)", and direct search can still request
+   them individually.
 3. Drop owned albums (by RG MBID) and open requests; the rest become child album
    requests with `parent_request_id`.
 4. Parent row: `kind="artist"`, `status="pending"`, plus a rollup computed on read:
@@ -703,6 +807,11 @@ Per cycle:
 | album row vanished and re-add fails | `failed` ("released from Lidarr") |
 | `lastSearchTime` older than 48 h, no files | `failed` ("no release found") |
 | otherwise | `approved` |
+
+**An unmonitored album row is not evidence of an add.** `POST /album` creates the artist
+*and* its discography metadata — Phase 0's RAM add left three unmonitored Daft Punk
+albums behind. Only the album id captured at add time, re-resolved by `foreignAlbumId`
+and confirmed `monitored`, counts as the request being in Lidarr.
 
 Never move backwards (`available` never returns to `downloading`). `last_synced_at` on
 every touched row.
@@ -902,6 +1011,8 @@ filtered from catalog results and refused at creation (Task 2.2 already rejects 
 | Failed download surfaces | Fixture with `downloadFailed` history → `failed` + reason |
 | 100%-in-Lidarr-but-not-scanned is honest | `imported`, not `available` |
 | Untagged album still shows as owned | Name+track-count availability test |
+| Korean-titled album findable by its English name | `PSY 9th` query test (Phase 0: MB rank 2) + alias-table match |
+| Reconciler ignores unmonitored sibling rows | Fixture from the Phase 0 Daft Punk case |
 | MusicBrainz outage degrades, does not 500 | 503 mapping test |
 | Deployed DB upgrades in place | `test_migration_upgrade_path.py` extended with the new schema |
 | Test count | `≥ 551` and rising; no skipped tests |

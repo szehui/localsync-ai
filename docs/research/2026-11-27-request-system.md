@@ -93,16 +93,17 @@ matching today — the same class of bug as 2.3.
 
 Verified fix, and it is cheap: **Navidrome's native REST album list already includes
 `mbzReleaseGroupId` and `mbzAlbumId` on every row** (probed 2026-11-27). One paged
-`/api/album?_start&_end` walk over ~3.1k albums populates a new
-`albums.release_group_mbid` column with no per-album calls. The Subsonic API — which is
-what `services/navidrome.py` uses — exposes only `musicBrainzId` = the **release** MBID
-(`MbzAlbumID`), which does *not* match Lidarr's release-group key. That mismatch is
+`/api/album?_start&_end` walk over the 3,626-album library (19 pages of 200) populates a
+new `albums.release_group_mbid` column with no per-album calls. The Subsonic API — which
+is what `services/navidrome.py` uses — exposes only `musicBrainzId` = the **release**
+MBID (`MbzAlbumID`), which does *not* match Lidarr's release-group key: in the full
+library, all 1,334 rows that have both fields carry *different* values. That mismatch is
 exactly the kind of thing that produces a system that is silently always-wrong.
 
-Measured coverage in a random sample of 12 library albums: **5/12 (≈42%)** carried a
-release-group MBID (tagging is per-album, all-or-nothing — same shape as the recording
-MBID work). So MBID availability is the *primary* signal with a name-keyed "probably
-owned" fallback, never an auto-deny.
+Measured coverage on the full library: **1,334 / 3,626 = 36.8%** carry a release-group
+MBID (tagging is per-album, all-or-nothing — same shape as the recording MBID work). So
+MBID availability is the *primary* signal with a name-keyed "probably owned" fallback,
+never an auto-deny.
 
 ### 2.5 Permissions are `is_owner` and nothing else
 
@@ -280,10 +281,11 @@ New tabs alongside the existing six in `App.tsx`:
 
 ## 7. Phased outline (after decisions)
 
-- **Phase 0 — spike (½ day).** Script the MBID add path against live Lidarr, including
-  the two known-unreachable cases (Various Artists soundtracks, Korean-titled K-pop) to
-  see whether the MBID route fixes them. Populate `albums.release_group_mbid` from the
-  native Navidrome API and measure real coverage on the 3.1k-album library.
+- **Phase 0 — spike (DONE 2026-11-27).** Ran the MBID add path against live Lidarr,
+  including the two cases previously thought unreachable (a Various Artists soundtrack and
+  the Korean-titled `싸다9`) — both add fine by MBID. Populated
+  `albums.release_group_mbid` from the native Navidrome API and measured real coverage:
+  1,334 / 3,626 = 36.8%. Results in the appendix below.
 - **Phase 1 — catalog (2–3 days).** MB/CAA/LB clients + cache + filters, catalog router,
   tests for rate limiting/backoff/degraded-upstream.
 - **Phase 2 — requests (2–3 days).** Schema + migration, create/approve/deny, MBID→Lidarr
@@ -295,3 +297,111 @@ New tabs alongside the existing six in `App.tsx`:
 
 Total: roughly 8–11 working days, of which Phase 0 is the only part that can invalidate
 the design — do it first.
+
+---
+
+# Phase 0 spike results (2026-11-27)
+
+All three spikes run live. Scripts: `scripts/spikes/mbid_add_probe.py`,
+`docs/research/kpop-and-cleanup-probe.py`, `docs/research/phase0-coverage-browse.py`.
+
+## 0.1 — MBID add path: works, including the two "unreachable" cases
+
+| Case | MBID | Resolved | Add + collapse | Left behind |
+| --- | --- | --- | --- | --- |
+| Daft Punk — *Random Access Memories* | `aa997ea0…` | yes, 1 row, 23 releases | created album 4887 / artist 503; collapsed to `[4887]` | deleted |
+| Shang-Chi score (Joel P West) | `c4c9da48…` | yes, 1 row | created album 4891 / artist 504; collapsed to `[4891]` | deleted |
+| Shang-Chi songs (88rising et al.) | `512af5da…` | yes, 1 row | **already in Lidarr** (album 4555, monitored) | untouched |
+| PSY — 싸다9 (Korean title) | `8ef6391e…` | yes, 1 row | **already in Lidarr** (album 4559, unmonitored) | untouched |
+
+The two cases previously documented as unreachable through Lidarr's lookup — a
+Various Artists soundtrack and a Korean-titled K-pop album — **are both reachable by
+MBID**. They were failures of *title* lookup, not of the album existing in
+MusicBrainz. The old `PSY 9th` → `싸다9` note should be read as "title search could
+not bridge the script difference", which the MBID path does not care about.
+
+Two operational details:
+
+- **`POST /album` creates the artist and its discography metadata.** Adding RAM also
+  created three unmonitored Daft Punk albums (Discovery, Human After All, Homework);
+  adding the Shang-Chi score created a second Joel P West album (Dust Jacket). All
+  were metadata-only (`trackFileCount = 0`). Cleanup therefore has to delete the
+  artist, not just the album. Our app never deletes, so this only matters for
+  cancelled requests — and it is another reason the reconciler must not treat
+  "an unmonitored row exists" as "the request was added".
+- **`already in Lidarr` ≠ wanted.** PSY's 싸다9 sits there unmonitored. The request
+  path must monitor the existing row (`_add_album_core` already returns
+  `already_present`, then `_monitor_only` fixes monitoring).
+
+## 0.2 — real release-group MBID coverage: 36.8%
+
+Whole library via the Navidrome native API, 19 pages of 200:
+
+| Metric | Value |
+| --- | --- |
+| Albums | **3,626** (the 3,127 figure in the migration note is stale) |
+| `mbzReleaseGroupId` present | **1,334 (36.8%)** |
+| `mbzAlbumId` present | 1,335 |
+| Both present and **different** | **1,334 of 1,334** |
+| Release date present | 1,405 (38.8%) |
+
+The last row is the trap in numbers: wherever a release MBID exists, it differs from
+the release-group MBID. The Subsonic `musicBrainzId` field would therefore have
+matched Lidarr's `foreignAlbumId` **zero times out of 1,334**.
+
+Implication: MBID availability covers roughly a third of the library. The
+artist+title+track-count fallback is load-bearing, not a nicety, and a
+"probably owned" badge is the honest UI for the other 63%.
+
+## 0.3 — discography browse semantics
+
+- `?artist=<mbid>&type=album` → 51 for Daft Punk, all returned with `limit=100`.
+- `type=ep` → 8. `type=single` → 145 total but capped at 100 per response, so only
+  singles need paging in practice.
+- **Repeating `type` in one request returns 503.** Use one call per type.
+- ENHYPEN lookup returned an artist with only 3 albums, which is wrong for the group —
+  MB has more than one artist named ENHYPEN. **Artist search must pick by score +
+  disambiguation, and show the candidates**, never `results[0]`.
+- The Shang-Chi songs release group is primary `Album` with secondary
+  `['Compilation', 'Soundtrack']`. A `studio` discography scope (no secondary types)
+  correctly excludes it; direct search must still be able to find and request it.
+
+## 0.4 — K-pop / non-Latin titles: three mechanisms, all MusicBrainz-native
+
+The question was how a household member finds `싸다9` when they know it as "PSY 9th".
+Probed answers:
+
+| Query | Result |
+| --- | --- |
+| MB search `PSY 9th` | `싸다9` at **rank 2** (count 9,769) |
+| MB search `BTS The Most Beautiful Moment in Life` | `화양연화 pt.2` rank 2, `화양연화 pt.1` rank 5 |
+| MB search `BTS Hwayangyeonhwa` (romanization) | no match |
+| MB search `releasegroup:(화양연화)` | 3 rows (pt.1, pt.2, Young Forever) |
+| MB search `releasegroup:"화양연화 pt.1"` | 503 — punctuation inside a quoted field trips the query |
+| Lidarr lookup `PSY 9th` | does **not** return 싸다9 in the top 4 |
+| Lidarr lookup `싸다9` | target #1 |
+
+The mechanism behind the first two rows: **the release-group's releases carry
+localized titles.** The `싸다9` release group contains three official releases —
+two titled `싸다9` and one titled **`PSY 9th`** (2022-04-29, 12 tracks) — and the
+release-group search index includes release titles. So the English name is already
+in MusicBrainz; we just have to ask for it and show it.
+
+That yields the design:
+
+1. **Search normalization** — strip punctuation from fielded/non-Latin queries
+   (`화양연화 pt.1` → `releasegroup:(화양연화)`), and keep MB `score` ordering instead of
+   re-ranking. Use the unfielded query when the input is Latin script; use a fielded,
+   punctuation-stripped query when it contains CJK/Hangul.
+2. **`also_known_as`** — on album detail, fetch `inc=releases` and collect the distinct
+   release titles that differ from the release-group title. Display `싸다9 — PSY 9th`.
+   Persist them in a small alias table so local typeahead can match "PSY 9th" later
+   without an upstream call. This replaces the Deezer-alias idea: no third party, no
+   fuzzy matching, exact same MBID.
+3. **Artist-first fallback** — when an album search returns nothing (e.g. a romanized
+   query), search `/artist` and offer the artist's discography. Script-independent and
+   always works, because the year + cover + track count make the album recognizable.
+
+Deezer remains unnecessary: its `PSY 9th` result (12 tracks) matches the MB release
+exactly, but it carries no MBID and adds nothing the release titles do not already
+give us.
