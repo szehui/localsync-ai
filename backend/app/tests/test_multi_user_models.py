@@ -11,7 +11,14 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from app.models.database import Base, Track, User, TrackAnnotation
+from app.models.database import (
+    Base,
+    Track,
+    User,
+    TrackAnnotation,
+    ListenbrainzUserConfig,
+    LastfmUserConfig,
+)
 
 
 @pytest.fixture
@@ -160,5 +167,64 @@ class TestTrackAnnotation:
         db.add(Track(id="t1", title="Song One"))
         db.commit()
         db.add(TrackAnnotation(user_id=99, track_id="t1", rating=4))
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+
+class TestListenbrainzUserConfig:
+    def test_create_listenbrainz_user_config(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        cfg = ListenbrainzUserConfig(
+            user_id=1,
+            user_token="lb-token-123",
+            username="sze",
+        )
+        db.add(cfg)
+        db.commit()
+        assert cfg.user_id == 1
+        assert cfg.user_token == "lb-token-123"
+        assert cfg.username == "sze"
+        # ListenBrainz defaults come from the model, not the caller.
+        assert cfg.api_base == "https://api.listenbrainz.org"
+        assert cfg.labs_api_base == "https://labs.api.listenbrainz.org"
+        assert cfg.enabled is True
+        assert cfg.last_connect_check is None
+
+    def test_one_config_per_user_id(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        db.add(ListenbrainzUserConfig(user_id=1, user_token="a", username="sze"))
+        db.add(ListenbrainzUserConfig(user_id=1, user_token="b", username="sze"))
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+    def test_unknown_user_is_rejected(self, db):
+        db.add(ListenbrainzUserConfig(user_id=99, user_token="a", username="sze"))
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+
+class TestLastfmUserConfig:
+    def test_create_lastfm_user_config(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        cfg = LastfmUserConfig(user_id=1, api_key="key-123", username="sze")
+        db.add(cfg)
+        db.commit()
+        assert cfg.user_id == 1
+        assert cfg.api_key == "key-123"
+        assert cfg.username == "sze"
+
+    def test_one_config_per_user_id(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        db.add(LastfmUserConfig(user_id=1, api_key="a", username="sze"))
+        db.add(LastfmUserConfig(user_id=1, api_key="b", username="sze"))
+        with pytest.raises(IntegrityError):
+            db.commit()
+
+    def test_unknown_user_is_rejected(self, db):
+        db.add(LastfmUserConfig(user_id=99, api_key="a", username="sze"))
         with pytest.raises(IntegrityError):
             db.commit()

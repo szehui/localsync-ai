@@ -148,6 +148,8 @@ class GeneratedPlaylist(Base):
 
 
 class ConnectionConfig(Base):
+    """Legacy singleton config. Read only by the one-time per-user migration,
+    then superseded by per-user tables; kept so that migration can run."""
     __tablename__ = "connection_config"
     id = Column(Integer, primary_key=True, default=1)  # singleton row
     url = Column(String, nullable=False)
@@ -174,6 +176,8 @@ class SmartTrigger(Base):
 
 
 class LastfmConfig(Base):
+    """Legacy singleton config. Read only by the one-time per-user migration,
+    then superseded by LastfmUserConfig; kept so that migration can run."""
     __tablename__ = "lastfm_config"
     id = Column(Integer, primary_key=True, default=1)  # singleton row
     api_key = Column(String, nullable=False)
@@ -193,6 +197,9 @@ class ListenbrainzConfig(Base):
 
     Primary listening-history source. Last.fm (LastfmConfig) remains as a
     fallback, consulted only when ListenBrainz yields nothing.
+
+    Legacy singleton: read only by the one-time per-user migration, then
+    superseded by ListenbrainzUserConfig.
     """
     __tablename__ = "listenbrainz_config"
     id = Column(Integer, primary_key=True, default=1)  # singleton row
@@ -202,6 +209,45 @@ class ListenbrainzConfig(Base):
     labs_api_base = Column(String, default="https://labs.api.listenbrainz.org")
     enabled = Column(Boolean, default=True)
     last_connect_check = Column(DateTime, nullable=True)
+
+
+class ListenbrainzUserConfig(Base):
+    """Per-user ListenBrainz credentials.
+
+    ListenBrainz auth is separate from Navidrome auth, so a user who never
+    linked a scrobbler has no token — that is a valid state, and this row may
+    simply be absent. user_id is the primary key, so each user has at most one
+    row, and deleting the user cascades the row away.
+    """
+    __tablename__ = "listenbrainz_user_config"
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_token = Column(String, nullable=False)
+    username = Column(String, nullable=False)
+    api_base = Column(String, default="https://api.listenbrainz.org")
+    labs_api_base = Column(String, default="https://labs.api.listenbrainz.org")
+    enabled = Column(Boolean, default=True)
+    last_connect_check = Column(DateTime, nullable=True)
+
+
+class LastfmUserConfig(Base):
+    """Per-user Last.fm credentials.
+
+    See ListenbrainzUserConfig: per-user, at most one row per user, and the
+    row may be absent when the user never linked Last.fm. Deleting the user
+    cascades the row away.
+    """
+    __tablename__ = "lastfm_user_config"
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    api_key = Column(String, nullable=False)
+    username = Column(String, nullable=False)
 
 
 class LbRecommendationCache(Base):
