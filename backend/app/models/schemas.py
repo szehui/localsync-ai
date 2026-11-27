@@ -171,6 +171,33 @@ class UserResponse(BaseModel):
     server_version: Optional[str] = None
 
 
+# --- Household roster ---
+
+class HouseholdUserResponse(BaseModel):
+    """One account in the household, as shown on the roster.
+
+    Deliberately narrow: no ``navidrome_password`` and no ListenBrainz token
+    field exists here at all, so a future mistake cannot start leaking them —
+    there is no attribute to populate. ``listenbrainz_configured`` is a boolean
+    derived from row existence, not the credential itself.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: str
+    display_name: Optional[str] = None
+    is_owner: bool = False
+    created_at: Optional[datetime] = None
+    last_login: Optional[datetime] = None
+    listenbrainz_configured: bool = False
+
+
+class DeleteUserResponse(BaseModel):
+    deleted: bool
+    user_id: int
+
+
 # --- Last.fm ---
 
 

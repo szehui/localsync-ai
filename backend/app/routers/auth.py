@@ -4,6 +4,8 @@ Endpoints:
   - POST /login   — validate Navidrome Subsonic credentials, establish connection, return JWT
   - POST /logout  — drop the caller's live connection (credentials stay)
   - GET  /me      — verify token and return current user info
+  - GET  /users        — household roster (no credentials in the payload)
+  - DELETE /users/{id} — owner-only account removal (cascades per-user data)
   - GET  /status       — connection status (requires JWT)
   - GET  /sync-status  — sync status (requires JWT)
   - POST /sync         — trigger sync (requires JWT)
@@ -24,10 +26,13 @@ from sqlalchemy.orm import Session
 from app.models.database import (
     get_db,
     SessionLocal,
+    GeneratedPlaylist,
     LastfmUserConfig,
     ListenbrainzUserConfig,
+    SmartTrigger,
+    User,
 )
-from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse
+from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse, HouseholdUserResponse, DeleteUserResponse
 from app.services.navidrome import NavidromeClient
 from app.services.listenbrainz import ListenBrainzClient, ListenBrainzError, UserNotFoundError
 from app.services.sync import SyncService
@@ -211,6 +216,103 @@ async def me(user: dict = Depends(get_current_user)):
         navidrome_url=user["navidrome_url"],
         server_version=server_version,
     )
+
+
+# ── Household roster (owner-managed accounts) ───────────────────────────────
+
+@router.get("/users", response_model=list[HouseholdUserResponse])
+async def list_users(
+    _user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List every account in the household, newest secrets excluded.
+
+    Any authenticated member may look at the roster — the UI needs it to show
+    who else shares the server. What comes back is identity and state only:
+    ``navidrome_password`` and the ListenBrainz token are not fields of
+    ``HouseholdUserResponse``, so they cannot be echoed even by accident.
+    ``listenbrainz_configured`` is a boolean derived from row existence.
+
+    One query with an outer join rather than a per-user probe: the roster is
+    small but N+1 queries on a page the UI polls is still waste.
+    """
+    rows = (
+        db.query(User, ListenbrainzUserConfig.user_id)
+        .outerjoin(ListenbrainzUserConfig, ListenbrainzUserConfig.user_id == User.id)
+        .order_by(User.id)
+        .all()
+    )
+    return [
+        HouseholdUserResponse(
+            id=member.id,
+            username=member.username,
+            display_name=member.display_name,
+            is_owner=bool(member.is_owner),
+            created_at=member.created_at,
+            last_login=member.last_login,
+            listenbrainz_configured=lb_user_id is not None,
+        )
+        for member, lb_user_id in rows
+    ]
+
+
+@router.delete("/users/{user_id}", response_model=DeleteUserResponse)
+async def delete_user(
+    user_id: int,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Remove another account from the household. Owner only.
+
+    The owner check reads the caller's row from the database rather than the
+    JWT: ``is_owner`` is a mutable DB flag, and a token minted before the flag
+    changed must not carry elevated rights. This also means a deleted owner
+    cannot keep acting on a stale token.
+
+    Per-user rows (annotations, Last.fm/ListenBrainz config, the CF cache,
+    discovery offers) go with the FK cascade. Two tables are the exception —
+    ``generated_playlists`` and ``smart_triggers`` hold nullable ``owner_id``
+    FKs with no ``ondelete`` cascade, so those links are cleared first; see
+    the comments below.
+    """
+    caller = db.get(User, user["id"])
+    if caller is None or not caller.is_owner:
+        raise HTTPException(status_code=403, detail="Only the owner can remove users")
+
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if target.is_owner:
+        raise HTTPException(status_code=400, detail="Cannot remove the owner account")
+
+    # Drop live sockets before the row disappears: a cached client still holds
+    # this user's credentials in memory, and leaving it registered would answer
+    # requests for an account that no longer exists.
+    await clear_clients_for_user(user_id)
+
+    # GeneratedPlaylist.owner_id is a plain nullable FK (no ON DELETE CASCADE),
+    # and the rows are history: the UI keeps listing past mixes, and the
+    # scheduler's retention/cooldown queries simply stop matching them. So the
+    # link is cleared instead of the row being destroyed. With SQLite's
+    # foreign_keys pragma on, deleting the user while a row still pointed here
+    # would fail outright.
+    db.query(GeneratedPlaylist).filter(
+        GeneratedPlaylist.owner_id == user_id
+    ).update({GeneratedPlaylist.owner_id: None}, synchronize_session=False)
+
+    # SmartTrigger.owner_id is the same shape — nullable, no ondelete cascade —
+    # so the triggers are orphaned rather than deleted. Their APScheduler jobs
+    # stay registered but can no longer resolve a user, which fails harmlessly
+    # in the job body instead of taking the account delete down with it.
+    db.query(SmartTrigger).filter(
+        SmartTrigger.owner_id == user_id
+    ).update({SmartTrigger.owner_id: None}, synchronize_session=False)
+
+    db.delete(target)
+    db.commit()
+    logger.info("Owner %s removed user %s", user["id"], user_id)
+    return DeleteUserResponse(deleted=True, user_id=user_id)
 
 
 # ── Connection endpoints ─────────────────────────────────────────────────────
