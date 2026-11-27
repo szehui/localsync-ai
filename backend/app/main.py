@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from app.models.database import init_db, engine, SessionLocal, SmartTrigger, ConnectionConfig
+from app.models.database import init_db, engine, SessionLocal, SmartTrigger
 from app.routers import auth, library, playlists, triggers
 from app.routers import youtube_import, discovery
 from app.config import settings
