@@ -256,13 +256,26 @@ class LastfmUserConfig(Base):
 
 
 class LbRecommendationCache(Base):
-    """Cached user-level collaborative-filtering recommendations.
+    """Cached per-user collaborative-filtering recommendations.
+
+    CF recommendations are computed from ONE listener's history, so they are
+    only meaningful for that listener: one row per user, and a deleted user
+    takes their cache row with them. Sharing this between accounts would
+    recommend one person's taste to another.
 
     The CF endpoint is expensive (1 call, 30/window budget) and only changes on
     a weekly cadence upstream, so it is refetched on a 24h TTL.
+
+    Contrast LbSimilarCache, which is deliberately NOT per-user: neighbours of
+    a recording are a property of the recording, not of who asked for them, so
+    that cache is shared across all users.
     """
     __tablename__ = "lb_recommendation_cache"
-    id = Column(Integer, primary_key=True, default=1)  # singleton row
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
     mbids = Column(Text, nullable=False)  # JSON [{recording_mbid, score, latest_listened_at}]
     fetched_at = Column(DateTime, default=datetime.utcnow)
 
@@ -272,6 +285,10 @@ class LbSimilarCache(Base):
 
     The Labs endpoint accepts exactly one recording MBID per call, so with ~20
     seeds per run this cache is what keeps the call count sane. 7d TTL.
+
+    Intentionally global, not per-user: the similar recordings of an MBID are
+    the same fact regardless of which user seeded the query. See
+    LbRecommendationCache for the per-user cache.
     """
     __tablename__ = "lb_similar_cache"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -402,6 +419,27 @@ def init_db():
                 f"CREATE INDEX IF NOT EXISTS ix_{table}_owner_id ON {table} (owner_id)"
             ))
         conn.commit()
+
+    # Per-user CF recommendation cache: the old table was a singleton (id=1)
+    # and has no user_id, which create_all() will never add. There is no
+    # defensible owner for that row — it was computed from whichever single
+    # listener the pre-multi-user install had — so drop and recreate rather
+    # than migrate. The cache has a 24h TTL, so the only cost is one extra API
+    # call. The guard keeps a fresh DB (where create_all already built the
+    # right table) untouched.
+    if inspector.has_table("lb_recommendation_cache"):
+        lb_cache_cols = [
+            c["name"] for c in inspector.get_columns("lb_recommendation_cache")
+        ]
+        if "user_id" not in lb_cache_cols:
+            logger.info(
+                "Migrating lb_recommendation_cache to per-user: dropping "
+                "singleton row (no owner, 24h TTL)"
+            )
+            with engine.connect() as conn:
+                conn.execute(sa.text("DROP TABLE lb_recommendation_cache"))
+                conn.commit()
+            Base.metadata.tables["lb_recommendation_cache"].create(bind=engine)
 
     # One-time multi-user migration: adopt legacy singleton config into
     # per-user rows, then backfill owner_id on pre-multi-user triggers and

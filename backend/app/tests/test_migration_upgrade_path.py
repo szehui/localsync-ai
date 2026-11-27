@@ -58,10 +58,16 @@ CREATE TABLE generated_playlists (
     seed_playlist_id VARCHAR, seed_playlist_name VARCHAR, strictness INTEGER,
     track_count INTEGER, track_ids TEXT, created_at DATETIME, updated_at DATETIME
 );
+-- Singleton CF recommendation cache: no user_id, one row for the whole install.
+CREATE TABLE lb_recommendation_cache (
+    id INTEGER PRIMARY KEY, mbids TEXT NOT NULL, fetched_at DATETIME
+);
 INSERT INTO connection_config (id, url, username, password)
     VALUES (1, 'http://nav:4533', 'sze', 'secret');
 INSERT INTO listenbrainz_config (id, user_token, username)
     VALUES (1, 'lb-token', 'sze_lb');
+INSERT INTO lb_recommendation_cache (id, mbids)
+    VALUES (1, '[{"recording_mbid": "stale-mbid", "score": 9.9}]');
 INSERT INTO tracks (id, title, artist_name, play_count, rating, starred)
     VALUES ('t1', 'Played Song', 'Artist A', 17, 4, 1);
 INSERT INTO tracks (id, title, artist_name, play_count, rating, starred)
@@ -166,3 +172,32 @@ def test_legacy_columns_and_tables_survive_the_upgrade(legacy_db):
     assert {"play_count", "rating", "starred", "last_played_at"} <= set(
         _columns(engine, "tracks")
     )
+
+
+def test_init_db_rescopes_recommendation_cache_to_per_user(legacy_db):
+    """The singleton CF cache row has no defensible owner, so it is dropped.
+
+    Without a user_id the old row belonged to whoever the pre-multi-user
+    install's single listener was. Dropping costs at most one API call because
+    the cache's TTL is 24h.
+    """
+    path, engine = legacy_db
+    db_module.init_db()
+
+    cols = _columns(engine, "lb_recommendation_cache")
+    assert "user_id" in cols
+    assert "id" not in cols
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("SELECT user_id, mbids FROM lb_recommendation_cache")
+        ).fetchall()
+    assert rows == [], f"stale singleton row survived the migration: {rows}"
+
+
+def test_similar_cache_stays_global_after_upgrade(legacy_db):
+    """create_all() builds lb_similar_cache fresh; it must not gain a user_id."""
+    path, engine = legacy_db
+    db_module.init_db()
+
+    assert "user_id" not in _columns(engine, "lb_similar_cache")

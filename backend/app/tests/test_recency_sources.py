@@ -30,6 +30,7 @@ def trigger():
     t.playlist_name = None
     t.last_run = None
     t.threshold = 5
+    t.owner_id = 1
     return t
 
 
@@ -222,7 +223,7 @@ class TestGatherCandidates:
     async def test_returns_empty_when_not_configured(self):
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = None
-        assert await scheduler._gather_lb_candidates(db, MagicMock()) == []
+        assert await scheduler._gather_lb_candidates(db, MagicMock(), 1) == []
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_client_error(self, monkeypatch):
@@ -235,7 +236,7 @@ class TestGatherCandidates:
         lb.close = AsyncMock()
         monkeypatch.setattr(scheduler, "ListenBrainzClient", lambda *a, **k: lb)
 
-        assert await scheduler._gather_lb_candidates(db, MagicMock()) == []
+        assert await scheduler._gather_lb_candidates(db, MagicMock(), 1) == []
         lb.close.assert_awaited()
 
     @pytest.mark.asyncio
@@ -249,7 +250,7 @@ class TestGatherCandidates:
         lb.close = AsyncMock()
         monkeypatch.setattr(scheduler, "ListenBrainzClient", lambda *a, **k: lb)
 
-        assert await scheduler._gather_lb_candidates(db, MagicMock()) == []
+        assert await scheduler._gather_lb_candidates(db, MagicMock(), 1) == []
         lb.close.assert_awaited()
 
 

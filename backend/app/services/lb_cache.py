@@ -7,6 +7,10 @@ budget, and neither changes quickly:
 * Labs similar-recordings takes exactly ONE MBID per call, so a 20-seed run
   costs 20 calls unless results are cached -> 7d TTL.
 
+The two caches are scoped differently: recommendations are per-user (they
+describe one listener's taste) while similar-recordings are global (they
+describe the recording).
+
 Empty results are cached deliberately. `[]` from Labs means "this dataset has no
 neighbours for that recording", which is a stable fact worth remembering — not a
 transient failure to retry.
@@ -46,25 +50,26 @@ def _load_json(raw: str, default):
 
 # ── recommendations ──────────────────────────────────────────────────────────
 
-def get_cached_recommendations(db: Session,
+def get_cached_recommendations(db: Session, user_id: int,
                                now: datetime | None = None) -> list[dict] | None:
-    """Cached CF recommendations, or None on miss/stale."""
+    """Cached CF recommendations for one user, or None on miss/stale."""
     row = db.query(LbRecommendationCache).filter(
-        LbRecommendationCache.id == 1).first()
+        LbRecommendationCache.user_id == user_id).first()
     if row is None or _is_stale(row.fetched_at, RECOMMENDATION_TTL, now):
         return None
     return _load_json(row.mbids, [])
 
 
-def put_recommendations(db: Session, mbids: list[dict],
+def put_recommendations(db: Session, user_id: int, mbids: list[dict],
                         now: datetime | None = None) -> None:
-    """Store CF recommendations, replacing any existing row."""
+    """Store one user's CF recommendations, replacing their existing row."""
     payload = json.dumps(mbids)
     fetched_at = now or datetime.utcnow()
     row = db.query(LbRecommendationCache).filter(
-        LbRecommendationCache.id == 1).first()
+        LbRecommendationCache.user_id == user_id).first()
     if row is None:
-        db.add(LbRecommendationCache(id=1, mbids=payload, fetched_at=fetched_at))
+        db.add(LbRecommendationCache(user_id=user_id, mbids=payload,
+                                     fetched_at=fetched_at))
     else:
         row.mbids = payload
         row.fetched_at = fetched_at

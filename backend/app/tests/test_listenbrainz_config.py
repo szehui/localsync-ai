@@ -57,16 +57,16 @@ class TestListenbrainzConfig:
 class TestLbRecommendationCache:
     def test_roundtrip(self, db_session):
         payload = [{"recording_mbid": "abc", "score": 9.3}]
-        db_session.add(LbRecommendationCache(id=1, mbids=json.dumps(payload)))
+        db_session.add(LbRecommendationCache(user_id=1, mbids=json.dumps(payload)))
         db_session.commit()
 
         row = db_session.query(LbRecommendationCache).filter(
-            LbRecommendationCache.id == 1).first()
+            LbRecommendationCache.user_id == 1).first()
         assert json.loads(row.mbids)[0]["recording_mbid"] == "abc"
         assert row.fetched_at is not None
 
     def test_fetched_at_is_set(self, db_session):
-        db_session.add(LbRecommendationCache(id=1, mbids="[]"))
+        db_session.add(LbRecommendationCache(user_id=1, mbids="[]"))
         db_session.commit()
         row = db_session.query(LbRecommendationCache).first()
         assert isinstance(row.fetched_at, datetime)

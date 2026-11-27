@@ -642,7 +642,8 @@ def _entry_from_similar(row: dict) -> dict | None:
     return {"artist": artist, "title": title, "recording_mbid": mbid}
 
 
-async def _gather_lb_candidates(db: Session, client: NavidromeClient) -> list[dict]:
+async def _gather_lb_candidates(db: Session, client: NavidromeClient,
+                                user_id: int) -> list[dict]:
     """Collect ListenBrainz-derived candidate entries, cheapest source first.
 
     Order matters for the rate limit:
@@ -654,6 +655,10 @@ async def _gather_lb_candidates(db: Session, client: NavidromeClient) -> list[di
     resolve through the text index. Returns [] when ListenBrainz is
     unconfigured, has no history yet, or errors — the caller then falls back to
     Last.fm.
+
+    `user_id` scopes the CF recommendation cache only: recommendations are one
+    listener's taste. The similar-recordings cache is keyed by recording MBID
+    and is shared by every user.
     """
     cfg = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
     if cfg is None:
@@ -673,10 +678,10 @@ async def _gather_lb_candidates(db: Session, client: NavidromeClient) -> list[di
 
         entries: list[dict] = []
 
-        recs = get_cached_recommendations(db)
+        recs = get_cached_recommendations(db, user_id)
         if recs is None:
             recs = await lb.get_recommendations()
-            put_recommendations(db, recs)
+            put_recommendations(db, user_id, recs)
         for rec in recs:
             mbid = (rec.get("recording_mbid") or "").strip()
             if mbid:
@@ -803,7 +808,7 @@ async def run_recency_trigger(trigger_id: int):
             newest_ids: list[str] = []
 
             # ── ListenBrainz first — it is the primary history source ──
-            lb_entries = await _gather_lb_candidates(db, client)
+            lb_entries = await _gather_lb_candidates(db, client, trigger.owner_id)
             if lb_entries:
                 lb_ids, unresolved = resolve_entries(db, lb_entries)
                 lb_ids.extend(await _resolve_via_search(client, unresolved))
