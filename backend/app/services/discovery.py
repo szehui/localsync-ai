@@ -4,9 +4,9 @@ This is the inverse of playlist generation. `services/resolver.py` treats an
 entry that fails to resolve to a local song id as a *failure*. Here that failure
 is the product.
 
-Pipeline:
+Pipeline (per user — seeds and offers are personal):
 
-    seeds (top-played library tracks with an MBID)
+    seeds (this user's top-played library tracks with an MBID)
       -> Labs similar-recordings per seed (names included, 7d cache)
       -> dedupe by recording MBID, merging evidence
       -> novelty triage against the library
@@ -32,7 +32,12 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.models.database import DiscoveryOffer, DiscoveryState, Track
+from app.models.database import (
+    DiscoveryOffer,
+    DiscoveryState,
+    Track,
+    TrackAnnotation,
+)
 from app.services import lb_cache
 
 logger = logging.getLogger(__name__)
@@ -106,8 +111,16 @@ def library_index(db: Session) -> tuple[set[str], set[str]]:
     return mbids, artists
 
 
-def select_seeds(db: Session, limit: int = DEFAULT_SEED_COUNT) -> list[Track]:
-    """Top-played tracks carrying an MBID, at most one per artist.
+def select_seeds(db: Session, user_id: int,
+                 limit: int = DEFAULT_SEED_COUNT) -> list[Track]:
+    """This user's top-played tracks carrying an MBID, at most one per artist.
+
+    Play counts are personal (TrackAnnotation), not a property of the shared
+    library row, so the join is not a lookup convenience: a track the household
+    played 300 times but this user never touched is not a seed for THEIR
+    discovery feed. Scoping by user_id is what makes the feed per-user at all —
+    everything downstream (Labs neighbours, triage, offers) inherits the taste
+    of whoever seeded it.
 
     One-per-artist matters: otherwise a single heavy-rotation artist (EXO at 193
     listens in live testing) consumes every seed slot and the candidate pool
@@ -116,12 +129,17 @@ def select_seeds(db: Session, limit: int = DEFAULT_SEED_COUNT) -> list[Track]:
     limit = max(1, min(limit, MAX_SEED_COUNT))
     rows = (
         db.query(Track)
+        .join(
+            TrackAnnotation,
+            (TrackAnnotation.track_id == Track.id)
+            & (TrackAnnotation.user_id == user_id),
+        )
         .filter(
             Track.recording_mbid.isnot(None),
             Track.recording_mbid != "",
-            Track.play_count > 0,
+            TrackAnnotation.play_count > 0,
         )
-        .order_by(Track.play_count.desc(), Track.id)
+        .order_by(TrackAnnotation.play_count.desc(), Track.id)
         .all()
     )
     seeds: list[Track] = []
@@ -259,8 +277,14 @@ def build_feed(offers: list[DiscoveryOffer], limit_artists: int = DEFAULT_FEED_A
 
 # ── persistence ──────────────────────────────────────────────────────────────
 
-def get_state(db: Session) -> DiscoveryState:
-    """Fetch (or lazily create) the singleton state row."""
+def get_state(db: Session, user_id: int) -> DiscoveryState:
+    """Fetch (or lazily create) the discovery state row.
+
+    The row is still a single shared record: the refresh is one rate-limited
+    background job, so there is no per-user status to read yet. ``user_id`` is
+    accepted here anyway so every entry point in this module is uniformly
+    per-user — when the state row goes per-user, no caller has to change.
+    """
     state = db.query(DiscoveryState).filter(DiscoveryState.id == 1).first()
     if state is None:
         state = DiscoveryState(id=1)
@@ -270,17 +294,21 @@ def get_state(db: Session) -> DiscoveryState:
     return state
 
 
-def upsert_offers(db: Session, candidates: list[dict], bucket: str,
+def upsert_offers(db: Session, user_id: int, candidates: list[dict], bucket: str,
                   now: datetime | None = None) -> int:
-    """Insert new offers, refresh the last_seen of known ones.
+    """Insert new offers for one user, refresh the last_seen of known ones.
 
     Two rules matter:
 
-    * A recording already known to the table is **never re-offered**. Its
+    * A recording already offered to *this* user is **never re-offered**. Its
       `last_seen` is bumped but its status is preserved, so a dismissed offer
       cannot resurrect itself and a saved one does not reappear.
     * Evidence is merged, not replaced, so a candidate that matches across
       several runs keeps accumulating its explanation.
+
+    Matching is on (user_id, recording_mbid), not recording_mbid alone: another
+    user's dismissal is their opinion, and must not stop this user being
+    offered the same recording.
     """
     stamp = now or datetime.utcnow()
     added = 0
@@ -289,7 +317,9 @@ def upsert_offers(db: Session, candidates: list[dict], bucket: str,
         if not mbid:
             continue
         existing = db.query(DiscoveryOffer).filter(
-            DiscoveryOffer.recording_mbid == mbid).first()
+            DiscoveryOffer.user_id == user_id,
+            DiscoveryOffer.recording_mbid == mbid,
+        ).first()
         evidence = cand.get("evidence") or []
         if existing is not None:
             existing.last_seen = stamp
@@ -303,6 +333,7 @@ def upsert_offers(db: Session, candidates: list[dict], bucket: str,
             continue
 
         db.add(DiscoveryOffer(
+            user_id=user_id,
             recording_mbid=mbid,
             artist_name=cand.get("artist_name"),
             track_title=cand.get("track_title"),
@@ -321,15 +352,23 @@ def upsert_offers(db: Session, candidates: list[dict], bucket: str,
     return added
 
 
-def offered_feed(db: Session, limit_artists: int = DEFAULT_FEED_ARTISTS) -> list[dict]:
-    """Current feed: only `offered` rows, grouped by artist."""
-    rows = (
+def offered_rows(db: Session, user_id: int) -> list[DiscoveryOffer]:
+    """This user's `offered` rows, best score first."""
+    return (
         db.query(DiscoveryOffer)
-        .filter(DiscoveryOffer.status == STATUS_OFFERED)
+        .filter(
+            DiscoveryOffer.user_id == user_id,
+            DiscoveryOffer.status == STATUS_OFFERED,
+        )
         .order_by(DiscoveryOffer.score.desc())
         .all()
     )
-    return build_feed(rows, limit_artists)
+
+
+def offered_feed(db: Session, user_id: int,
+                 limit_artists: int = DEFAULT_FEED_ARTISTS) -> list[dict]:
+    """Current feed for one user: only `offered` rows, grouped by artist."""
+    return build_feed(offered_rows(db, user_id), limit_artists)
 
 
 # ── orchestration ────────────────────────────────────────────────────────────
@@ -352,15 +391,21 @@ def _candidate_from_labs_row(row: dict, seed: Track) -> dict:
 
 async def gather_labs_candidates(
     db: Session,
+    user_id: int,
     client,
     seeds: list[Track],
     target_candidates: int = 0,
     min_live_seeds: int = 0,
     max_calls: int | None = None,
 ) -> tuple[list[dict], int, int]:
-    """Expand seeds via Labs, using the 7d cache.
+    """Expand one user's seeds via Labs, using the 7d cache.
 
     Returns (candidates, api_calls, live_seeds).
+
+    ``user_id`` is threaded for a uniform per-user pipeline; the neighbours of
+    an MBID are a property of the recording, not of who asked, so the cache that
+    makes this affordable stays global (lb_similar_cache). The *seeds* are what
+    make the run personal, and they arrive already scoped to the user.
 
     Roughly half of all recording MBIDs have no Labs neighbours at all, so a
     fixed seed count produces a feed dominated by whichever two or three seeds
@@ -407,13 +452,14 @@ async def gather_labs_candidates(
     return candidates, calls, live
 
 
-async def refresh_feed(db: Session, client, seed_count: int = DEFAULT_SEED_COUNT) -> dict:
-    """Run a full discovery refresh and persist offers. Returns a summary dict.
+async def refresh_feed(db: Session, user_id: int, client,
+                       seed_count: int = DEFAULT_SEED_COUNT) -> dict:
+    """Run a full discovery refresh for one user and persist their offers.
 
     Never raises: the state row records the failure so the UI can show it, and a
     partial run still persists whatever candidates were gathered.
     """
-    state = get_state(db)
+    state = get_state(db, user_id)
     state.last_status = "running"
     db.commit()
 
@@ -422,16 +468,16 @@ async def refresh_feed(db: Session, client, seed_count: int = DEFAULT_SEED_COUNT
 
     try:
         lib_mbids, lib_artists = library_index(db)
-        seeds = select_seeds(db, seed_count)
+        seeds = select_seeds(db, user_id, seed_count)
         summary["seeds_used"] = len(seeds)
         if not seeds:
             raise RuntimeError(
-                "no seeds available: the library has no played tracks with a "
-                "recording MBID (run a full sync)"
+                "no seeds available: this user has no played tracks with a "
+                "recording MBID (listen to something, or run a full sync)"
             )
 
         raw, calls, live = await gather_labs_candidates(
-            db, client, seeds,
+            db, user_id, client, seeds,
             target_candidates=TARGET_CANDIDATES,
             min_live_seeds=MIN_LIVE_SEEDS,
             max_calls=MAX_SEED_CALLS,
@@ -444,14 +490,15 @@ async def refresh_feed(db: Session, client, seed_count: int = DEFAULT_SEED_COUNT
         owned, artist_known, new_artist = triage_candidates(
             candidates, lib_mbids, lib_artists)
 
-        added = upsert_offers(db, cap_per_artist(new_artist), NEW_ARTIST)
-        added += upsert_offers(db, cap_per_artist(artist_known), ARTIST_KNOWN)
+        added = upsert_offers(db, user_id, cap_per_artist(new_artist), NEW_ARTIST)
+        added += upsert_offers(db, user_id, cap_per_artist(artist_known),
+                               ARTIST_KNOWN)
         summary["offers_added"] = added
 
         logger.info(
-            "Discovery: %d seeds -> %d raw -> %d unique (%d owned, %d gap-fill, "
-            "%d new) -> %d new offers, %d calls",
-            len(seeds), len(raw), len(candidates), len(owned),
+            "Discovery: user %s, %d seeds -> %d raw -> %d unique (%d owned, "
+            "%d gap-fill, %d new) -> %d new offers, %d calls",
+            user_id, len(seeds), len(raw), len(candidates), len(owned),
             len(artist_known), len(new_artist), added, calls,
         )
     except Exception as exc:  # noqa: BLE001

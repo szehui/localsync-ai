@@ -18,7 +18,6 @@ from sqlalchemy.orm import Session
 from app.models.database import (
     DiscoveryOffer,
     LidarrConfig,
-    ListenbrainzConfig,
     SessionLocal,
     get_db,
 )
@@ -36,6 +35,7 @@ from app.routers.auth import get_current_user
 from app.services import discovery
 from app.services.lidarr import LidarrService
 from app.services.listenbrainz import ListenBrainzClient
+from app.services.users import get_listenbrainz_config
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +74,19 @@ def _build_counts(offers: list[DiscoveryOffer]) -> DiscoveryCounts:
     )
 
 
-async def _run_refresh_background() -> None:
-    """Background refresh with its own DB session (the request's session is gone)."""
+async def _run_refresh_background(user_id: int) -> None:
+    """Background refresh for one user, with its own DB session.
+
+    The request's session is gone by the time this runs, and the refresh must
+    use *this* user's ListenBrainz credentials: a per-user feed seeded from one
+    person's plays should not authenticate as somebody else, nor run at all on a
+    household token they never linked.
+    """
     db = SessionLocal()
     try:
-        config = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+        config = get_listenbrainz_config(db, user_id)
         if config is None:
-            state = discovery.get_state(db)
+            state = discovery.get_state(db, user_id)
             state.last_status = "error"
             state.last_error = (
                 "ListenBrainz is not configured; add a username and token in "
@@ -96,13 +102,13 @@ async def _run_refresh_background() -> None:
             labs_api_base=config.labs_api_base or "https://labs.api.listenbrainz.org",
         )
         try:
-            await discovery.refresh_feed(db, client)
+            await discovery.refresh_feed(db, user_id, client)
         finally:
             await client.close()
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Discovery background refresh failed")
+        logger.exception("Discovery background refresh failed for user %s", user_id)
         try:
-            state = discovery.get_state(db)
+            state = discovery.get_state(db, user_id)
             state.last_status = "error"
             state.last_error = str(exc)
             db.commit()
@@ -114,26 +120,25 @@ async def _run_refresh_background() -> None:
 
 @router.get("/", response_model=DiscoveryFeedResponse)
 async def get_feed(limit: int = discovery.DEFAULT_FEED_ARTISTS,
+                   user: dict = Depends(get_current_user),
                    db: Session = Depends(get_db)):
-    """Current discovery feed, grouped by artist."""
-    offers = (
-        db.query(DiscoveryOffer)
-        .filter(DiscoveryOffer.status == discovery.STATUS_OFFERED)
-        .order_by(DiscoveryOffer.score.desc())
-        .all()
-    )
+    """The calling user's discovery feed, grouped by artist."""
+    offers = discovery.offered_rows(db, user["id"])
     groups = discovery.build_feed(offers, limit)
     return DiscoveryFeedResponse(
         artists=[DiscoveryArtistGroup(**g) for g in groups],
-        state=DiscoveryStateResponse.model_validate(discovery.get_state(db)),
+        state=DiscoveryStateResponse.model_validate(
+            discovery.get_state(db, user["id"])),
         counts=_build_counts(offers),
     )
 
 
 @router.post("/refresh", response_model=DiscoveryRefreshResponse, status_code=202)
-async def refresh(background: BackgroundTasks, db: Session = Depends(get_db)):
-    """Kick off a background refresh. Poll `GET /` for progress."""
-    state = discovery.get_state(db)
+async def refresh(background: BackgroundTasks,
+                  user: dict = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """Kick off a background refresh for the caller. Poll `GET /` for progress."""
+    state = discovery.get_state(db, user["id"])
     if state.last_status == STATUS_RUNNING:
         return DiscoveryRefreshResponse(
             status=STATUS_RUNNING, message="A refresh is already running")
@@ -143,7 +148,7 @@ async def refresh(background: BackgroundTasks, db: Session = Depends(get_db)):
     state.last_error = None
     db.commit()
 
-    background.add_task(_run_refresh_background)
+    background.add_task(_run_refresh_background, user["id"])
     return DiscoveryRefreshResponse(
         status=STATUS_RUNNING,
         message="Refresh started; this takes ~20s on a cold run",
@@ -151,9 +156,14 @@ async def refresh(background: BackgroundTasks, db: Session = Depends(get_db)):
 
 
 @router.post("/{offer_id}/dismiss", response_model=DiscoveryRefreshResponse)
-async def dismiss(offer_id: int, db: Session = Depends(get_db)):
-    """Dismiss an offer. It never resurfaces in the feed."""
-    offer = db.query(DiscoveryOffer).filter(DiscoveryOffer.id == offer_id).first()
+async def dismiss(offer_id: int, user: dict = Depends(get_current_user),
+                  db: Session = Depends(get_db)):
+    """Dismiss one of the caller's offers. It never resurfaces for them."""
+    offer = (
+        db.query(DiscoveryOffer)
+        .filter(DiscoveryOffer.id == offer_id, DiscoveryOffer.user_id == user["id"])
+        .first()
+    )
     if offer is None:
         raise HTTPException(status_code=404, detail="Offer not found")
     offer.status = discovery.STATUS_DISMISSED
@@ -163,9 +173,14 @@ async def dismiss(offer_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{offer_id}/add", response_model=DiscoveryAddResponse)
 async def add_to_lidarr(offer_id: int, request: DiscoveryAddRequest,
+                        user: dict = Depends(get_current_user),
                         db: Session = Depends(get_db)):
-    """Add the offer's album to Lidarr's wanted list (single album only)."""
-    offer = db.query(DiscoveryOffer).filter(DiscoveryOffer.id == offer_id).first()
+    """Add the caller's offer album to Lidarr's wanted list (single album only)."""
+    offer = (
+        db.query(DiscoveryOffer)
+        .filter(DiscoveryOffer.id == offer_id, DiscoveryOffer.user_id == user["id"])
+        .first()
+    )
     if offer is None:
         raise HTTPException(status_code=404, detail="Offer not found")
     if offer.status == discovery.STATUS_SAVED:

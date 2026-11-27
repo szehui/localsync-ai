@@ -62,12 +62,32 @@ CREATE TABLE generated_playlists (
 CREATE TABLE lb_recommendation_cache (
     id INTEGER PRIMARY KEY, mbids TEXT NOT NULL, fetched_at DATETIME
 );
+-- Household-global discovery feed: recording_mbid UNIQUE, so user B could never
+-- be offered anything user A had already seen. The row is 'dismissed' on
+-- purpose: that status is the dedupe memory the rebuild must not lose.
+CREATE TABLE discovery_offers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recording_mbid VARCHAR NOT NULL UNIQUE, artist_name VARCHAR,
+    track_title VARCHAR, release_name VARCHAR, release_mbid VARCHAR,
+    source VARCHAR NOT NULL, score FLOAT, evidence TEXT, bucket VARCHAR NOT NULL,
+    status VARCHAR NOT NULL, lidarr_album_id INTEGER,
+    lidarr_artist_name VARCHAR, first_seen DATETIME, last_seen DATETIME
+);
+CREATE INDEX ix_discovery_offers_recording_mbid ON discovery_offers (recording_mbid);
+CREATE INDEX ix_discovery_offers_artist_name ON discovery_offers (artist_name);
+CREATE INDEX ix_discovery_offers_status ON discovery_offers (status);
 INSERT INTO connection_config (id, url, username, password)
     VALUES (1, 'http://nav:4533', 'sze', 'secret');
 INSERT INTO listenbrainz_config (id, user_token, username)
     VALUES (1, 'lb-token', 'sze_lb');
 INSERT INTO lb_recommendation_cache (id, mbids)
     VALUES (1, '[{"recording_mbid": "stale-mbid", "score": 9.9}]');
+INSERT INTO discovery_offers
+    (recording_mbid, artist_name, track_title, release_name, source, score,
+     evidence, bucket, status, lidarr_album_id)
+    VALUES ('legacy-mbid', 'Legacy Artist', 'Legacy Track', 'Legacy Album',
+            'labs', 42.5, '[{"seed_artist": "Seed", "seed_title": "Song"}]',
+            'new_artist', 'dismissed', NULL);
 INSERT INTO tracks (id, title, artist_name, play_count, rating, starred)
     VALUES ('t1', 'Played Song', 'Artist A', 17, 4, 1);
 INSERT INTO tracks (id, title, artist_name, play_count, rating, starred)
@@ -201,3 +221,108 @@ def test_similar_cache_stays_global_after_upgrade(legacy_db):
     db_module.init_db()
 
     assert "user_id" not in _columns(engine, "lb_similar_cache")
+
+
+def test_discovery_offers_rebuilt_per_user_keeping_dismissals(legacy_db):
+    """The old unique(recording_mbid) is replaced by unique(user_id, recording).
+
+    SQLite cannot drop a constraint in place, so init_db() rebuilds the table.
+    The rows must survive the rebuild: `status` is the dismiss/save memory, and
+    losing it re-offers every album the user already rejected.
+    """
+    path, engine = legacy_db
+    db_module.init_db()
+
+    cols = _columns(engine, "discovery_offers")
+    assert "user_id" in cols
+
+    # The old table must not be left behind.
+    assert "discovery_offers_old" not in sa.inspect(engine).get_table_names()
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        owner = db.query(db_module.User).filter_by(is_owner=True).one()
+        offers = db.query(db_module.DiscoveryOffer).all()
+
+        assert len(offers) == 1
+        offer = offers[0]
+        assert offer.user_id == owner.id
+        assert offer.status == "dismissed"          # dedupe memory preserved
+        assert offer.recording_mbid == "legacy-mbid"
+        assert offer.artist_name == "Legacy Artist"
+        assert offer.release_name == "Legacy Album"
+        assert offer.score == 42.5
+        assert offer.bucket == "new_artist"
+
+        # The same recording is now offerable to a second user.
+        db.add(db_module.User(
+            username="guest", navidrome_url="http://nav:4533",
+            navidrome_password="secret",
+        ))
+        db.flush()
+        guest = db.query(db_module.User).filter_by(username="guest").one()
+        db.add(db_module.DiscoveryOffer(
+            user_id=guest.id, recording_mbid="legacy-mbid",
+            artist_name="Legacy Artist", source="labs", bucket="new_artist",
+            status="offered",
+        ))
+        db.commit()
+
+        assert db.query(db_module.DiscoveryOffer).count() == 2
+
+
+def test_discovery_offers_rebuild_is_a_no_op_on_restart(legacy_db):
+    """A second startup must not rebuild again, nor duplicate the rows."""
+    path, engine = legacy_db
+    db_module.init_db()
+    db_module.init_db()
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        offers = db.query(db_module.DiscoveryOffer).all()
+        assert len(offers) == 1
+        assert offers[0].status == "dismissed"
+
+    assert "user_id" in _columns(engine, "discovery_offers")
+    assert "discovery_offers_old" not in sa.inspect(engine).get_table_names()
+
+
+def test_discovery_offers_rebuild_attributes_to_the_only_user(tmp_path, monkeypatch):
+    """Users created by plain login carry is_owner=False.
+
+    Such an install has exactly one listener, so the legacy offers are
+    unambiguously theirs and the rebuild must still happen — leaving the old
+    table would break every discovery query.
+    """
+    path = tmp_path / "single_user.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(LEGACY_SCHEMA)
+    conn.execute("DELETE FROM connection_config")  # no adoption => no owner flag
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR NOT NULL,
+            display_name VARCHAR, navidrome_url VARCHAR NOT NULL,
+            navidrome_password VARCHAR NOT NULL, is_owner BOOLEAN,
+            created_at DATETIME, last_login DATETIME
+        );
+        INSERT INTO users (username, navidrome_url, navidrome_password, is_owner)
+            VALUES ('sze', 'http://nav:4533', 'secret', 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    engine = create_engine(f"sqlite:///{path}",
+                           connect_args={"check_same_thread": False})
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal",
+                        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    try:
+        db_module.init_db()
+
+        assert "user_id" in _columns(engine, "discovery_offers")
+        with engine.connect() as c:
+            rows = c.execute(sa.text(
+                "SELECT user_id, status FROM discovery_offers")).fetchall()
+        assert rows == [(1, "dismissed")]
+    finally:
+        engine.dispose()

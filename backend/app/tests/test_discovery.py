@@ -3,12 +3,22 @@ import json
 from datetime import datetime
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from app.models.database import Base, DiscoveryOffer, DiscoveryState, Track
+from app.models.database import (
+    Base,
+    DiscoveryOffer,
+    DiscoveryState,
+    Track,
+    TrackAnnotation,
+    User,
+)
 from app.services import discovery
 from app.services.sync import build_search_key
+
+USER = 1
+OTHER_USER = 2
 
 
 @pytest.fixture
@@ -16,21 +26,35 @@ def db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine)()
+    session.add_all([
+        User(id=USER, username="sze", navidrome_url="http://nav:4533",
+             navidrome_password="secret", is_owner=True),
+        User(id=OTHER_USER, username="guest", navidrome_url="http://nav:4533",
+             navidrome_password="secret"),
+    ])
+    session.commit()
     try:
         yield session
     finally:
         session.close()
 
 
-def make_track(track_id, artist, title, mbid=None, play_count=1):
+def make_track(track_id, artist, title, mbid=None):
     return Track(
         id=track_id,
         title=title,
         artist_name=artist,
         recording_mbid=mbid,
-        play_count=play_count,
         search_key=build_search_key(artist, title),
     )
+
+
+def played(db, track_id, play_count=1, user_id=USER):
+    """Record one user's plays for a track. Play counts are personal."""
+    ann = TrackAnnotation(
+        user_id=user_id, track_id=track_id, play_count=play_count)
+    db.add(ann)
+    return ann
 
 
 def cand(mbid, artist, title, release=None, score=10.0, seed=("Seed", "Song")):
@@ -72,26 +96,50 @@ class TestLibraryIndex:
 class TestSelectSeeds:
     def test_one_seed_per_artist_by_play_count(self, db):
         db.add_all([
-            make_track("s1", "EXO", "A", mbid="m1", play_count=100),
-            make_track("s2", "EXO", "B", mbid="m2", play_count=90),
-            make_track("s3", "Muse", "C", mbid="m3", play_count=50),
+            make_track("s1", "EXO", "A", mbid="m1"),
+            make_track("s2", "EXO", "B", mbid="m2"),
+            make_track("s3", "Muse", "C", mbid="m3"),
         ])
+        played(db, "s1", 100)
+        played(db, "s2", 90)
+        played(db, "s3", 50)
         db.commit()
-        seeds = discovery.select_seeds(db, limit=5)
+        seeds = discovery.select_seeds(db, USER, limit=5)
         assert [s.id for s in seeds] == ["s1", "s3"]
 
     def test_requires_mbid_and_play_count(self, db):
         db.add_all([
-            make_track("s1", "NoMbid", "A", mbid=None, play_count=10),
-            make_track("s2", "NeverPlayed", "B", mbid="m2", play_count=0),
-            make_track("s3", "Good", "C", mbid="m3", play_count=1),
+            make_track("s1", "NoMbid", "A", mbid=None),
+            make_track("s2", "NeverPlayed", "B", mbid="m2"),
+            make_track("s3", "ZeroPlays", "C", mbid="m3"),
+            make_track("s4", "Good", "D", mbid="m4"),
         ])
+        played(db, "s1", 10)   # played, but untagged
+        played(db, "s3", 0)    # annotated, never played
+        played(db, "s4", 1)
         db.commit()
-        seeds = discovery.select_seeds(db, limit=5)
-        assert [s.id for s in seeds] == ["s3"]
+        seeds = discovery.select_seeds(db, USER, limit=5)
+        assert [s.id for s in seeds] == ["s4"]
 
     def test_empty_library(self, db):
-        assert discovery.select_seeds(db, limit=5) == []
+        assert discovery.select_seeds(db, USER, limit=5) == []
+
+    def test_seeds_are_per_user(self, db):
+        """A household favourite this user never played is not their seed."""
+        db.add(make_track("s1", "Shared Artist", "Household Hit", mbid="m1"))
+        played(db, "s1", 10, user_id=USER)
+        played(db, "s1", 0, user_id=OTHER_USER)
+        db.commit()
+
+        assert [s.id for s in discovery.select_seeds(db, USER, limit=5)] == ["s1"]
+        assert discovery.select_seeds(db, OTHER_USER, limit=5) == []
+
+    def test_legacy_track_play_count_is_not_a_seed_source(self, db):
+        """tracks.play_count is a dead household column; seeds come from annotations."""
+        db.add(Track(id="s1", title="T", artist_name="A", recording_mbid="m1",
+                     play_count=300, search_key="a|t"))
+        db.commit()
+        assert discovery.select_seeds(db, USER, limit=5) == []
 
 
 class TestDedupeCandidates:
@@ -200,38 +248,109 @@ class TestBuildFeed:
 
 class TestUpsertOffers:
     def test_inserts_then_does_not_duplicate(self, db):
-        added = discovery.upsert_offers(db, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+        added = discovery.upsert_offers(
+            db, USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
         assert added == 1
-        added = discovery.upsert_offers(db, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+        added = discovery.upsert_offers(
+            db, USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
         assert added == 0
         assert db.query(DiscoveryOffer).count() == 1
 
     def test_dismissed_offer_never_resurrects(self, db):
-        discovery.upsert_offers(db, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+        discovery.upsert_offers(db, USER, [cand("m1", "A", "T")],
+                                discovery.NEW_ARTIST)
         offer = db.query(DiscoveryOffer).first()
         offer.status = discovery.STATUS_DISMISSED
         db.commit()
 
-        discovery.upsert_offers(db, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+        discovery.upsert_offers(db, USER, [cand("m1", "A", "T")],
+                                discovery.NEW_ARTIST)
 
         refreshed = db.query(DiscoveryOffer).first()
         assert refreshed.status == discovery.STATUS_DISMISSED
-        assert discovery.offered_feed(db) == []
+        assert discovery.offered_feed(db, USER) == []
+
+    def test_same_recording_can_be_offered_to_two_users(self, db):
+        """The old schema had recording_mbid UNIQUE, which made this impossible."""
+        added = discovery.upsert_offers(
+            db, USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+        added += discovery.upsert_offers(
+            db, OTHER_USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+
+        assert added == 2
+        rows = db.query(DiscoveryOffer).filter_by(recording_mbid="m1").all()
+        assert {r.user_id for r in rows} == {USER, OTHER_USER}
+
+    def test_dismissed_offer_does_not_leak_to_other_users(self, db):
+        """One person's dismissal is their opinion, not a household decision."""
+        discovery.upsert_offers(db, USER, [cand("m1", "A", "T")],
+                                discovery.NEW_ARTIST)
+        mine = db.query(DiscoveryOffer).filter_by(user_id=USER).one()
+        mine.status = discovery.STATUS_DISMISSED
+        db.commit()
+
+        added = discovery.upsert_offers(db, OTHER_USER, [cand("m1", "A", "T")],
+                                        discovery.NEW_ARTIST)
+
+        assert added == 1
+        assert discovery.offered_feed(db, USER) == []
+        assert [g["artist_name"] for g in discovery.offered_feed(db, OTHER_USER)] == ["A"]
+        # And the dismisser's row is still dismissed, not overwritten.
+        assert db.query(DiscoveryOffer).filter_by(user_id=USER).one().status == (
+            discovery.STATUS_DISMISSED)
 
     def test_merges_evidence_across_runs(self, db):
         discovery.upsert_offers(
-            db, [cand("m1", "A", "T", seed=("S1", "x"))], discovery.NEW_ARTIST)
+            db, USER, [cand("m1", "A", "T", seed=("S1", "x"))], discovery.NEW_ARTIST)
         discovery.upsert_offers(
-            db, [cand("m1", "A", "T", seed=("S2", "y"))], discovery.NEW_ARTIST)
+            db, USER, [cand("m1", "A", "T", seed=("S2", "y"))], discovery.NEW_ARTIST)
 
         offer = db.query(DiscoveryOffer).first()
         evidence = json.loads(offer.evidence)
         assert len(evidence) == 2
 
     def test_bumps_score_to_max(self, db):
-        discovery.upsert_offers(db, [cand("m1", "A", "T", score=5)], discovery.NEW_ARTIST)
-        discovery.upsert_offers(db, [cand("m1", "A", "T", score=99)], discovery.NEW_ARTIST)
+        discovery.upsert_offers(
+            db, USER, [cand("m1", "A", "T", score=5)], discovery.NEW_ARTIST)
+        discovery.upsert_offers(
+            db, USER, [cand("m1", "A", "T", score=99)], discovery.NEW_ARTIST)
         assert db.query(DiscoveryOffer).first().score == 99
+
+    def test_deleting_a_user_removes_only_their_offers(self):
+        """user_id is a NOT NULL FK with ON DELETE CASCADE, not a loose integer."""
+        engine = create_engine(
+            "sqlite:///:memory:", connect_args={"check_same_thread": False})
+
+        # SQLite only honours ON DELETE CASCADE with this pragma per connection.
+        @event.listens_for(engine, "connect")
+        def _fk_on(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        Base.metadata.create_all(engine)
+        session = sessionmaker(bind=engine)()
+        try:
+            session.add_all([
+                User(id=USER, username="sze", navidrome_url="http://nav:4533",
+                     navidrome_password="secret", is_owner=True),
+                User(id=OTHER_USER, username="guest",
+                     navidrome_url="http://nav:4533", navidrome_password="secret"),
+            ])
+            session.commit()
+            discovery.upsert_offers(
+                session, USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+            discovery.upsert_offers(
+                session, OTHER_USER, [cand("m1", "A", "T")], discovery.NEW_ARTIST)
+
+            session.query(User).filter_by(id=USER).delete()
+            session.commit()
+
+            assert session.query(DiscoveryOffer).filter_by(user_id=USER).count() == 0
+            assert session.query(DiscoveryOffer).filter_by(
+                user_id=OTHER_USER).count() == 1
+        finally:
+            session.close()
 
 
 class FakeClient:
@@ -259,10 +378,8 @@ def labs_row(mbid, artist, title, release="Rel", score=50):
 
 class TestRefreshFeed:
     async def test_happy_path(self, db):
-        db.add_all([
-            make_track("s1", "The White Stripes", "Fell in Love", mbid="seed-1",
-                       play_count=3),
-        ])
+        db.add(make_track("s1", "The White Stripes", "Fell in Love", mbid="seed-1"))
+        played(db, "s1", 3)
         db.commit()
         client = FakeClient({"seed-1": [
             labs_row("r1", "The Strokes", "Reptilia"),
@@ -271,11 +388,11 @@ class TestRefreshFeed:
             labs_row("seed-1", "The White Stripes", "Fell in Love"),
         ]})
 
-        summary = await discovery.refresh_feed(db, client)
+        summary = await discovery.refresh_feed(db, USER, client)
 
         assert summary["status"] == "ok"
         assert summary["offers_added"] == 2
-        feed = discovery.offered_feed(db)
+        feed = discovery.offered_feed(db, USER)
         assert {g["artist_name"] for g in feed} == {"The Strokes", "Pixies"}
         state = db.query(DiscoveryState).first()
         assert state.last_status == "ok"
@@ -283,15 +400,17 @@ class TestRefreshFeed:
     async def test_known_artist_without_mbid_is_gap_fill_not_owned(self, db):
         """An unknown MBID on an artist we own is a gap-fill, not 'owned'."""
         db.add_all([
-            make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1", play_count=2),
-            make_track("s2", "The White Stripes", "Other", mbid="ws-1", play_count=1),
+            make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1"),
+            make_track("s2", "The White Stripes", "Other", mbid="ws-1"),
         ])
+        played(db, "s1", 2)
+        played(db, "s2", 1)
         db.commit()
         client = FakeClient({"seed-1": [
             labs_row("unknown-mbid", "The White Stripes", "Seven Nation Army"),
         ]})
 
-        summary = await discovery.refresh_feed(db, client)
+        summary = await discovery.refresh_feed(db, USER, client)
 
         assert summary["offers_added"] == 1
         offer = db.query(DiscoveryOffer).first()
@@ -299,31 +418,34 @@ class TestRefreshFeed:
 
     async def test_known_artist_goes_to_gap_fill_bucket(self, db):
         db.add_all([
-            make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1", play_count=2),
-            make_track("s2", "Bloc Party", "Banquet", mbid="other", play_count=1),
+            make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1"),
+            make_track("s2", "Bloc Party", "Banquet", mbid="other"),
         ])
+        played(db, "s1", 2)
+        played(db, "s2", 1)
         db.commit()
         client = FakeClient({"seed-1": [labs_row("r1", "Bloc Party", "Helicopter")]})
 
-        await discovery.refresh_feed(db, client)
+        await discovery.refresh_feed(db, USER, client)
 
         offer = db.query(DiscoveryOffer).first()
         assert offer.bucket == discovery.ARTIST_KNOWN
 
     async def test_uses_cache_and_makes_no_second_call(self, db):
-        db.add(make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1", play_count=1))
+        db.add(make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1"))
+        played(db, "s1", 1)
         db.commit()
         client = FakeClient({"seed-1": [labs_row("r1", "New", "T")]})
 
-        first = await discovery.refresh_feed(db, client)
+        first = await discovery.refresh_feed(db, USER, client)
         assert first["calls_made"] == 1
 
-        second = await discovery.refresh_feed(db, client)
+        second = await discovery.refresh_feed(db, USER, client)
         assert second["calls_made"] == 0  # 7d cache hit
 
     async def test_no_seeds_records_error_state(self, db):
         client = FakeClient({})
-        summary = await discovery.refresh_feed(db, client)
+        summary = await discovery.refresh_feed(db, USER, client)
         assert summary["status"] == "error"
         state = db.query(DiscoveryState).first()
         assert state.last_status == "error"
@@ -331,9 +453,11 @@ class TestRefreshFeed:
 
     async def test_one_bad_seed_does_not_abort(self, db):
         db.add_all([
-            make_track("s1", "A", "a", mbid="seed-1", play_count=2),
-            make_track("s2", "B", "b", mbid="seed-2", play_count=1),
+            make_track("s1", "A", "a", mbid="seed-1"),
+            make_track("s2", "B", "b", mbid="seed-2"),
         ])
+        played(db, "s1", 2)
+        played(db, "s2", 1)
         db.commit()
 
         class Exploding:
@@ -345,9 +469,28 @@ class TestRefreshFeed:
                     raise RuntimeError("boom")
                 return [labs_row("r9", "Good Artist", "Good Track")]
 
-        summary = await discovery.refresh_feed(db, Exploding())
+        summary = await discovery.refresh_feed(db, USER, Exploding())
         assert summary["status"] == "ok"
         assert summary["offers_added"] == 1
+
+    async def test_refresh_only_persists_offers_for_the_calling_user(self, db):
+        """One user's run must not populate, or fail because of, another's feed."""
+        db.add(make_track("s1", "Seed Artist", "Seed Song", mbid="seed-1"))
+        played(db, "s1", 3, user_id=USER)
+        played(db, "s1", 0, user_id=OTHER_USER)
+        db.commit()
+        client = FakeClient({"seed-1": [labs_row("r1", "The Strokes", "Reptilia")]})
+
+        first = await discovery.refresh_feed(db, USER, client)
+        assert first["status"] == "ok"
+
+        # The second user never played anything, so their run has no seeds —
+        # the household's plays are not theirs to be seeded from.
+        second = await discovery.refresh_feed(db, OTHER_USER, client)
+        assert second["status"] == "error"
+
+        assert db.query(DiscoveryOffer).filter_by(user_id=USER).count() == 1
+        assert db.query(DiscoveryOffer).filter_by(user_id=OTHER_USER).count() == 0
 
 
 class TestGatherEarlyStop:
@@ -355,7 +498,7 @@ class TestGatherEarlyStop:
 
     async def test_counts_live_seeds_and_skips_dead(self, db):
         seeds = [
-            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}", play_count=10 - i)
+            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}")
             for i in range(4)
         ]
         db.add_all(seeds)
@@ -368,7 +511,8 @@ class TestGatherEarlyStop:
             "seed-3": [],
         })
 
-        candidates, calls, live = await discovery.gather_labs_candidates(db, client, seeds)
+        candidates, calls, live = await discovery.gather_labs_candidates(
+            db, USER, client, seeds)
 
         assert calls == 4          # all four were uncached, so all were fetched
         assert live == 2           # only two contributed neighbours
@@ -377,7 +521,7 @@ class TestGatherEarlyStop:
     async def test_stops_once_target_met_with_enough_live_seeds(self, db):
         # 20 seeds, each contributing 5 candidates => 50 candidates at 10 live.
         seeds = [
-            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}", play_count=20 - i)
+            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}")
             for i in range(20)
         ]
         db.add_all(seeds)
@@ -390,7 +534,7 @@ class TestGatherEarlyStop:
         client = FakeClient(mapping)
 
         candidates, calls, live = await discovery.gather_labs_candidates(
-            db, client, seeds, target_candidates=50, min_live_seeds=6,
+            db, USER, client, seeds, target_candidates=50, min_live_seeds=6,
         )
 
         assert len(candidates) >= 50
@@ -400,7 +544,7 @@ class TestGatherEarlyStop:
 
     async def test_respects_max_calls_cap(self, db):
         seeds = [
-            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}", play_count=5)
+            make_track(f"s{i}", f"Artist {i}", f"Song {i}", mbid=f"seed-{i}")
             for i in range(10)
         ]
         db.add_all(seeds)
@@ -408,6 +552,6 @@ class TestGatherEarlyStop:
         client = FakeClient({})
 
         _, calls, _ = await discovery.gather_labs_candidates(
-            db, client, seeds, max_calls=3,
+            db, USER, client, seeds, max_calls=3,
         )
         assert calls == 3

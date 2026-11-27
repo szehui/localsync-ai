@@ -298,7 +298,7 @@ class LbSimilarCache(Base):
 
 
 class DiscoveryOffer(Base):
-    """One candidate recording offered to the user in the discovery feed.
+    """One candidate recording offered to a user in the discovery feed.
 
     Novelty triage bins each candidate against the local library:
       * already owned            -> never stored
@@ -308,10 +308,27 @@ class DiscoveryOffer(Base):
     `status` is the dedupe memory: `offered` shows in the feed, `saved` means the
     album was pushed to Lidarr, `dismissed` never resurfaces. Without this the
     same ~50 candidates would be re-offered on every run.
+
+    Offers are per-user, not household-global. The dedupe memory is one
+    person's opinion ("I don't want this album"), so the uniqueness that makes
+    it work is (user_id, recording_mbid): the same recording can be offered to
+    several users, and one user's dismissal must not hide it from anyone else.
+    Deleting a user takes their offers with them, since a feed nobody owns is
+    unreachable.
     """
     __tablename__ = "discovery_offers"
+    __table_args__ = (
+        UniqueConstraint("user_id", "recording_mbid",
+                         name="uq_discovery_offer_user_mbid"),
+    )
     id = Column(Integer, primary_key=True, autoincrement=True)
-    recording_mbid = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    recording_mbid = Column(String, nullable=False, index=True)
     artist_name = Column(String, nullable=True, index=True)
     track_title = Column(String, nullable=True)
     release_name = Column(String, nullable=True)
@@ -446,6 +463,99 @@ def init_db():
     # playlists. Safe to re-run on every startup.
     with SessionLocal() as db:
         _migrate_multi_user(db)
+
+    # Per-user discovery offers. The old table carried `recording_mbid UNIQUE`,
+    # which made it impossible for a second user to ever be offered a recording
+    # the first user had already seen. SQLite cannot drop a UNIQUE constraint in
+    # place, so the table is rebuilt and its rows copied across — deliberately
+    # AFTER the multi-user adoption above, because legacy rows can only be
+    # attributed once an owner user exists. Guarded so a fresh DB (already built
+    # per-user by create_all) and a second startup are both no-ops.
+    if inspector.has_table("discovery_offers"):
+        offer_columns = [
+            c["name"] for c in inspector.get_columns("discovery_offers")
+        ]
+        if "user_id" not in offer_columns:
+            _rebuild_discovery_offers(offer_columns)
+
+
+def _rebuild_discovery_offers(legacy_columns: list[str]) -> None:
+    """Recreate discovery_offers with a per-user unique key, keeping its rows.
+
+    SQLite has no ALTER TABLE ... DROP CONSTRAINT, so the only way to replace
+    `recording_mbid UNIQUE` with `(user_id, recording_mbid)` is to rebuild. The
+    rows are NOT disposable: `status` is the user's save/dismiss memory, and
+    dropping it would re-offer every album they already rejected.
+
+    Legacy rows predate multi-user support, so they all belong to the owner
+    user — there was only ever one listener. If the owner flag is missing but
+    exactly one user row exists (users created by plain login before the
+    adoption step existed also carry is_owner=False), that user is still the
+    sole listener, so the rows are theirs. With several candidate users there
+    is nobody to attribute to, and guessing would hand one tenant another
+    person's dismissal history, so the rebuild is skipped and the old table
+    left intact.
+
+    Column names come from the model rather than a hardcoded list, but only ones
+    that actually exist in the old table are copied; `user_id` is the exception
+    and is supplied as the owner id.
+    """
+    import sqlalchemy as sa
+
+    table = Base.metadata.tables["discovery_offers"]
+    existing = set(legacy_columns)
+    copy_columns = [
+        c.name for c in table.columns if c.name != "user_id" and c.name in existing
+    ]
+
+    with SessionLocal() as db:
+        owner = db.query(User).filter_by(is_owner=True).first()
+        if owner is None:
+            users = db.query(User).limit(2).all()
+            if len(users) == 1:
+                owner = users[0]
+        owner_id = owner.id if owner is not None else None
+
+    if owner_id is None:
+        logger.warning(
+            "Discovery offers: no owner user exists to attribute legacy rows to "
+            "— leaving discovery_offers on the pre-multi-user schema. The "
+            "discovery feed will error until the table is rebuilt; set "
+            "is_owner=True on the account that owns the old dismissed/saved "
+            "offers and restart."
+        )
+        return
+
+    copy_sql = ", ".join(copy_columns)
+    insert_sql = (
+        f"INSERT INTO discovery_offers (user_id, {copy_sql}) "
+        f"SELECT :owner_id, {copy_sql} FROM discovery_offers_old"
+    )
+
+    with engine.connect() as conn:
+        conn.execute(
+            sa.text("ALTER TABLE discovery_offers RENAME TO discovery_offers_old")
+        )
+        # Renaming a table keeps its explicitly named indexes, and index names
+        # are global in SQLite, so creating the new table would collide with
+        # them. (sqlite_autoindex_* entries belong to the renamed table and are
+        # left alone — they cannot be dropped, and do not collide.)
+        stale_indexes = conn.execute(sa.text(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='discovery_offers_old' AND name NOT LIKE 'sqlite_%'"
+        )).scalars().all()
+        for name in stale_indexes:
+            conn.execute(sa.text(f'DROP INDEX IF EXISTS "{name}"'))
+
+        table.create(bind=conn)
+        result = conn.execute(sa.text(insert_sql), {"owner_id": owner_id})
+        conn.execute(sa.text("DROP TABLE discovery_offers_old"))
+        conn.commit()
+
+    logger.info(
+        "Discovery offers: rebuilt per-user, %s legacy rows attributed to owner %s",
+        result.rowcount, owner_id,
+    )
 
 
 def _backfill_search_keys():
