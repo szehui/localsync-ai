@@ -1,5 +1,93 @@
 # LocalSync AI — Development Log
 
+## 2026-11-27 — Multi-user support
+
+Household members now get their own playlists, from their own listening history.
+Before this, "logging in as someone else" silently *replaced* the only tenant.
+
+### What was actually broken
+The auth layer looked multi-user (a JWT per login) but the tenancy was a lie:
+`ConnectionConfig` was a singleton row (`id=1`), login overwrote it, and
+`get_current_user`'s identity was discarded at every call site. Consequences:
+
+- A second person logging in and syncing **overwrote everyone's play counts**,
+  because `Track.play_count` was a single column while Navidrome's `playCount`
+  is per Subsonic account.
+- `POST /logout` **deleted the shared credentials row**, so one person logging
+  out stopped everyone's scheduled playlists.
+
+### Decisions
+- **Annotations split out** into `track_annotations(user_id, track_id)` with a
+  composite PK, mirroring Navidrome's own `annotation(user_id, item_id)`. Library
+  metadata (title/artist/album/genre/MBID) stays global — it is user-independent.
+- **Legacy data adopted, not discarded.** Whoever was in `ConnectionConfig`
+  becomes `users.id=1` with `is_owner=True` and inherits the existing play
+  counts. All-zero tracks are skipped (indistinguishable from "no row", and one
+  insert per track otherwise).
+- **`lb_similar_cache` stays global; only CF recommendations go per-user.** Labs
+  similar-recordings describe a *recording's* neighbours — a property of the
+  recording, not the listener. CF recommendations are computed from one
+  listener's history, so sharing those would recommend one person's taste to
+  another. This corrects the original plan, which said to key both.
+- **Logout no longer deletes credentials.** It drops only that user's live
+  client; an owner-only `DELETE /api/auth/users/{id}` is how an account is
+  actually removed. Scheduled generation survives a logout.
+- **Playlist names are not prefixed.** Each user's client creates the playlist in
+  their own Navidrome account, so two users can both own "Fresh Discoveries
+  2026-11-27". Local rows are disambiguated by `owner_id`.
+- **Triggers return 404 (not 403) for another user's row**, so the API does not
+  reveal that someone else's trigger exists.
+
+### Upgrade-path bugs found and fixed during the work
+1. `Base.metadata.create_all()` never alters existing tables. On a deployed
+   database `owner_id` was missing from `smart_triggers` / `generated_playlists`,
+   so `init_db()` died with `no such column: owner_id` and the container
+   crash-looped before serving a request. Added the `ALTER TABLE` step *and* the
+   indexes (which `ALTER TABLE` cannot carry). Pinned by
+   `test_migration_upgrade_path.py`, which builds the pre-multi-user schema by
+   hand — a fresh-schema test can never see this class of bug.
+2. `library.py` still returned and sorted by `tracks.play_count` / `.rating` /
+   `.starred`. With sync no longer writing them, the UI would have shown zeros
+   for every track and "most played" would have been arbitrary order. Now joins
+   the caller's annotations.
+3. `SyncService.__init__` initially gained `user_id: int = 1`. Removed the
+   default: a silent fallback would attribute one person's history to another.
+
+### Migration notes
+- `lb_recommendation_cache` is **dropped and recreated** per-user rather than
+  migrated — the old row has no defensible owner, and the 24h TTL means the cost
+  is one extra API call.
+- `discovery_offers` is **rebuilt** (rename → create → copy → drop) because
+  SQLite cannot drop the old `recording_mbid UNIQUE` constraint in place. The
+  dedupe memory (`saved` / `dismissed` status) is copied across, so dismissed
+  albums are not re-offered.
+- Legacy columns (`tracks.play_count` etc.) and the legacy singleton tables are
+  **deliberately left in place** — they are the rollback path. Cleanup is a
+  separate task, gated on production running a week.
+
+### Open item — not fixed
+**Navidrome passwords are stored in plaintext** in SQLite. The scheduler needs
+them to run while the user is offline, so this is per-user plaintext now. Needs
+its own ticket (OS keyring, env-supplied KMS secret, or `cryptography` with a key
+from the environment). Do not let this scroll away.
+
+### Verification
+- 429 → 548 tests, no regressions.
+- Frontend builds (`tsc && vite build`).
+- Upgrade path covered by 15+ tests that run the real `init_db()` against a
+  hand-built legacy schema, including idempotency on repeated startup.
+
+### Commits
+`06978a3` models · `56d307e` per-user credentials · `965e884` owner_id columns ·
+`410e624` adoption migration · `d199e16` uid in JWT · `65827a1` upgrade-path fix ·
+`865eca2` users service · `4544d49` per-user annotations in sync ·
+`b53adb5` auth rewiring · `8994c88` required user_id · `4d9f09e` per-user mixes ·
+`b2ee6bc` per-user CF cache · `bf5f3da` per-owner scheduler ·
+`c0bdc75` owned triggers · `53cca67` per-user discovery ·
+`ce54b1e` library annotations · `5ea1ed9` user administration
+
+---
+
 ## 2026-06-04 — Project Kickoff
 
 ### Decisions Made
