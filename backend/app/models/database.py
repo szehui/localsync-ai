@@ -388,6 +388,21 @@ def init_db():
             "tracks.search_key backfilled; tracks.recording_mbid needs a full library resync"
         )
 
+    # Multi-user ownership: `create_all()` does NOT alter existing tables, so an
+    # upgraded database still lacks these columns even though the models declare
+    # them. Without this the backfill below dies with
+    # "no such column: owner_id" and the app never finishes starting.
+    with engine.connect() as conn:
+        for table in ("smart_triggers", "generated_playlists"):
+            cols = [c["name"] for c in inspector.get_columns(table)]
+            if "owner_id" not in cols:
+                conn.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN owner_id INTEGER"))
+            # ALTER TABLE cannot carry the model's index=True, so create it here.
+            conn.execute(sa.text(
+                f"CREATE INDEX IF NOT EXISTS ix_{table}_owner_id ON {table} (owner_id)"
+            ))
+        conn.commit()
+
     # One-time multi-user migration: adopt legacy singleton config into
     # per-user rows, then backfill owner_id on pre-multi-user triggers and
     # playlists. Safe to re-run on every startup.
