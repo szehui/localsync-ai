@@ -258,6 +258,21 @@ class TestSelectMixDispatch:
         out = select_mix(db, 1, "on_repeat", rng=random.Random(0))
         assert len(out) <= MIX_SPECS["on_repeat"]["limit"]
 
+    def test_explicit_limit_is_honoured(self, db):
+        """A caller-supplied limit must not collide with the spec's default.
+
+        Regression: `target = int(limit or spec.pop("limit", 50))` short-circuits
+        when `limit` is truthy, so "limit" stayed in `spec` and was passed to the
+        selector twice -> TypeError. Every call site currently omits `limit`, so
+        nothing caught it; the first `?limit=` API parameter would have.
+        """
+        for i in range(60):
+            add_track(db, f"p{i}", f"Artist {i % 5}", plays=20, last_played_days=3)
+        out = select_mix(db, 1, "on_repeat", limit=7, rng=random.Random(0))
+        assert len(out) == 7
+        # And it must still beat the spec default rather than being ignored.
+        assert len(select_mix(db, 1, "on_repeat", limit=3, rng=random.Random(0))) == 3
+
     def test_user_id_is_forwarded(self, db):
         add_track(db, "t1", "A", plays=20, last_played_days=3, user_id=1)
         assert {e["id"] for e in select_mix(db, 1, "on_repeat")} == {"t1"}

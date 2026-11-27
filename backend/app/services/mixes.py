@@ -366,7 +366,11 @@ def select_mix(db: Session, user_id: int, kind: str, limit: int | None = None,
         selector = _SELECTORS[kind]
 
     spec = dict(MIX_SPECS[kind])
-    target = int(limit or spec.pop("limit", 50))
+    # Pop the default unconditionally: `limit or spec.pop(...)` short-circuits
+    # when a caller passes an explicit limit, leaving "limit" in `spec` and
+    # raising TypeError for the duplicate keyword below.
+    spec_limit = spec.pop("limit", 50)
+    target = int(limit or spec_limit)
     spec.pop("label", None)
     spec.pop("description", None)
     spec.update({k: v for k, v in overrides.items() if v is not None})
