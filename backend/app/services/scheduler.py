@@ -1267,12 +1267,20 @@ async def run_library_mix_trigger(trigger_id: int):
         spec = MIX_SPECS.get(kind) or MIX_SPECS[DEFAULT_MIX]
         playlist_name = trigger.playlist_name or spec["label"]
 
+        # Mixes are per user: everything they read (plays, last played) is a
+        # personal annotation, so a trigger with no owner has nobody to build
+        # for. Refuse rather than silently picking someone else's history.
+        owner_id = trigger.owner_id
+        if owner_id is None:
+            logger.error("Trigger %s has no owner — refusing to run", trigger.id)
+            return
+
         # Weekly seed on the undated name: a stable playlist within the week,
         # a different draw next week, and no churn if the job reruns.
         iso_year, iso_week, _ = datetime.utcnow().isocalendar()
         rng = seeded_rng("library_mix", trigger.id, kind, f"{iso_year}-W{iso_week}")
 
-        entries = select_mix(db, kind, rng=rng)
+        entries = select_mix(db, owner_id, kind, rng=rng)
         track_ids = _curate(
             db, [entry["id"] for entry in entries], target=spec.get("limit", 50), rng=rng
         )
