@@ -35,7 +35,8 @@ Read these before starting. Do not guess.
 | `backend/app/services/discovery.py` | Seeds from `Track.play_count` (must become per-user) |
 
 **Test command** (from `backend/`): `./venv/bin/python -m pytest app/tests -q`
-Baseline: **387 passing**. Do not drop below that without explaining why.
+Baseline: **429 passing** (measured, not guessed — the wiki's "387" was stale).
+Do not drop below that without explaining why.
 
 **Style rules already in this repo — follow them:**
 - Migrations are idempotent `ALTER TABLE`/`CREATE TABLE IF NOT EXISTS` blocks inside
