@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.models.database import (
-    ConnectionConfig,
     GeneratedPlaylist,
-    LastfmConfig,
-    ListenbrainzConfig,
+    LastfmUserConfig,
+    ListenbrainzUserConfig,
     SmartTrigger,
+    User,
 )
 import app.services.scheduler as scheduler
 
@@ -41,28 +41,32 @@ def _make_db(trigger, *, lb_configured: bool, lastfm_configured: bool):
         m = MagicMock()
         if model is SmartTrigger:
             m.filter.return_value.first.return_value = trigger
-        elif model is ListenbrainzConfig:
-            m.filter.return_value.first.return_value = (
-                MagicMock(username="szeis4cookie", user_token="tok") if lb_configured else None
-            )
-        elif model is LastfmConfig:
-            m.filter.return_value.first.return_value = (
-                MagicMock(api_key="k", username="u") if lastfm_configured else None
-            )
-        elif model is ConnectionConfig:
-            m.filter.return_value.first.return_value = MagicMock(
-                url="http://nav", username="u", password="p"
-            )
         elif model is GeneratedPlaylist:
             m.filter.return_value.first.return_value = None
             m.filter.return_value.filter.return_value.all.return_value = []
+            m.filter.return_value.filter.return_value.filter.return_value.all.return_value = []
         else:
             m.filter.return_value.first.return_value = None
             m.filter.return_value.filter.return_value.all.return_value = []
         return m
 
+    def fake_get(model, key):
+        """Per-user credential lookups go through db.get(model, user_id)."""
+        if model is ListenbrainzUserConfig:
+            return (
+                MagicMock(username="szeis4cookie", user_token="tok") if lb_configured else None
+            )
+        if model is LastfmUserConfig:
+            return MagicMock(api_key="k", username="u") if lastfm_configured else None
+        if model is User:
+            return MagicMock(
+                id=key, navidrome_url="http://nav", username="u", navidrome_password="p"
+            )
+        return None
+
     db = MagicMock()
     db.query.side_effect = fake_query
+    db.get.side_effect = fake_get
     return db
 
 
@@ -92,7 +96,7 @@ class TestListenBrainzIsPrimary:
         db = _make_db(trigger, lb_configured=True, lastfm_configured=True)
 
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
         monkeypatch.setattr(
             scheduler, "_gather_lb_candidates",
@@ -122,7 +126,7 @@ class TestListenBrainzIsPrimary:
         db = _make_db(trigger, lb_configured=True, lastfm_configured=False)
 
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
         monkeypatch.setattr(
             scheduler, "_gather_lb_candidates",
@@ -150,7 +154,7 @@ class TestListenBrainzIsPrimary:
         db = _make_db(trigger, lb_configured=True, lastfm_configured=False)
 
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
         monkeypatch.setattr(
             scheduler, "_gather_lb_candidates",
@@ -180,7 +184,7 @@ class TestLastfmFallback:
         db = _make_db(trigger, lb_configured=True, lastfm_configured=True)
 
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
         # ListenBrainz configured but empty (e.g. a brand-new account).
         monkeypatch.setattr(scheduler, "_gather_lb_candidates", AsyncMock(return_value=[]))
@@ -208,7 +212,7 @@ class TestLastfmFallback:
         db = _make_db(trigger, lb_configured=False, lastfm_configured=False)
 
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
 
         await scheduler.run_recency_trigger(1)
@@ -222,15 +226,13 @@ class TestGatherCandidates:
     @pytest.mark.asyncio
     async def test_returns_empty_when_not_configured(self):
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = None
+        db.get.return_value = None
         assert await scheduler._gather_lb_candidates(db, MagicMock(), 1) == []
 
     @pytest.mark.asyncio
     async def test_returns_empty_on_client_error(self, monkeypatch):
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = MagicMock(
-            username="u", user_token="t"
-        )
+        db.get.return_value = MagicMock(username="u", user_token="t")
         lb = MagicMock()
         lb.get_recent_listens = AsyncMock(side_effect=RuntimeError("boom"))
         lb.close = AsyncMock()
@@ -242,9 +244,7 @@ class TestGatherCandidates:
     @pytest.mark.asyncio
     async def test_closes_client_even_when_no_listens(self, monkeypatch):
         db = MagicMock()
-        db.query.return_value.filter.return_value.first.return_value = MagicMock(
-            username="u", user_token="t"
-        )
+        db.get.return_value = MagicMock(username="u", user_token="t")
         lb = MagicMock()
         lb.get_recent_listens = AsyncMock(return_value=[])
         lb.close = AsyncMock()

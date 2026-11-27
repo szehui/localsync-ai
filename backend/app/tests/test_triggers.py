@@ -1,10 +1,13 @@
 """Tests for Smart Triggers scheduler service."""
 import json
+import logging
 from datetime import datetime, timedelta
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from app.services.scheduler import (
     init_scheduler,
@@ -16,10 +19,12 @@ from app.services.scheduler import (
     PLAYLIST_RETENTION_DAYS,
     _get_cooldown_track_ids,
     _playlist_date,
+    _publish_playlist,
     _prune_old_dated_playlists,
     _stale_playlist_rows,
 )
-from app.models.database import SmartTrigger, GeneratedPlaylist
+from app.models.database import Base, SmartTrigger, GeneratedPlaylist, User
+from app.services.curation import MIN_PLAYLIST_TRACKS
 
 
 @pytest.fixture
@@ -173,13 +178,16 @@ def _make_playlist(name: str, track_ids: list, updated_at: datetime) -> MagicMoc
 
 
 def _bind_rows(rows):
-    """Build a MagicMock db where .query().filter().filter().all() returns `rows`.
+    """Build a MagicMock db whose .query().filter()...all() returns `rows`.
 
-    The helper applies two filters (updated_at cutoff, name LIKE prefix), so the
-    mock chain must reflect that.
+    The helper chains three filters (updated_at cutoff, name LIKE prefix, owner
+    scope), so bind every depth the test might reach.
     """
     db = MagicMock()
-    db.query.return_value.filter.return_value.filter.return_value.all.return_value = rows
+    chain = db.query.return_value.filter.return_value
+    chain.all.return_value = rows
+    chain.filter.return_value.all.return_value = rows
+    chain.filter.return_value.filter.return_value.all.return_value = rows
     return db
 
 
@@ -238,12 +246,13 @@ class TestCooldownHelper:
         assert result == {"ok"}
 
     def test_filter_uses_name_prefix_and_window(self):
-        """The SQL filter chain must apply BOTH updated_at cutoff AND name LIKE prefix."""
+        """The SQL filter chain must apply updated_at cutoff, name LIKE prefix, owner."""
         db = _bind_rows([])
-        _get_cooldown_track_ids(db, "Fresh Discoveries", days=2)
-        # Two .filter() calls: one for updated_at cutoff, one for name LIKE
+        _get_cooldown_track_ids(db, "Fresh Discoveries", owner_id=1, days=2)
+        # Three .filter() calls: updated_at cutoff, name LIKE, owner scope
         db.query.return_value.filter.assert_called_once()
         db.query.return_value.filter.return_value.filter.assert_called_once()
+        db.query.return_value.filter.return_value.filter.return_value.filter.assert_called_once()
 
     def test_default_window_is_two_days(self):
         """Default days argument is 2 (matches 'next two days' requirement)."""
@@ -304,9 +313,15 @@ class TestPlaylistDateParsing:
 
 
 def _retention_db(rows):
-    """db mock for the single-filter prune query, with delete() recorded."""
+    """db mock for the prune query, with delete() recorded.
+
+    `_stale_playlist_rows` chains two filters (name LIKE prefix, owner scope);
+    bind every depth so the mock works whichever chain the caller builds.
+    """
     db = MagicMock()
-    db.query.return_value.filter.return_value.all.return_value = rows
+    chain = db.query.return_value.filter.return_value
+    chain.all.return_value = rows
+    chain.filter.return_value.all.return_value = rows
     db.delete = MagicMock()
     return db
 
@@ -566,10 +581,7 @@ class TestRecencyTriggerCooldownIntegration:
     async def test_cooldown_set_excluded_from_final_track_ids(self, monkeypatch):
         """If a song was in yesterday's Fresh Discoveries, it must not appear in today's output."""
         from app.services.scheduler import run_recency_trigger
-        from app.models.database import (
-            SmartTrigger, ConnectionConfig, LastfmConfig,
-            GeneratedPlaylist, SessionLocal,
-        )
+        from app.models.database import SmartTrigger, GeneratedPlaylist
 
         # Build a trigger row
         trigger = MagicMock(spec=SmartTrigger)
@@ -579,6 +591,7 @@ class TestRecencyTriggerCooldownIntegration:
         trigger.enabled = True
         trigger.playlist_name = None  # use default
         trigger.last_run = None
+        trigger.owner_id = 1
 
         # Pre-existing playlist: yesterday's selection includes "blocked1", "blocked2"
         existing = MagicMock(spec=GeneratedPlaylist)
@@ -598,24 +611,20 @@ class TestRecencyTriggerCooldownIntegration:
             m = MagicMock()
             if model is SmartTrigger:
                 m.filter.return_value.first.return_value = trigger
-            elif model is LastfmConfig:
-                m.filter.return_value.first.return_value = None  # no lastfm configured
-            elif model is ConnectionConfig:
-                m.filter.return_value.first.return_value = MagicMock(
-                    url="http://nav", username="u", password="p"
-                )
             elif model is GeneratedPlaylist:
                 # The cooldown helper (mocked) and same-name lookup both query this.
                 m.filter.return_value.first.return_value = existing
                 m.filter.return_value.filter.return_value.all.return_value = [existing]
-                # Retention pruning uses a single filter (name LIKE prefix).
-                m.filter.return_value.all.return_value = [existing]
+                # Retention pruning chains two filters (name LIKE, owner).
+                m.filter.return_value.filter.return_value.filter.return_value.all.return_value = [existing]
             else:
                 m.filter.return_value.first.return_value = None
             return m
 
         db_mock = MagicMock()
         db_mock.query.side_effect = fake_query
+        # Per-user credential lookups go through db.get; none configured here.
+        db_mock.get = MagicMock(return_value=None)
         # commit/rollback/add are no-ops on MagicMock
         db_mock.commit = MagicMock()
         db_mock.rollback = MagicMock()
@@ -627,7 +636,7 @@ class TestRecencyTriggerCooldownIntegration:
         # Mock the cooldown helper to return the known blocked set
         monkeypatch.setattr(
             "app.services.scheduler._get_cooldown_track_ids",
-            lambda db, prefix, days=2: {"blocked1", "blocked2"},
+            lambda db, prefix, owner_id=None, days=2: {"blocked1", "blocked2"},
         )
 
         # Mock NavidromeClient
@@ -666,7 +675,9 @@ class TestRecencyTriggerCooldownIntegration:
         fake_client.create_playlist = fake_create_playlist
         fake_client.delete_playlist = AsyncMock()
 
-        monkeypatch.setattr("app.services.scheduler._get_client_from_db", lambda: fake_client)
+        monkeypatch.setattr(
+            "app.services.scheduler.build_client", lambda db, uid: fake_client
+        )
 
         # Run the trigger
         await run_recency_trigger(1)
@@ -678,3 +689,131 @@ class TestRecencyTriggerCooldownIntegration:
         assert "blocked2" not in final, f"blocked2 leaked into output: {final}"
         # And it must have included some fresh tracks
         assert final & {"fresh1", "fresh2", "fresh3", "fresh4"}, f"No fresh tracks: {final}"
+
+
+# ─── Per-owner scoping ──────────────────────────────────────────────────────
+
+@pytest.fixture
+def memory_db():
+    """Real in-memory SQLite so owner_id filtering is actually exercised."""
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def _add_user(db, user_id: int, username: str):
+    db.add(User(
+        id=user_id,
+        username=username,
+        display_name=username,
+        navidrome_url=f"http://navidrome-{user_id}",
+        navidrome_password="pw",
+    ))
+    return user_id
+
+
+def _stub_client(playlist_id: str):
+    client = MagicMock()
+    client.create_playlist = AsyncMock(return_value={"playlist": {"id": playlist_id}})
+    client.delete_playlist = AsyncMock()
+    client.get_playlists = AsyncMock(return_value=[])
+    client.close = AsyncMock()
+    return client
+
+
+class TestOwnerScoping:
+    """Generation and publishing are per owner: nothing a trigger reads or
+    writes may leak across tenants."""
+
+    @pytest.mark.parametrize("kind", sorted(TRIGGER_JOBS))
+    @pytest.mark.asyncio
+    async def test_trigger_without_owner_does_not_run(self, monkeypatch, caplog, kind):
+        """A NULL owner_id is nobody to build for: refuse, publish nothing."""
+        trigger = MagicMock(spec=SmartTrigger)
+        trigger.id = 7
+        trigger.name = "Ownerless"
+        trigger.trigger_type = kind
+        trigger.enabled = True
+        trigger.playlist_name = None
+        trigger.cron_expression = None
+        trigger.threshold = 5
+        trigger.mix_kind = None
+        trigger.last_run = None
+        trigger.owner_id = None
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = trigger
+
+        built = []
+        published = []
+
+        def fake_build_client(db_, uid):
+            built.append(uid)
+            return _stub_client("pid")
+
+        async def fake_publish(*a, **k):
+            published.append((a, k))
+            return True
+
+        monkeypatch.setattr("app.services.scheduler.SessionLocal", lambda: db)
+        monkeypatch.setattr("app.services.scheduler.build_client", fake_build_client)
+        monkeypatch.setattr("app.services.scheduler._publish_playlist", fake_publish)
+        monkeypatch.setattr("app.services.scheduler.select_mix", lambda *a, **k: [])
+
+        with caplog.at_level(logging.ERROR):
+            await TRIGGER_JOBS[kind](7)
+
+        assert built == [], f"{kind} built a client for an ownerless trigger"
+        assert published == [], f"{kind} published a playlist for an ownerless trigger"
+        assert "has no owner" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_publish_playlist_is_scoped_per_owner(self, memory_db):
+        db = memory_db
+        _add_user(db, 1, "one")
+        _add_user(db, 2, "two")
+        db.commit()
+
+        client_one = _stub_client("pid-one")
+        client_two = _stub_client("pid-two")
+        tracks = [f"t{i}" for i in range(MIN_PLAYLIST_TRACKS)]
+
+        # Same playlist name, two owners: each lands in their own account.
+        assert await _publish_playlist(db, client_one, "Daily Mix", tracks, owner_id=1)
+        assert await _publish_playlist(db, client_two, "Daily Mix", tracks, owner_id=2)
+
+        client_one.create_playlist.assert_awaited_once()
+        client_two.create_playlist.assert_awaited_once()
+
+        rows = db.query(GeneratedPlaylist).all()
+        assert len(rows) == 2, "same-named playlists of two owners collapsed into one row"
+        assert {r.owner_id for r in rows} == {1, 2}
+        assert {r.navidrome_playlist_id for r in rows} == {"pid-one", "pid-two"}
+
+        # A second publish for owner 1 replaces only their row.
+        assert await _publish_playlist(db, client_one, "Daily Mix", tracks, owner_id=1)
+        assert db.query(GeneratedPlaylist).filter(
+            GeneratedPlaylist.owner_id == 1
+        ).count() == 1
+        assert db.query(GeneratedPlaylist).count() == 2
+
+    @pytest.mark.asyncio
+    async def test_cooldown_is_per_owner(self, memory_db):
+        """Owner 1's recent playlist must not suppress owner 2's mix."""
+        db = memory_db
+        _add_user(db, 1, "one")
+        _add_user(db, 2, "two")
+        db.commit()
+
+        tracks = [f"t{i}" for i in range(MIN_PLAYLIST_TRACKS)]
+        await _publish_playlist(
+            db, _stub_client("pid-one"), "Fresh Discoveries 2026-11-27", tracks,
+            owner_id=1,
+        )
+
+        assert _get_cooldown_track_ids(db, "Fresh Discoveries", 1, days=2) == set(tracks)
+        assert _get_cooldown_track_ids(db, "Fresh Discoveries", 2, days=2) == set()

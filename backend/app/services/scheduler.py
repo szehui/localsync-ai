@@ -11,7 +11,8 @@ import re
 from datetime import datetime, timedelta
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy.orm import Session
-from app.models.database import SmartTrigger, GeneratedPlaylist, ConnectionConfig, SessionLocal, Track, LastfmConfig, ListenbrainzConfig
+from app.models.database import SmartTrigger, GeneratedPlaylist, SessionLocal, Track
+from app.services.users import build_client, get_listenbrainz_config, get_lastfm_config
 from app.services.navidrome import NavidromeClient
 from app.services.lastfm import LastfmClient
 from app.services.listenbrainz import ListenBrainzClient
@@ -68,19 +69,26 @@ def _job_id(trigger: SmartTrigger) -> str:
 
 # ─── Cooldown / Recency Exclusion ───────────────────────────────────────────
 
-def _get_cooldown_track_ids(db: Session, name_prefix: str, days: int = 2) -> set:
+def _get_cooldown_track_ids(
+    db: Session, name_prefix: str, owner_id: int | None = None, days: int = 2
+) -> set:
     """Return the union of track_ids from GeneratedPlaylist rows whose name
     starts with `name_prefix` and which were updated within the last `days` days.
 
     Used to exclude songs that have already appeared in recent runs of a
     same-named playlist (e.g. the daily 'Fresh Discoveries YYYY-MM-DD' list),
     so the recency trigger doesn't pick the same songs day after day.
+
+    Cooldown history is per owner: my recently-used tracks must not suppress
+    your mix, and your plays must not suppress mine. Two users running a
+    trigger with the same playlist name each have their own exclusion set.
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
     rows = (
         db.query(GeneratedPlaylist)
         .filter(GeneratedPlaylist.updated_at >= cutoff)
         .filter(GeneratedPlaylist.name.like(f"{name_prefix}%"))
+        .filter(GeneratedPlaylist.owner_id == owner_id)
         .all()
     )
     blocked: set = set()
@@ -131,7 +139,9 @@ def _playlist_date(playlist_name: str | None) -> datetime | None:
         return None
 
 
-def _stale_playlist_rows(db: Session, reference_name: str, retention_days: int) -> list:
+def _stale_playlist_rows(
+    db: Session, reference_name: str, retention_days: int, owner_id: int | None = None
+) -> list:
     """Return GeneratedPlaylist rows for the same dated series that are too old.
 
     Age comes from the date in the playlist name, not `updated_at` — the
@@ -139,6 +149,10 @@ def _stale_playlist_rows(db: Session, reference_name: str, retention_days: int) 
     about how old the *list* is. Only names in the same series (sharing the
     reference name's prefix, date suffix stripped) are considered, so custom
     and undated playlists are never touched.
+
+    Scoped to `owner_id`: another user's identically-named series is theirs to
+    prune, not ours, and dropping their rows would strand playlists in their
+    Navidrome account forever.
     """
     reference_date = _playlist_date(reference_name)
     if reference_date is None:
@@ -154,6 +168,7 @@ def _stale_playlist_rows(db: Session, reference_name: str, retention_days: int) 
     rows = (
         db.query(GeneratedPlaylist)
         .filter(GeneratedPlaylist.name.like(f"{prefix}%"))
+        .filter(GeneratedPlaylist.owner_id == owner_id)
         .all()
     )
     stale = []
@@ -182,6 +197,7 @@ async def _prune_old_dated_playlists(
     client: NavidromeClient,
     reference_name: str,
     retention_days: int = PLAYLIST_RETENTION_DAYS,
+    owner_id: int | None = None,
 ) -> int:
     """Delete playlists in the same dated series older than `retention_days`.
 
@@ -197,6 +213,11 @@ async def _prune_old_dated_playlists(
     a run that already produced a playlist, so every failure is logged and
     skipped rather than raised.
 
+    Per-user by construction: both the Navidrome listing and the deletes go
+    through `client`, which belongs to one owner, so the remote side can only
+    ever touch that owner's playlists. The DB side filters `stale_rows` on
+    `owner_id` for the same reason.
+
     Returns the number of Navidrome playlists removed.
     """
     reference_date = _playlist_date(reference_name)
@@ -208,7 +229,7 @@ async def _prune_old_dated_playlists(
         return 0
     cutoff = reference_date - timedelta(days=retention_days)
 
-    stale_rows = _stale_playlist_rows(db, reference_name, retention_days)
+    stale_rows = _stale_playlist_rows(db, reference_name, retention_days, owner_id)
 
     remote: list[dict] | None
     try:
@@ -430,7 +451,13 @@ def _track_meta(db: Session, track_ids) -> dict:
     return meta
 
 
-def _aging_penalty(db: Session, track_ids, reference: datetime, lookback_days: int = 30) -> dict:
+def _aging_penalty(
+    db: Session,
+    track_ids,
+    reference: datetime,
+    lookback_days: int = 30,
+    owner_id: int | None = None,
+) -> dict:
     """Map track id -> score penalty based on how recently it was offered.
 
     There is no "last offered" column; `GeneratedPlaylist.track_ids` already
@@ -438,6 +465,9 @@ def _aging_penalty(db: Session, track_ids, reference: datetime, lookback_days: i
     derived without a schema change. The penalty is linear in age up to a cap,
     which is what stops the same handful of Deep Cuts recurring every week —
     the 2-day cooldown alone is far too short at a weekly cadence.
+
+    Scoped to `owner_id`: aging history is per owner, same as cooldown, so one
+    user's recent mixes never demote another user's candidates.
     """
     ids = set(sid for sid in track_ids if sid)
     if not ids:
@@ -446,6 +476,7 @@ def _aging_penalty(db: Session, track_ids, reference: datetime, lookback_days: i
     rows = (
         db.query(GeneratedPlaylist.updated_at, GeneratedPlaylist.track_ids)
         .filter(GeneratedPlaylist.updated_at >= cutoff)
+        .filter(GeneratedPlaylist.owner_id == owner_id)
         .all()
     )
     last_seen: dict = {}
@@ -469,7 +500,8 @@ def _aging_penalty(db: Session, track_ids, reference: datetime, lookback_days: i
     return penalties
 
 
-def _curate(db: Session, track_ids, target: int, rng, artist_cap: int = 5) -> list[str]:
+def _curate(db: Session, track_ids, target: int, rng, artist_cap: int = 5,
+            owner_id: int | None = None) -> list[str]:
     """Re-rank a blended track list for diversity, then trim to `target`.
 
     The blend happens on bare ids, so one artist can own half the playlist (a
@@ -498,7 +530,7 @@ def _curate(db: Session, track_ids, target: int, rng, artist_cap: int = 5) -> li
         # curation, so don't reorder what the blend produced.
         return ids[:target]
 
-    penalized = _aging_penalty(db, ids, datetime.utcnow())
+    penalized = _aging_penalty(db, ids, datetime.utcnow(), owner_id=owner_id)
 
     capped: list[str] = []
     seen_artist: dict = {}
@@ -565,23 +597,35 @@ async def _publish_playlist(
     name: str,
     track_ids: list[str],
     prune: bool = False,
+    owner_id: int | None = None,
 ) -> bool:
     """Create or replace `name` in Navidrome and record it locally.
 
     Shared by every trigger so the delete-then-create dance (updatePlaylist
     appends rather than replaces) exists in exactly one place. Returns False
     when the publish gate rejected the run.
+
+    `owner_id` scopes both sides. The remote side is per-user implicitly:
+    `client` was built from that owner's credentials, so the playlist lands in
+    their own Navidrome account. The local side must say so explicitly. Names
+    are deliberately NOT prefixed per user — two owners may both have a
+    "Daily Mix" in their own account, and each is a distinct row.
     """
     if not _publish_gate_ok(track_ids, name):
         return False
 
-    existing = db.query(GeneratedPlaylist).filter(GeneratedPlaylist.name == name).first()
+    existing = (
+        db.query(GeneratedPlaylist)
+        .filter(GeneratedPlaylist.name == name, GeneratedPlaylist.owner_id == owner_id)
+        .first()
+    )
     if existing and existing.navidrome_playlist_id:
         try:
             await client.delete_playlist(existing.navidrome_playlist_id)
         except Exception as e:
             logger.warning(f"Failed to delete old playlist '{name}': {e}")
         result = await client.create_playlist(name, track_ids)
+        existing.owner_id = owner_id  # repairs a legacy NULL-owner row
         existing.navidrome_playlist_id = result.get("playlist", {}).get("id", "")
         existing.track_ids = json.dumps(track_ids)
         existing.track_count = len(track_ids)
@@ -589,6 +633,7 @@ async def _publish_playlist(
     else:
         result = await client.create_playlist(name, track_ids)
         db.add(GeneratedPlaylist(
+            owner_id=owner_id,
             name=name,
             navidrome_playlist_id=result.get("playlist", {}).get("id", ""),
             track_count=len(track_ids),
@@ -598,7 +643,9 @@ async def _publish_playlist(
 
     if prune:
         try:
-            pruned = await _prune_old_dated_playlists(db, client, name)
+            pruned = await _prune_old_dated_playlists(
+                db, client, name, owner_id=owner_id
+            )
             if pruned:
                 logger.info(
                     f"Pruned {pruned} playlist(s) older than {PLAYLIST_RETENTION_DAYS} days"
@@ -607,27 +654,6 @@ async def _publish_playlist(
             logger.warning(f"Playlist pruning failed (new playlist was created): {e}")
 
     return True
-
-
-# ─── DB-backed Navidrome Client ─────────────────────────────────────────────
-
-def _get_client_from_db() -> NavidromeClient:
-    """Create a NavidromeClient using credentials stored in the ConnectionConfig table.
-
-    Raises RuntimeError if no saved config exists.
-    """
-    db = SessionLocal()
-    try:
-        config = db.query(ConnectionConfig).filter(ConnectionConfig.id == 1).first()
-        if config is None:
-            raise RuntimeError("No Navidrome credentials saved in database — log in via the UI first.")
-        return NavidromeClient(
-            url=config.url,
-            username=config.username,
-            password=config.password,
-        )
-    finally:
-        db.close()
 
 
 # ─── ListenBrainz candidate gathering ───────────────────────────────────────
@@ -656,11 +682,11 @@ async def _gather_lb_candidates(db: Session, client: NavidromeClient,
     unconfigured, has no history yet, or errors — the caller then falls back to
     Last.fm.
 
-    `user_id` scopes the CF recommendation cache only: recommendations are one
-    listener's taste. The similar-recordings cache is keyed by recording MBID
-    and is shared by every user.
+    `user_id` scopes both the credentials and the CF recommendation cache:
+    recommendations are one listener's taste. The similar-recordings cache is
+    keyed by recording MBID and is shared by every user.
     """
-    cfg = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+    cfg = get_listenbrainz_config(db, user_id)
     if cfg is None:
         return []
 
@@ -794,12 +820,20 @@ async def run_recency_trigger(trigger_id: int):
         if not trigger or not trigger.enabled:
             return
 
-        client = _get_client_from_db()
+        # Everything a trigger reads is one person's library annotation or
+        # listening history, so a trigger with no owner has nobody to build
+        # for. Refuse rather than silently picking someone else's account.
+        owner_id = trigger.owner_id
+        if owner_id is None:
+            logger.error("Trigger %s has no owner — refusing to run", trigger.id)
+            return
+
+        client = build_client(db, owner_id)
         try:
             # Determine playlist name and derive cooldown lookup prefix
             playlist_name = trigger.playlist_name or f"Fresh Discoveries {datetime.utcnow().strftime('%Y-%m-%d')}"
             cooldown_prefix = _cooldown_prefix_for(playlist_name)
-            blocked = _get_cooldown_track_ids(db, cooldown_prefix, days=2)
+            blocked = _get_cooldown_track_ids(db, cooldown_prefix, owner_id, days=2)
 
             # ── Gather candidate tracks ──
             similar_from_lb: list[str] = []       # PRIMARY: ListenBrainz
@@ -808,7 +842,7 @@ async def run_recency_trigger(trigger_id: int):
             newest_ids: list[str] = []
 
             # ── ListenBrainz first — it is the primary history source ──
-            lb_entries = await _gather_lb_candidates(db, client, trigger.owner_id)
+            lb_entries = await _gather_lb_candidates(db, client, owner_id)
             if lb_entries:
                 lb_ids, unresolved = resolve_entries(db, lb_entries)
                 lb_ids.extend(await _resolve_via_search(client, unresolved))
@@ -836,7 +870,7 @@ async def run_recency_trigger(trigger_id: int):
                 ]
 
             # ── Last.fm only when ListenBrainz produced nothing ──
-            lastfm_cfg = None if similar_from_lb else db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
+            lastfm_cfg = None if similar_from_lb else get_lastfm_config(db, owner_id)
             if similar_from_lb:
                 logger.info("ListenBrainz covered this run — Last.fm skipped")
             elif lastfm_cfg:
@@ -993,7 +1027,7 @@ async def run_recency_trigger(trigger_id: int):
                 target=50,
                 rng=rng,
             )
-            track_ids = _curate(db, blended, target=50, rng=rng)
+            track_ids = _curate(db, blended, target=50, rng=rng, owner_id=owner_id)
             logger.info(
                 f"Blend: {len(similar_from_lb)} LB + {len(similar_from_nav)} nav + "
                 f"{len(similar_from_lastfm)} lastfm history, {len(newest_ids)} newest "
@@ -1001,7 +1035,7 @@ async def run_recency_trigger(trigger_id: int):
             )
             # ── Push to Navidrome ────────────────────────────────────────────
             published = await _publish_playlist(
-                db, client, playlist_name, track_ids, prune=True
+                db, client, playlist_name, track_ids, prune=True, owner_id=owner_id
             )
             if not published:
                 # Publish gate rejected the run; yesterday's playlist stays put.
@@ -1030,13 +1064,18 @@ async def run_heavy_rotation_trigger(trigger_id: int):
         if not trigger or not trigger.enabled:
             return
 
+        owner_id = trigger.owner_id
+        if owner_id is None:
+            logger.error("Trigger %s has no owner — refusing to run", trigger.id)
+            return
+
         threshold = trigger.threshold or 5
-        client = _get_client_from_db()
+        client = build_client(db, owner_id)
         # ListenBrainz client (primary similarity source) — one instance for the
         # whole run so its rate limiter is shared across seeds.
         lb_client = None
         try:
-            lb_cfg = db.query(ListenbrainzConfig).filter(ListenbrainzConfig.id == 1).first()
+            lb_cfg = get_listenbrainz_config(db, owner_id)
             if lb_cfg:
                 lb_client = ListenBrainzClient(lb_cfg.user_token, lb_cfg.username)
         except Exception:
@@ -1044,7 +1083,7 @@ async def run_heavy_rotation_trigger(trigger_id: int):
         # Last.fm client for diverse similarity lookups (fallback only)
         lastfm_client = None
         try:
-            lastfm_cfg = db.query(LastfmConfig).filter(LastfmConfig.id == 1).first()
+            lastfm_cfg = get_lastfm_config(db, owner_id)
             if lastfm_cfg:
                 lastfm_client = LastfmClient(lastfm_cfg.api_key, lastfm_cfg.username)
         except Exception:
@@ -1158,11 +1197,13 @@ async def run_heavy_rotation_trigger(trigger_id: int):
                     playlist_name = trigger.playlist_name or f"More Like This: {track_name}"
 
                     existing = db.query(GeneratedPlaylist).filter(
-                        GeneratedPlaylist.name == playlist_name
+                        GeneratedPlaylist.name == playlist_name,
+                        GeneratedPlaylist.owner_id == owner_id,
                     ).first()
 
                     if existing and existing.navidrome_playlist_id:
                         await client.update_playlist(existing.navidrome_playlist_id, sim_ids, name=playlist_name)
+                        existing.owner_id = owner_id  # repairs a legacy NULL-owner row
                         existing.track_ids = json.dumps(sim_ids)
                         existing.track_count = len(sim_ids)
                         existing.updated_at = datetime.utcnow()
@@ -1171,6 +1212,7 @@ async def run_heavy_rotation_trigger(trigger_id: int):
                         result = await client.create_playlist(playlist_name, sim_ids)
                         playlist_id = result.get("playlist", {}).get("id", "")
                         playlist = GeneratedPlaylist(
+                            owner_id=owner_id,
                             name=playlist_name,
                             navidrome_playlist_id=playlist_id,
                             seed_track_id=track_id,
@@ -1209,7 +1251,12 @@ async def run_scheduled_trigger(trigger_id: int):
         if not trigger or not trigger.enabled:
             return
 
-        client = _get_client_from_db()
+        owner_id = trigger.owner_id
+        if owner_id is None:
+            logger.error("Trigger %s has no owner — refusing to run", trigger.id)
+            return
+
+        client = build_client(db, owner_id)
         try:
             frequent_albums = await client.get_album_list2(type_="frequent", size=20)
             track_ids = []
@@ -1231,7 +1278,9 @@ async def run_scheduled_trigger(trigger_id: int):
 
             playlist_name = trigger.playlist_name or "Scheduled Mix"
 
-            published = await _publish_playlist(db, client, playlist_name, track_ids)
+            published = await _publish_playlist(
+                db, client, playlist_name, track_ids, owner_id=owner_id
+            )
             if not published:
                 trigger.last_run = datetime.utcnow()
                 db.commit()
@@ -1287,7 +1336,8 @@ async def run_library_mix_trigger(trigger_id: int):
 
         entries = select_mix(db, owner_id, kind, rng=rng)
         track_ids = _curate(
-            db, [entry["id"] for entry in entries], target=spec.get("limit", 50), rng=rng
+            db, [entry["id"] for entry in entries], target=spec.get("limit", 50), rng=rng,
+            owner_id=owner_id,
         )
         logger.info(
             f"Library mix '{kind}': {len(entries)} candidate(s) -> "
@@ -1302,9 +1352,11 @@ async def run_library_mix_trigger(trigger_id: int):
             db.commit()
             return
 
-        client = _get_client_from_db()
+        client = build_client(db, owner_id)
         try:
-            await _publish_playlist(db, client, playlist_name, track_ids)
+            await _publish_playlist(
+                db, client, playlist_name, track_ids, owner_id=owner_id
+            )
         finally:
             await client.close()
 

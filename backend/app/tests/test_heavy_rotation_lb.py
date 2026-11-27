@@ -5,11 +5,11 @@ import pytest
 
 import app.services.scheduler as scheduler
 from app.models.database import (
-    ConnectionConfig,
     GeneratedPlaylist,
-    LastfmConfig,
-    ListenbrainzConfig,
+    LastfmUserConfig,
+    ListenbrainzUserConfig,
     SmartTrigger,
+    User,
 )
 
 
@@ -23,6 +23,7 @@ def trigger():
     t.playlist_name = None
     t.last_run = None
     t.threshold = 5
+    t.owner_id = 1
     return t
 
 
@@ -33,18 +34,6 @@ def _make_db(trigger, *, lb_configured: bool, lastfm_configured: bool):
         m = MagicMock()
         if model is SmartTrigger:
             m.filter.return_value.first.return_value = trigger
-        elif model is ListenbrainzConfig:
-            m.filter.return_value.first.return_value = (
-                MagicMock(username="szeis4cookie", user_token="tok") if lb_configured else None
-            )
-        elif model is LastfmConfig:
-            m.filter.return_value.first.return_value = (
-                MagicMock(api_key="k", username="u") if lastfm_configured else None
-            )
-        elif model is ConnectionConfig:
-            m.filter.return_value.first.return_value = MagicMock(
-                url="http://nav", username="u", password="p"
-            )
         elif model is GeneratedPlaylist:
             m.filter.return_value.first.return_value = None
             m.filter.return_value.filter.return_value.all.return_value = []
@@ -53,8 +42,23 @@ def _make_db(trigger, *, lb_configured: bool, lastfm_configured: bool):
             m.filter.return_value.filter.return_value.all.return_value = []
         return m
 
+    def fake_get(model, key):
+        """Per-user credential lookups go through db.get(model, user_id)."""
+        if model is ListenbrainzUserConfig:
+            return (
+                MagicMock(username="szeis4cookie", user_token="tok") if lb_configured else None
+            )
+        if model is LastfmUserConfig:
+            return MagicMock(api_key="k", username="u") if lastfm_configured else None
+        if model is User:
+            return MagicMock(
+                id=key, navidrome_url="http://nav", username="u", navidrome_password="p"
+            )
+        return None
+
     db = MagicMock()
     db.query.side_effect = fake_query
+    db.get.side_effect = fake_get
     return db
 
 
@@ -169,7 +173,7 @@ class TestHeavyRotationSources:
 
         db = _make_db(trigger, lb_configured=True, lastfm_configured=True)
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(
             scheduler, "_lb_similar_for_track",
             AsyncMock(return_value=[f"lb{i}" for i in range(20)]),
@@ -194,7 +198,7 @@ class TestHeavyRotationSources:
 
         db = _make_db(trigger, lb_configured=True, lastfm_configured=True)
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         # ListenBrainz knows nothing for this seed.
         monkeypatch.setattr(scheduler, "_lb_similar_for_track", AsyncMock(return_value=[]))
 
@@ -233,7 +237,7 @@ class TestThinHistoryBootstrap:
 
         db = _make_db(trigger, lb_configured=True, lastfm_configured=False)
         monkeypatch.setattr(scheduler, "SessionLocal", lambda: db)
-        monkeypatch.setattr(scheduler, "_get_client_from_db", lambda: client)
+        monkeypatch.setattr(scheduler, "build_client", lambda db, uid: client)
         monkeypatch.setattr(scheduler, "_get_cooldown_track_ids", lambda *a, **k: set())
         monkeypatch.setattr(
             scheduler, "_gather_lb_candidates",
