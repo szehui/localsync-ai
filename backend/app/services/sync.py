@@ -12,11 +12,11 @@ logger = logging.getLogger(__name__)
 
 
 class SyncService:
-    def __init__(self, client: NavidromeClient, user_id: int = 1):
+    def __init__(self, client: NavidromeClient, user_id: int):
         # Play counts / ratings / stars are per Subsonic account, so every sync
-        # is attributed to exactly one user. Defaults to the owner for the
-        # legacy singleton connection paths, which have not been given a user
-        # identity yet.
+        # is attributed to exactly one user. There is deliberately no default:
+        # a silent fallback would attribute one person's listening history to
+        # another, which is the bug this refactor exists to remove.
         self.client = client
         self.user_id = user_id
         self.is_syncing = False
