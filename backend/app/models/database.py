@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import create_engine, event, Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, event, or_, Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -388,6 +388,12 @@ def init_db():
             "tracks.search_key backfilled; tracks.recording_mbid needs a full library resync"
         )
 
+    # One-time multi-user migration: adopt legacy singleton config into
+    # per-user rows, then backfill owner_id on pre-multi-user triggers and
+    # playlists. Safe to re-run on every startup.
+    with SessionLocal() as db:
+        _migrate_multi_user(db)
+
 
 def _backfill_search_keys():
     """Populate tracks.search_key for rows synced before the column existed."""
@@ -404,4 +410,108 @@ def _backfill_search_keys():
                 sa.text("UPDATE tracks SET search_key = :k WHERE id = :i"),
                 {"k": build_search_key(artist_name, title), "i": track_id},
             )
-        conn.commit()
+            conn.commit()
+
+
+def _migrate_multi_user(db) -> None:
+    """Adopt legacy singleton rows into the users table. Idempotent.
+
+    Reads the pre-multi-user singleton config (ConnectionConfig,
+    ListenbrainzConfig, LastfmConfig) and the per-track state that still lives
+    on Track, then copies it into per-user rows owned by a single owner user.
+    Safe to re-run on every startup: if the users table is already populated
+    the adoption block is skipped, and the owner_id backfill only touches rows
+    whose owner_id is NULL, committing only when something changed.
+
+    Legacy columns (tracks.play_count / rating / starred / last_played_at) and
+    the legacy singleton tables are intentionally left in place — they are the
+    rollback path.
+    """
+    if db.query(User).first() is None:
+        legacy_conn = db.get(ConnectionConfig, 1)
+        if legacy_conn is None:
+            logger.info(
+                "Multi-user migration: no legacy connection to adopt — skipping"
+            )
+        else:
+            owner = User(
+                username=legacy_conn.username,
+                display_name=legacy_conn.username,
+                navidrome_url=legacy_conn.url,
+                navidrome_password=legacy_conn.password,
+                is_owner=True,
+            )
+            db.add(owner)
+            db.flush()  # populate owner.id before child rows reference it
+
+            lb = db.get(ListenbrainzConfig, 1)
+            if lb is not None:
+                db.add(
+                    ListenbrainzUserConfig(
+                        user_id=owner.id,
+                        user_token=lb.user_token,
+                        username=lb.username,
+                        api_base=lb.api_base,
+                        labs_api_base=lb.labs_api_base,
+                        enabled=lb.enabled,
+                    )
+                )
+
+            lf = db.get(LastfmConfig, 1)
+            if lf is not None:
+                db.add(
+                    LastfmUserConfig(
+                        user_id=owner.id,
+                        api_key=lf.api_key,
+                        username=lf.username,
+                    )
+                )
+
+            # All-zero track state is deliberately skipped: it is
+            # indistinguishable from "no annotation" and would cost one insert
+            # per track in the library.
+            tracks = (
+                db.query(Track)
+                .filter(
+                    or_(
+                        Track.play_count > 0,
+                        Track.starred.is_(True),
+                        Track.last_played_at.isnot(None),
+                        Track.rating > 0,
+                    )
+                )
+                .all()
+            )
+            for t in tracks:
+                db.add(
+                    TrackAnnotation(
+                        user_id=owner.id,
+                        track_id=t.id,
+                        play_count=t.play_count or 0,
+                        rating=t.rating or 0,
+                        starred=bool(t.starred),
+                        last_played_at=t.last_played_at,
+                    )
+                )
+            db.commit()
+            logger.info(
+                "Multi-user migration: adopted user %s; annotated %d tracks",
+                legacy_conn.username,
+                len(tracks),
+            )
+
+    # Runs on every startup: legacy triggers/playlists predate owner_id, so
+    # without this they would be unreachable to every user.
+    owner = db.query(User).filter_by(is_owner=True).first()
+    if owner is None:
+        return
+    changed = 0
+    for model in (SmartTrigger, GeneratedPlaylist):
+        changed += (
+            db.query(model)
+            .filter(model.owner_id.is_(None))
+            .update({model.owner_id: owner.id}, synchronize_session=False)
+        ) or 0
+    if changed:
+        db.commit()
+        logger.info("Multi-user migration: backfilled owner_id on %d rows", changed)
