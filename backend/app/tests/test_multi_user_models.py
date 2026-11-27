@@ -16,6 +16,8 @@ from app.models.database import (
     Track,
     User,
     TrackAnnotation,
+    GeneratedPlaylist,
+    SmartTrigger,
     ListenbrainzUserConfig,
     LastfmUserConfig,
 )
@@ -228,3 +230,65 @@ class TestLastfmUserConfig:
         db.add(LastfmUserConfig(user_id=99, api_key="a", username="sze"))
         with pytest.raises(IntegrityError):
             db.commit()
+
+
+class TestGeneratedPlaylist:
+    def test_owner_id_defaults_to_none(self, db):
+        pl = GeneratedPlaylist(name="Mix", track_ids="[]")
+        db.add(pl)
+        db.commit()
+        assert pl.owner_id is None
+
+    def test_accepts_owner_id(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        pl = GeneratedPlaylist(name="Mix", track_ids="[]", owner_id=1)
+        db.add(pl)
+        db.commit()
+        assert pl.owner_id == 1
+
+    def test_queryable_by_owner_id(self, db):
+        make_user(db, user_id=1)
+        make_user(db, user_id=2, username="other")
+        db.commit()
+        db.add(GeneratedPlaylist(name="A", track_ids="[]", owner_id=1))
+        db.add(GeneratedPlaylist(name="B", track_ids="[]", owner_id=2))
+        db.commit()
+        mine = (
+            db.query(GeneratedPlaylist)
+            .filter_by(owner_id=1)
+            .order_by(GeneratedPlaylist.name)
+            .all()
+        )
+        assert [p.name for p in mine] == ["A"]
+
+
+class TestSmartTrigger:
+    def test_owner_id_defaults_to_none(self, db):
+        tr = SmartTrigger(name="Recency", trigger_type="recency")
+        db.add(tr)
+        db.commit()
+        assert tr.owner_id is None
+
+    def test_accepts_owner_id(self, db):
+        make_user(db, user_id=1)
+        db.commit()
+        tr = SmartTrigger(name="Recency", trigger_type="recency", owner_id=1)
+        db.add(tr)
+        db.commit()
+        assert tr.owner_id == 1
+
+    def test_queryable_by_owner_id(self, db):
+        make_user(db, user_id=1)
+        make_user(db, user_id=2, username="other")
+        db.commit()
+        db.add(SmartTrigger(name="A", trigger_type="recency", owner_id=1))
+        db.add(SmartTrigger(name="B", trigger_type="heavy_rotation", owner_id=2))
+        db.commit()
+        mine = (
+            db.query(SmartTrigger)
+            .filter_by(owner_id=1)
+            .order_by(SmartTrigger.name)
+            .all()
+        )
+        assert [t.name for t in mine] == ["A"]

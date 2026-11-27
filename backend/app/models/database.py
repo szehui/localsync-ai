@@ -134,6 +134,9 @@ class Track(Base):
 class GeneratedPlaylist(Base):
     __tablename__ = "generated_playlists"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # NULL means created before multi-user support; the migration backfills
+    # these to the owner user so no playlist becomes unreachable.
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     name = Column(String, nullable=False)
     navidrome_playlist_id = Column(String, nullable=True)  # ID after pushing to Navidrome
     seed_track_id = Column(String, nullable=True)
@@ -160,6 +163,8 @@ class ConnectionConfig(Base):
 class SmartTrigger(Base):
     __tablename__ = "smart_triggers"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    # NULL on pre-multi-user rows; the migration backfills them to the owner.
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     name = Column(String, nullable=False)
     trigger_type = Column(String, nullable=False)  # "recency" | "heavy_rotation" | "scheduled" | "library_mix"
     enabled = Column(Boolean, default=True)
