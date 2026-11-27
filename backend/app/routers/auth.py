@@ -14,7 +14,7 @@ import asyncio
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from app.models.database import get_db, ConnectionConfig, SessionLocal, LastfmConfig, ListenbrainzConfig
+from app.models.database import get_db, ConnectionConfig, SessionLocal, LastfmConfig, ListenbrainzConfig, User
 from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse
 from app.services.navidrome import NavidromeClient
 from app.services.listenbrainz import ListenBrainzClient, ListenBrainzError, UserNotFoundError
@@ -32,10 +32,12 @@ _current_sync_service: SyncService | None = None
 # ── JWT auth dependency ──────────────────────────────────────────────────────
 
 async def get_current_user(authorization: str | None = Header(default=None)) -> dict:
-    """Extract and verify the JWT from the Authorization header.
+    """Verify the JWT and return the *tenant*, not just the login name.
 
-    Returns a dict with 'username' and 'navidrome_url'.
-    Used as a FastAPI dependency on protected routes.
+    Returns a dict with 'id', 'username' and 'navidrome_url'; 'id' is what
+    callers scope queries by. Tokens minted before multi-user support carry no
+    'uid' and are rejected rather than silently treated as user 1 — scoping to
+    the wrong tenant is worse than a 401.
     """
     if authorization is None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -45,13 +47,48 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
     payload = verify_token(token)
     if payload is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    uid = payload.get("uid")
+    if uid is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Token predates multi-user support — please log in again",
+        )
     return {
+        "id": uid,
         "username": payload.get("sub", "unknown"),
         "navidrome_url": payload.get("url", ""),
     }
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+def _resolve_user_id(db: Session, url: str, username: str, password: str) -> int:
+    """Return the tenant id behind these Navidrome credentials, creating it if new.
+
+    (navidrome_url, username) is the tenant key, so the same username on two
+    servers stays two distinct users. Task 7 moves this into
+    app/services/users.py as get_or_create_user(); it lives here only so this
+    change does not need a new module.
+    """
+    user = (
+        db.query(User)
+        .filter(User.navidrome_url == url, User.username == username)
+        .first()
+    )
+    if user is not None:
+        return user.id
+    user = User(
+        username=username,
+        navidrome_url=url,
+        navidrome_password=password,
+        is_owner=False,
+    )
+    db.add(user)
+    db.flush()  # assigns the autoincrement id
+    uid = user.id
+    db.commit()
+    return uid
+
 
 def get_navidrome_client() -> NavidromeClient | None:
     return _current_client
@@ -160,10 +197,14 @@ async def login(creds: LoginRequest, db: Session = Depends(get_db)):
             ))
         db.commit()
 
+        # Bind the token to a tenant row
+        user_id = _resolve_user_id(db, creds.url, creds.username, creds.password)
+
         # Issue JWT
         token = create_access_token(data={
             "sub": creds.username,
             "url": creds.url,
+            "uid": user_id,
         })
         return TokenResponse(access_token=token)
     except Exception as e:

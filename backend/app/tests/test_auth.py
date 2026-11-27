@@ -38,9 +38,24 @@ def mock_navidrome_client():
 def mock_db():
     """Mock DB session for endpoints that need it.
     Also patches SessionLocal in the auth module to return this mock.
+
+    Login now inserts a tenant row, and a MagicMock cannot produce an
+    autoincrement id — the JWT would carry uid=None and every protected
+    endpoint would then 401. So ``add`` hands User rows an id, which is all the
+    mocked flow needs; the multi-user tests below use a real session instead.
     """
+    from app.models.database import User
+
     mock = MagicMock()
     mock.query.return_value.filter.return_value.first.return_value = None
+    next_id = {"value": 0}
+
+    def _add(obj):
+        if isinstance(obj, User) and obj.id is None:
+            next_id["value"] += 1
+            obj.id = next_id["value"]
+
+    mock.add.side_effect = _add
     with patch('app.routers.auth.SessionLocal') as mock_session_local:
         mock_session_local.return_value = mock
         yield mock
@@ -335,3 +350,117 @@ def test_expired_token_rejected(client):
         "/api/auth/me", headers={"Authorization": f"Bearer {expired}"}
     )
     assert response.status_code == 401
+
+
+# ─── Multi-user: tenant id in the token ────────────────────────────────────
+
+
+@pytest.fixture
+def db():
+    """Real in-memory SQLite session for the multi-user tests.
+
+    The ``mock_db`` MagicMock cannot represent User rows and login now inserts
+    one, so these tests run against the actual models. StaticPool keeps every
+    thread on one connection — TestClient dispatches the request from its own
+    thread — so the app sees the same in-memory database as the test.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+
+    from app.models.database import Base, get_db
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)()
+    try:
+        yield session
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        session.close()
+        engine.dispose()
+
+
+def _login_as(client, monkeypatch, mock_navidrome_client, db, username="user"):
+    """Log in against a real session and return the JWT."""
+    import app.routers.auth as auth_module
+    from app.models.database import get_db
+
+    monkeypatch.setattr(
+        auth_module, "NavidromeClient", lambda *args, **kwargs: mock_navidrome_client
+    )
+    app.dependency_overrides[get_db] = lambda: db
+
+    creds = LoginRequest(url="http://test", username=username, password="pass")
+    response = client.post("/api/auth/login", json=creds.model_dump())
+    assert response.status_code == 200, f"Login failed: {response.text}"
+    return response.json()["access_token"]
+
+
+def _decode(token):
+    from app.config import settings
+
+    return jwt.decode(
+        token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+    )
+
+
+def test_login_token_carries_uid(client, monkeypatch, mock_navidrome_client, db):
+    """A freshly minted token must name the tenant it belongs to."""
+    from app.models.database import User
+
+    token = _login_as(client, monkeypatch, mock_navidrome_client, db)
+    payload = _decode(token)
+    assert "uid" in payload
+    assert isinstance(payload["uid"], int)
+    assert payload["uid"] == db.query(User).one().id
+
+
+def test_get_current_user_returns_id(client, monkeypatch, mock_navidrome_client, db):
+    """The dependency hands callers the tenant id; /me still echoes the login."""
+    import asyncio
+
+    from app.routers.auth import get_current_user
+
+    token = _login_as(client, monkeypatch, mock_navidrome_client, db)
+    uid = _decode(token)["uid"]
+
+    user = asyncio.run(get_current_user(authorization=f"Bearer {token}"))
+    assert user["id"] == uid
+    assert user["username"] == "user"
+
+    response = client.get("/api/auth/me", headers=_auth_header(token))
+    assert response.status_code == 200
+    assert response.json()["username"] == "user"
+
+
+def test_token_without_uid_is_rejected(client):
+    """A pre-multi-user token has no tenant — 401, not a guess at user 1."""
+    from app.config import settings
+
+    legacy = jwt.encode(
+        {"sub": "user", "url": "http://test", "exp": 9999999999},
+        settings.jwt_secret_key,
+        algorithm=settings.jwt_algorithm,
+    )
+    response = client.get("/api/auth/me", headers=_auth_header(legacy))
+    assert response.status_code == 401
+    assert "log in again" in response.json()["detail"]
+
+
+def test_second_login_creates_second_user(
+    client, monkeypatch, mock_navidrome_client, db
+):
+    """Each distinct login is its own tenant; nobody shares a row."""
+    from app.models.database import User
+
+    _login_as(client, monkeypatch, mock_navidrome_client, db, username="user")
+    _login_as(client, monkeypatch, mock_navidrome_client, db, username="other")
+
+    users = db.query(User).all()
+    assert len(users) == 2
+    assert {u.username for u in users} == {"user", "other"}

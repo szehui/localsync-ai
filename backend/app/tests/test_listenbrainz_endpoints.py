@@ -34,9 +34,18 @@ def mock_navidrome_client():
 def _login(client, monkeypatch, mock_navidrome_client):
     """Log in and return the JWT. Also yields the DB mock used for auth."""
     import app.routers.auth as auth_module
+    from app.models.database import User
 
     mock_db = MagicMock()
     mock_db.query.return_value.filter.return_value.first.return_value = None
+
+    # Login inserts a tenant row and the JWT carries its id; a MagicMock has no
+    # autoincrement, so hand the new User row an id (uid=None would 401).
+    def _add(obj):
+        if isinstance(obj, User) and obj.id is None:
+            obj.id = 1
+
+    mock_db.add.side_effect = _add
 
     monkeypatch.setattr(
         auth_module, "NavidromeClient", lambda *args, **kwargs: mock_navidrome_client
