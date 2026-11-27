@@ -64,6 +64,19 @@ The auth layer looked multi-user (a JWT per login) but the tenancy was a lie:
 - Legacy columns (`tracks.play_count` etc.) and the legacy singleton tables are
   **deliberately left in place** — they are the rollback path. Cleanup is a
   separate task, gated on production running a week.
+- The owner_id backfill runs **only on the adopting startup**, not every startup.
+  `DELETE /users/{id}` nulls that member's `generated_playlists.owner_id` so the
+  history survives without pointing at a removed account; a repeated backfill
+  would hand those rows straight back to the owner on the next restart —
+  resurrecting deleted history and re-arming their triggers. Pinned by
+  `test_orphan_reclaim.py`.
+
+### Removing a member
+`DELETE /api/auth/users/{id}`, owner-only. Cascades their annotations, LB/Last.fm
+config, CF cache and discovery offers. Their generated-playlist **history is kept**
+with `owner_id` set to NULL (it is a record of what was published), and their
+triggers are orphaned rather than reassigned — an orphaned trigger refuses to run,
+which is the desired outcome.
 
 ### Open item — not fixed
 **Navidrome passwords are stored in plaintext** in SQLite. The scheduler needs
@@ -514,7 +527,9 @@ Girl"), and an **Add album** button that queues just that album in Lidarr.
   have accumulated from at least `MIN_LIVE_SEEDS=6` distinct seeds, capped at
   `MAX_SEED_CALLS=45`. Live effect: 8 live seeds instead of 4, 135 artists
   instead of 40.
-- **`discovery_offers` is the dedupe ledger.** Unique on `recording_mbid`;
+- **`discovery_offers` is the dedupe ledger.** Unique on `(user_id, recording_mbid)`
+  (was `recording_mbid` alone before multi-user, which made it impossible to offer
+  a second person a recording the first had already seen);
   `upsert_offers` bumps `last_seen`/score and merges evidence instead of
   re-inserting, and never resurrects a `dismissed` or `saved` row. Skipping
   already-seen recordings is what keeps the feed from re-offering the same

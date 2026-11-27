@@ -113,22 +113,30 @@ def test_no_legacy_config_is_a_noop(db):
 
 
 def test_legacy_triggers_get_owner_backfilled(db):
-    owner = User(
-        username="sze",
-        navidrome_url="https://navidrome.example.com",
-        navidrome_password="secret",
-        is_owner=True,
-    )
-    db.add(owner)
-    db.commit()
+    """Rows that predate multi-user are claimed by the owner at adoption time.
 
+    The rows must exist BEFORE the adopting startup (no users yet) — that is the
+    only moment the backfill runs. Claiming NULL-owner rows on every later
+    startup would re-attribute history that DELETE /users/{id} deliberately
+    orphaned; see test_orphan_reclaim.py.
+    """
     trigger = SmartTrigger(name="Recency", trigger_type="recency", owner_id=None)
     playlist = GeneratedPlaylist(name="Mix", track_ids="[]", owner_id=None)
     db.add_all([trigger, playlist])
+
+    db.add(
+        ConnectionConfig(
+            id=1,
+            url="https://navidrome.example.com",
+            username="sze",
+            password="secret",
+        )
+    )
     db.commit()
 
     _migrate_multi_user(db)
 
     db.expire_all()
+    owner = db.query(User).filter_by(is_owner=True).one()
     assert db.get(SmartTrigger, trigger.id).owner_id == owner.id
     assert db.get(GeneratedPlaylist, playlist.id).owner_id == owner.id

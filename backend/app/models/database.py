@@ -583,14 +583,21 @@ def _migrate_multi_user(db) -> None:
     ListenbrainzConfig, LastfmConfig) and the per-track state that still lives
     on Track, then copies it into per-user rows owned by a single owner user.
     Safe to re-run on every startup: if the users table is already populated
-    the adoption block is skipped, and the owner_id backfill only touches rows
-    whose owner_id is NULL, committing only when something changed.
+    the adoption block is skipped.
+
+    The owner_id backfill runs ONLY on the startup that performs the adoption.
+    It must not run on every startup: `DELETE /users/{id}` deliberately nulls
+    that user's generated-playlist history so it stops pointing at a removed
+    account, and a repeated backfill would hand those rows straight back to the
+    owner — resurrecting history the operator deleted and defeating the
+    "trigger has no owner — refusing to run" guard.
 
     Legacy columns (tracks.play_count / rating / starred / last_played_at) and
     the legacy singleton tables are intentionally left in place — they are the
     rollback path.
     """
-    if db.query(User).first() is None:
+    users_were_empty = db.query(User).first() is None
+    if users_were_empty:
         legacy_conn = db.get(ConnectionConfig, 1)
         if legacy_conn is None:
             logger.info(
@@ -663,8 +670,10 @@ def _migrate_multi_user(db) -> None:
                 len(tracks),
             )
 
-    # Runs on every startup: legacy triggers/playlists predate owner_id, so
-    # without this they would be unreachable to every user.
+    # Adoption-time only (see docstring): a repeated backfill would reclaim rows
+    # that DELETE /users/{id} deliberately orphaned.
+    if not users_were_empty:
+        return
     owner = db.query(User).filter_by(is_owner=True).first()
     if owner is None:
         return
