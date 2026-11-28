@@ -192,6 +192,11 @@ class Request(Base):
     last_synced_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
     available_evidence = Column(String, nullable=True)  # mbid | name
+    # The status this row's notification was sent for. The reconciler may revisit
+    # a row many times (it runs every five minutes and a failed row is watched for
+    # thirty days), so without this a single failure would be announced on every
+    # cycle. Set only when a send was attempted, never on a no-op cycle.
+    notified_status = Column(String, nullable=True)
 
     __table_args__ = (
         Index("ix_requests_open_rg", "release_group_mbid",
@@ -237,6 +242,11 @@ class Blocklist(Base):
     scope = Column(String, nullable=False, default="release_group")
     release_group_mbid = Column(String, nullable=True, index=True)
     artist_mbid = Column(String, nullable=True, index=True)
+    # Labels, not identity: the list is rendered from these instead of paying a
+    # MusicBrainz call per row, and they are whatever the caller knew at the
+    # time. Matching is always by MBID.
+    artist_name = Column(String, nullable=True)
+    album_title = Column(String, nullable=True)
     reason = Column(Text, nullable=True)
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -337,6 +347,29 @@ class LidarrConfig(Base):
     id = Column(Integer, primary_key=True, default=1)
     url = Column(String, nullable=False)
     api_key = Column(String, nullable=False)
+
+
+class NotificationConfig(Base):
+    """Singleton table for outbound notifications (a Discord webhook).
+
+    ``webhook_url`` is a credential: anyone holding it can post to the channel,
+    so it is never returned to the client in full and never logged. The API
+    reports a masked form instead (see ``services.notifier.mask_webhook``).
+
+    ``events`` is a JSON array of event names, so a household that only wants
+    "your album arrived" can turn off the request chatter without another
+    migration. An absent row means notifications are off.
+    """
+    __tablename__ = "notification_config"
+    id = Column(Integer, primary_key=True, default=1)
+    webhook_url = Column(Text, nullable=False)
+    enabled = Column(Boolean, default=True)
+    events = Column(Text, nullable=True)  # JSON list of event names
+    # Where the app is reachable, so an embed can link to the requests page.
+    # Optional: the reconciler sends notifications with no HTTP request in hand
+    # and therefore no Host header to borrow.
+    base_url = Column(String, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ListenbrainzConfig(Base):
@@ -620,6 +653,33 @@ def init_db():
         with engine.connect() as conn:
             conn.execute(sa.text("ALTER TABLE smart_triggers ADD COLUMN mix_kind VARCHAR"))
             conn.commit()
+
+    # Request notifications: the row remembers which status it announced, so the
+    # five-minute reconciler cannot re-announce a failure on every cycle.
+    # `create_all()` builds this for a fresh database and never touches an
+    # existing table, so an upgraded install needs the ALTER.
+    if inspector.has_table("requests"):
+        request_columns = [c["name"] for c in inspector.get_columns("requests")]
+        if "notified_status" not in request_columns:
+            with engine.connect() as conn:
+                conn.execute(sa.text(
+                    "ALTER TABLE requests ADD COLUMN notified_status VARCHAR"))
+                conn.commit()
+            logger.info("Migrated requests: added notified_status")
+
+    # Blocklist rows carry their own labels so the owner can recognise an entry
+    # without a MusicBrainz call per render.
+    if inspector.has_table("blocklist"):
+        block_columns = [c["name"] for c in inspector.get_columns("blocklist")]
+        missing_block = [name for name in ("artist_name", "album_title")
+                         if name not in block_columns]
+        if missing_block:
+            with engine.connect() as conn:
+                for name in missing_block:
+                    conn.execute(sa.text(
+                        f"ALTER TABLE blocklist ADD COLUMN {name} VARCHAR"))
+                conn.commit()
+            logger.info("Migrated blocklist: added %s", ", ".join(missing_block))
 
     # Backfill search_key from existing rows (no Navidrome calls needed).
     # recording_mbid CANNOT be backfilled — it requires a library resync.

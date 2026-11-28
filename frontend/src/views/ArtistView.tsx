@@ -12,6 +12,7 @@
  */
 import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
+import { useAuth } from '../AuthContext.tsx';
 import type { ArtistDetail, ArtistRequestPlan, ArtistScope, CatalogCard } from '../types.ts';
 import { Badge, Button, Card, EmptyState, Select, Spinner } from '../components.tsx';
 import { AlbumCard } from '../catalog.tsx';
@@ -45,6 +46,13 @@ export function ArtistView({ artistMbid, artistName, onOpenAlbum, onBack, onRequ
   const [confirmArmed, setConfirmArmed] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createdMessage, setCreatedMessage] = useState<string | null>(null);
+  const [blockOpen, setBlockOpen] = useState(false);
+  const [blockReason, setBlockReason] = useState('');
+  const [blocking, setBlocking] = useState(false);
+  const [blockedArtist, setBlockedArtist] = useState(false);
+  const [blockError, setBlockError] = useState<string | null>(null);
+  const { user } = useAuth();
+  const isOwner = Boolean(user?.is_owner);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,6 +104,25 @@ export function ArtistView({ artistMbid, artistName, onOpenAlbum, onBack, onRequ
       cancelled = true;
     };
   }, [artistMbid, scope]);
+
+  async function blockArtist() {
+    setBlocking(true);
+    setBlockError(null);
+    try {
+      await api.addBlock({
+        scope: 'artist',
+        artist_mbid: artistMbid,
+        artist_name: artist?.artist_name ?? artistName ?? undefined,
+        reason: blockReason.trim() || undefined,
+      });
+      setBlockedArtist(true);
+      setBlockOpen(false);
+    } catch (e) {
+      setBlockError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBlocking(false);
+    }
+  }
 
   async function createRequest() {
     if (!plan) return;
@@ -216,6 +243,46 @@ export function ArtistView({ artistMbid, artistName, onOpenAlbum, onBack, onRequ
 
         {planError && <p className="text-xs text-red-400">{planError}</p>}
         {createdMessage && <p className="text-xs text-emerald-400">{createdMessage}</p>}
+
+        {/* Blocking the artist blocks every album by them, enforced server-side
+            at request time — this panel only saves the owner a trip to Settings. */}
+        {isOwner && (
+          <div className="border-t border-surface-border pt-3">
+            {blockedArtist ? (
+              <p className="text-[11px] text-gray-400">
+                Blocked — this artist will not be offered again.
+              </p>
+            ) : blockOpen ? (
+              <div className="space-y-2">
+                <input
+                  value={blockReason}
+                  onChange={(event) => setBlockReason(event.target.value)}
+                  placeholder="Why? (optional — only you see this)"
+                  maxLength={300}
+                  className="w-full rounded-lg border border-surface-border bg-surface-overlay px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-accent/30"
+                />
+                <div className="flex gap-2">
+                  <Button size="sm" variant="danger" onClick={blockArtist}
+                          loading={blocking} disabled={blocking}>
+                    Confirm block artist
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => setBlockOpen(false)}>
+                    Cancel
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setBlockOpen(true)}
+                className="text-[11px] text-gray-500 hover:text-red-400 transition-colors"
+                title="Never offer or accept anything by this artist"
+              >
+                Block this artist
+              </button>
+            )}
+            {blockError && <p className="mt-1 text-[11px] text-red-400">{blockError}</p>}
+          </div>
+        )}
       </Card>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">

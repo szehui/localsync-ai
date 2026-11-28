@@ -11,12 +11,13 @@ import { CatalogHome } from './views/CatalogHome.tsx';
 import { CatalogSearch } from './views/CatalogSearch.tsx';
 import { ArtistView } from './views/ArtistView.tsx';
 import { RequestsView } from './views/RequestsView.tsx';
+import { ManageView } from './views/ManageView.tsx';
 import { AlbumModal } from './views/AlbumModal.tsx';
 import type { CatalogCard } from './types.ts';
 
-type Tab = 'home' | 'search' | 'requests' | 'discover' | 'seed' | 'playlists' | 'automation' | 'youtube' | 'source';
+type Tab = 'home' | 'search' | 'requests' | 'discover' | 'seed' | 'playlists' | 'automation' | 'youtube' | 'source' | 'manage';
 
-const TABS: { id: Tab; label: string; icon: string; description: string }[] = [
+const TABS: { id: Tab; label: string; icon: string; description: string; ownerOnly?: boolean }[] = [
   { id: 'home', label: 'Home', icon: '🏠', description: 'New releases worth a listen' },
   { id: 'search', label: 'Search', icon: '🔎', description: 'Find anything; request what you lack' },
   { id: 'requests', label: 'Requests', icon: '📥', description: 'What was asked for and where it is' },
@@ -26,6 +27,8 @@ const TABS: { id: Tab; label: string; icon: string; description: string }[] = [
   { id: 'automation', label: 'Automation', icon: '⚡', description: 'Smart triggers' },
   { id: 'youtube', label: 'YouTube', icon: '📺', description: 'Import YTM playlists' },
   { id: 'source', label: 'Source', icon: '🎵', description: 'Connect & sync your library' },
+  // Owner-only: these settings belong to the household, not to one member.
+  { id: 'manage', label: 'Manage', icon: '⚙️', description: 'Notifications and the blocklist', ownerOnly: true },
 ];
 
 export default function App() {
@@ -130,7 +133,7 @@ function MainApp() {
         {/* Tabs */}
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
           <nav className="flex gap-1 -mb-px overflow-x-auto">
-            {TABS.map((tab) => {
+            {TABS.filter((tab) => !tab.ownerOnly || user?.is_owner).map((tab) => {
               const isActive = activeTab === tab.id;
               return (
                 <button
@@ -190,6 +193,7 @@ function MainApp() {
         {activeTab === 'automation' && <AutomationHub />}
         {activeTab === 'youtube' && <YouTubeImport />}
         {activeTab === 'source' && <SourceDashboard />}
+        {activeTab === 'manage' && user?.is_owner && <ManageView />}
       </main>
 
       {openAlbumMbid && (

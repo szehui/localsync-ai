@@ -33,6 +33,13 @@ import type {
   RequestListResponse,
   RequestVoteResponse,
   ArtistScope,
+  NotificationConfig,
+  NotificationConfigPayload,
+  NotificationTestResult,
+  BlocklistEntry,
+  BlocklistListResponse,
+  BlocklistCreatePayload,
+  BlocklistScope,
 } from './types';
 
 const BASE = '/api';
@@ -356,4 +363,38 @@ export const api = {
     const qs = new URLSearchParams({ artist_mbid: artistMbid, scope });
     return request<ArtistRequestPlan>(`/requests/plan?${qs}`);
   },
+
+  // ─── Notifications ────────────────────────────────────────────────────────
+
+  getNotificationConfig: () => request<NotificationConfig>('/notifications'),
+
+  setNotificationConfig: (payload: NotificationConfigPayload) =>
+    request<NotificationConfig>('/notifications', {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
+  clearNotificationConfig: () =>
+    request<NotificationConfig>('/notifications', { method: 'DELETE' }),
+
+  testNotification: () =>
+    request<NotificationTestResult>('/notifications/test', { method: 'POST' }),
+
+  // ─── Blocklist ────────────────────────────────────────────────────────────
+
+  listBlocklist: (opts?: { scope?: BlocklistScope }) => {
+    const qs = opts?.scope ? `?scope=${opts.scope}` : '';
+    return request<BlocklistListResponse>(`/blocklist${qs}`);
+  },
+
+  addBlock: (payload: BlocklistCreatePayload) =>
+    request<BlocklistEntry>('/blocklist', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  removeBlock: (id: number) =>
+    request<{ removed: boolean; id: number }>(`/blocklist/${id}`, {
+      method: 'DELETE',
+    }),
 };

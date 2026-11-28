@@ -420,7 +420,8 @@ class TestArtistRequests:
 
         assert [a["release_group_mbid"] for a in plan["albums"]] == ["rg-new"]
         assert plan["summary"] == {"requestable": 1, "owned": 1,
-                                   "already_requested": 1, "total": 3}
+                                   "already_requested": 1, "blocked": 0,
+                                   "total": 3}
 
     async def test_studio_scope_excludes_soundtracks_and_compilations(self, db, owner):
         client = MagicMock()

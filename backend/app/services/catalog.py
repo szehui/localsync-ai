@@ -185,19 +185,37 @@ def card(rg: dict, *, owned: bool = False, owned_via: Optional[str] = None,
 
 def annotate(db: Session, release_groups: list[dict], *,
              index: Optional[OwnershipIndex] = None,
-             covers: Optional[dict[str, Optional[str]]] = None) -> list[dict]:
-    """Turn release-group payloads into cards with ownership and requests."""
+             covers: Optional[dict[str, Optional[str]]] = None,
+             blocked: Optional[tuple[set[str], set[str]]] = None) -> list[dict]:
+    """Turn release-group payloads into cards with ownership and requests.
+
+    ``blocked`` is the ``(release_groups, artists)`` pair from
+    ``services.blocklist.blocked_sets``. Cards carry a ``blocked`` flag rather
+    than being dropped here: the caller decides, because search hides blocked
+    results while an artist page shows them greyed out — an album silently
+    missing from a discography reads as a bug.
+    """
     index = index or ownership_index(db)
     requests = _open_requests(db, [rg.get("id") for rg in release_groups])
     covers = covers or {}
+    if blocked is None:
+        from app.services.blocklist import blocked_sets
+
+        blocked = blocked_sets(db)
+    blocked_rgs, blocked_artists = blocked
 
     out = []
     for rg in release_groups:
         rgid = rg.get("id")
         owned, via = index.lookup(rgid, artist_credit_name(rg), rg.get("title") or "")
-        out.append(card(rg, owned=owned, owned_via=via,
-                        request=requests.get(rgid),
-                        cover_url=covers.get(rgid)))
+        entry = card(rg, owned=owned, owned_via=via,
+                     request=requests.get(rgid),
+                     cover_url=covers.get(rgid))
+        entry["blocked"] = bool(
+            (rgid and rgid in blocked_rgs)
+            or (entry.get("artist_mbid") and entry["artist_mbid"] in blocked_artists)
+        )
+        out.append(entry)
     return out
 
 
@@ -284,7 +302,11 @@ async def search(db: Session, user: dict, query: str, *, limit: int = 10,
             })
 
         return {
-            "results": annotate(db, release_groups, covers=covers),
+            # Blocked albums are dropped from search: offering something the
+            # household has rejected is noise, and the request would be refused
+            # anyway. Artist pages keep them (flagged) — see artist_detail.
+            "results": [c for c in annotate(db, release_groups, covers=covers)
+                        if not c.get("blocked")],
             "count": total,
             "offset": offset,
             "artist_suggestions": suggestions,
@@ -404,6 +426,9 @@ async def rails(db: Session, user: dict, *, mb: Optional[MusicBrainzClient] = No
         covers.update(await _covers(db, gaps))
 
     pool = annotate(db, release_groups, covers=covers)
+    # Blocked artists and albums are hidden from rails for the same reason they
+    # are hidden from search: the household has said no.
+    pool = [c for c in pool if not c.get("blocked")]
     cards = pool[:RAIL_LIMIT]
 
     # Trending means "the most-listened among these new releases", so popularity

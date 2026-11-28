@@ -396,3 +396,67 @@ class ArtistRequestPlan(BaseModel):
     scope: str
     albums: list[dict] = []
     summary: dict[str, int] = {}
+
+
+# --- Notifications ---
+
+class NotificationConfigRequest(BaseModel):
+    """Configure the household webhook.
+
+    ``webhook_url`` may be omitted on update to keep the stored one: the API
+    never returns it, so a UI that round-trips the response would otherwise
+    write back a masked placeholder over a working URL.
+    """
+
+    webhook_url: Optional[str] = None
+    enabled: bool = True
+    events: Optional[list[str]] = None
+    base_url: Optional[str] = None
+
+
+class NotificationConfigResponse(BaseModel):
+    """Never carries the webhook URL — only a masked hint and its state."""
+
+    configured: bool = False
+    enabled: bool = False
+    webhook_hint: Optional[str] = None
+    events: list[str] = []
+    available_events: list[str] = []
+    base_url: Optional[str] = None
+
+
+class NotificationTestResponse(BaseModel):
+    sent: bool
+    detail: str
+
+
+# --- Blocklist ---
+
+class BlocklistCreate(BaseModel):
+    """Block one release group or one artist. Exactly one id is required."""
+
+    scope: str = "release_group"          # release_group | artist
+    release_group_mbid: Optional[str] = None
+    artist_mbid: Optional[str] = None
+    reason: Optional[str] = None
+    # Display fields, so the owner can recognise the row later without a
+    # MusicBrainz call per list render. They are hints, not identity.
+    artist_name: Optional[str] = None
+    album_title: Optional[str] = None
+
+
+class BlocklistEntry(BaseModel):
+    id: int
+    scope: str
+    release_group_mbid: Optional[str] = None
+    artist_mbid: Optional[str] = None
+    artist_name: Optional[str] = None
+    album_title: Optional[str] = None
+    reason: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+
+class BlocklistListResponse(BaseModel):
+    entries: list[BlocklistEntry] = []
+    total: int = 0

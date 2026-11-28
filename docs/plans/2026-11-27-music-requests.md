@@ -1092,44 +1092,78 @@ separate admin tab. Keep the existing tab styling and `description` pattern.
 
 # Phase 5 — Polish
 
-### Task 5.1: Availability badge on library views
+> **Status: 5.2, 5.3, 5.4 shipped 2026-11-28 (as one commit). 5.1 deferred.**
+
+### Task 5.1: Availability badge on library views — DEFERRED
 
 Show `release_group_mbid` presence (or absence) in album lists so the household can see
 which albums are untagged — the same slice that will forever be "probably owned".
+
+**Why deferred:** the badge would only make the 499-album Subsonic gap visible in a
+second place. The gap's root cause (why Navidrome reports albums Subsonic does not) is
+the larger, still-unexplained hole in ownership reporting; a badge is worth building
+once that is understood, so it can say *why* an album is unmatched rather than just that
+it is.
 
 **Commit:** `feat(ui): show tagging/MBID state`
 
 ---
 
-### Task 5.2: Discord webhook notifications
+### Task 5.2: Discord webhook notifications — SHIPPED
 
-**Files:** Create `backend/app/services/notifier.py`, model `NotificationConfig`
+**Files:** `backend/app/services/notifier.py`, `backend/app/routers/notifications.py`,
+model `NotificationConfig`, column `requests.notified_status`.
 
-Events: `request.created` (owner channel), `request.available` (requester), `request.failed`
-(owner). Fire-and-forget with a 5 s timeout; a failed webhook must never fail the request
-transition. Config is a single row: `{webhook_url, enabled, events}`; owner-only UI under
-Source.
+Events: `request.created`, `request.available`, `request.failed`. Fire-and-forget with a
+5 s timeout; a failed webhook never fails the request transition. Config is a single row
+`{webhook_url, base_url, enabled, events}`, owner-only UI under **Manage**.
+
+**Deviations from the plan, all deliberate:**
+
+- **Destination is one webhook for the household**, not one channel per role. A second
+  webhook to route "owner" vs "requester" events is a config surface with no user yet;
+  the embed carries `Asked by`, which is what the owner needs to triage.
+- **Child albums of a discography do not announce.** The parent fires once when the last
+  album lands. The plan's literal reading would send 30 messages for one request.
+- **The webhook URL is write-only over the API.** The plan said "config is a single row";
+  it did not say the row holds a credential. `GET` returns a mask, `PUT` without a URL
+  keeps the stored one, logs carry the mask.
+- **Announcements are collected during the reconcile cycle and sent after the commit**, not
+  fired inline: the reconciler runs each row inside a savepoint, and an HTTP call there
+  would hold a write lock for a network round trip.
+- **`base_url` column added** beyond the plan's three fields: the reconciler has no HTTP
+  request to borrow a hostname from, so links in background notifications need a
+  configured origin.
 
 **Commit:** `feat(notifications): Discord webhook for request events`
 
 ---
 
-### Task 5.3: Blocklist
+### Task 5.3: Blocklist — SHIPPED
 
-Owner-only: block a release group or an artist from search/requests. Blocked items are
-filtered from catalog results and refused at creation (Task 2.2 already rejects them).
+**Files:** `backend/app/services/blocklist.py`, `backend/app/routers/blocklist.py`,
+`Blocklist` gains `album_title` / `artist_name` (display names, so the owner can review
+the list months later without an upstream lookup).
+
+Owner-only, two scopes. Enforced at creation (already true in Task 2.2, now shared through
+one module), and additionally: search and rails drop blocked cards; artist pages keep them
+greyed and non-requestable; the discography plan skips them and reports `blocked` in its
+summary.
+
+**Deviation:** the plan said "filtered from catalog results". Filtering alone would have
+left a discography showing 38 of 39 albums with no explanation, so blocked albums are
+*marked and disabled* on the artist page while being dropped from search and rails, where
+there is no surrounding list to make an absence legible.
 
 **Commit:** `feat(requests): blocklist`
 
 ---
 
-### Task 5.4: Docs + dev log
+### Task 5.4: Docs + dev log — SHIPPED
 
-- `DEVLOG.md`: one entry with the MBID decision, the probe numbers, and what was rejected
-  (Deezer, Spotify, title matching).
-- `~/wiki/domains/infrastructure/localsync-ai.md`: new "Requests" section, including the
-  two availability signals and the per-user `auto_approve` flag.
-- `docs/research/2026-11-27-request-system.md`: fill in Spike results.
+- `DEVLOG.md`: Phase 5 entry — the parent-status bug, the once-per-status rule, the two
+  UI bugs the live test found, and what was verified vs. only unit-tested.
+- `~/wiki/domains/infrastructure/localsync-ai.md`: notifications + blocklist section.
 
 **Commit:** `docs: music requests`
 

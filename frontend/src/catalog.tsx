@@ -146,7 +146,11 @@ export function AlbumCard({ card, onOpen, onOpenArtist, rail = false, busy = fal
   // differently on purpose — 716 albums here are single-track rips that no MBID
   // backfill will ever reach, and calling those "not owned" invites a duplicate
   // purchase.
-  const badge = owned ? (
+  const badge = card.blocked ? (
+    <span title="Blocked by the owner — search will not offer it">
+      <Badge variant="danger">Blocked</Badge>
+    </span>
+  ) : owned ? (
     <span title={
       card.owned_via === 'name'
         ? 'Matched on artist and album name — this library copy has no MusicBrainz tag'
@@ -172,6 +176,7 @@ export function AlbumCard({ card, onOpen, onOpenArtist, rail = false, busy = fal
         'group text-left rounded-xl border border-surface-border bg-surface-raised p-3 transition-all duration-200',
         'hover:border-surface-highlight hover:shadow-lg hover:shadow-black/20',
         rail && 'w-40 shrink-0',
+        card.blocked && 'opacity-50',
       )}
     >
       <button

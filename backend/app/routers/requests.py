@@ -13,6 +13,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import Request as HttpRequest
 from sqlalchemy.orm import Session
 
 from app.models.database import Request, User, get_db
@@ -100,6 +101,7 @@ def _get_owned_request(db: Session, request_id: int, user: dict) -> Request:
 @router.post("", response_model=RequestResponse, status_code=201)
 async def create_request(
     payload: RequestCreate,
+    http: HttpRequest,
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -129,6 +131,21 @@ async def create_request(
 
     request = result["request"]
     response = _to_response(db, request)
+
+    # Announced only when a row was actually created. A vote on an existing
+    # request is a "me too", already visible in the UI as a vote count, and
+    # pinging the channel for it would turn interest into spam.
+    if result.get("created"):
+        try:
+            from app.services import notifier
+            await notifier.notify(
+                db, "request.created", request,
+                actor=_display_name(db, request.user_id),
+                base_url=notifier.base_url_from(dict(http.headers)),
+            )
+        except Exception as exc:  # noqa: BLE001 - a ping must not fail a request
+            logger.warning("request.created notification failed (%s)", exc)
+
     # 201 only when a row was actually created; a vote on an existing request is
     # a successful no-op, not a new resource.
     return response

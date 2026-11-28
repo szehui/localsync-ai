@@ -1,5 +1,69 @@
 # LocalSync AI — Development Log
 
+## 2026-11-28 — Phase 5: notifications and the blocklist
+
+Two gaps closed, and a bug that had been breaking discography requests since
+Phase 3.
+
+**Request parents were failing every five minutes.** An artist request carries no
+release-group MBID — its children do. The reconciler treats "the album is gone
+from Lidarr" as `failed`, so every cycle it looked up an album that could never
+exist and marked the parent failed while its children downloaded happily. Parents
+belong to `_roll_up_parents`, which derives their status from the children; the
+per-row pass now skips them. Nothing caught this because no discography request
+had been reconciled in production yet, and the rollup test never asserted that
+the row pass left parents alone.
+
+### Notifications
+
+A Discord webhook, owner-configured, three events: `request.created`,
+`request.available`, `request.failed`. Fired from the router on creation and from
+the reconciler on transition, collected during the cycle and sent after the
+commit — an HTTP call inside the per-row savepoint would hold a write lock for
+the length of a network round trip.
+
+**Once per status, not once per cycle.** The reconciler runs every five minutes
+over every open request, so a naive implementation announces a failure forever.
+`requests.notified_status` records what was announced; `retry` clears it, because
+a second attempt deserves its own notification.
+
+**Discographies announce once.** Children of an artist request stay quiet; the
+parent fires when the last album lands. Thirty individual "album available"
+messages for one ask is spam, and the parent is the thing the user asked for.
+
+**The webhook URL is a credential**, so it is write-only over the API: `GET`
+returns `http://172.22.0.1:8899/…` and never the token, the log line carries the
+same mask, and a `PUT` without a URL keeps the stored one so the form can be
+saved without re-pasting a secret.
+
+**Two UI bugs found by watching it fail.** The `Enabled` checkbox defaulted
+unchecked for an unconfigured webhook, so "Save" stored `enabled=false` and only
+the test button worked — the test endpoint ignores the flag by design, which is
+exactly what made the bug invisible. And the API reported *subscribed* events
+rather than stored ones, so pausing blanked the checkbox list and resuming would
+have come back with nothing ticked.
+
+### Blocklist
+
+Owner-only, two scopes: one release group or a whole artist. Enforced in four
+places, because hiding is not refusing: creation is refused server-side (a client
+that never saw a filtered search must still be told no), search drops blocked
+cards, rails drop them, and artist pages keep them — greyed, labelled, not
+requestable — since an album silently missing from a discography reads as a bug.
+The artist plan skips blocked albums and reports how many it skipped.
+
+### Verified
+
+Against a real HTTP sink and the live stack: test message delivered as a
+well-formed embed; `New request: Portishead — Dummy` arrived with artist, year,
+requester and cover art; blocking *Third* removed it from search results while
+the artist page kept it greyed; unblocking restored it; a member account got 403
+from both new APIs and does not see the Manage tab. `1,003` backend tests pass.
+
+Discography completion was verified with a fake Lidarr in tests, not live — no
+download finished during the session, so `request.available` has never been seen
+end to end. Worth knowing.
+
 ## 2026-11-28 — Phase 3: status truth
 
 Requests now report what is *true* instead of what was asked for. A row moves

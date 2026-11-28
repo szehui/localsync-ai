@@ -8,6 +8,7 @@
  */
 import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
+import { useAuth } from '../AuthContext.tsx';
 import type { AlbumDetail, RequestItem } from '../types.ts';
 import { Badge, Button, Spinner } from '../components.tsx';
 import { Cover, STATUS_STYLES, StatusPill } from '../catalog.tsx';
@@ -37,6 +38,13 @@ export function AlbumModal({
   const [showNote, setShowNote] = useState(false);
   const [created, setCreated] = useState<RequestItem | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
+  const [blockOpen, setBlockOpen] = useState(false);
+  const [blockReason, setBlockReason] = useState('');
+  const [blocking, setBlocking] = useState(false);
+  const [blocked, setBlocked] = useState(false);
+  const [blockError, setBlockError] = useState<string | null>(null);
+  const { user } = useAuth();
+  const isOwner = Boolean(user?.is_owner);
 
   useEffect(() => {
     let cancelled = false;
@@ -47,6 +55,10 @@ export function AlbumModal({
     setRequestError(null);
     setNote('');
     setShowNote(false);
+    setBlockOpen(false);
+    setBlockReason('');
+    setBlocked(false);
+    setBlockError(null);
 
     api
       .getAlbum(releaseGroupMbid)
@@ -90,6 +102,26 @@ export function AlbumModal({
       setRequestError(e instanceof Error ? e.message : String(e));
     } finally {
       setRequesting(false);
+    }
+  }
+
+  async function handleBlock() {
+    setBlocking(true);
+    setBlockError(null);
+    try {
+      await api.addBlock({
+        scope: 'release_group',
+        release_group_mbid: releaseGroupMbid,
+        artist_name: album?.artist_name ?? undefined,
+        album_title: album?.title ?? undefined,
+        reason: blockReason.trim() || undefined,
+      });
+      setBlocked(true);
+      setBlockOpen(false);
+    } catch (e) {
+      setBlockError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBlocking(false);
     }
   }
 
@@ -250,6 +282,52 @@ export function AlbumModal({
                     </Button>
                   </>
                 )}
+              </div>
+            )}
+
+            {/* Blocking is a household decision, so only the owner is offered it.
+                It is enforced server-side as well — this button is a shortcut,
+                not the policy. */}
+            {isOwner && !album.owned && (
+              <div className="mt-3 border-t border-surface-border pt-3">
+                {blocked ? (
+                  <p className="text-xs text-gray-400">
+                    Blocked — this album will not be offered again.
+                  </p>
+                ) : blockOpen ? (
+                  <div className="space-y-2">
+                    <input
+                      value={blockReason}
+                      onChange={(event) => setBlockReason(event.target.value)}
+                      placeholder="Why? (optional — only you see this)"
+                      maxLength={300}
+                      className="w-full rounded-lg border border-surface-border bg-surface-overlay px-3 py-1.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-accent/30"
+                    />
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        onClick={handleBlock}
+                        loading={blocking}
+                        disabled={blocking}
+                      >
+                        Confirm block
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => setBlockOpen(false)}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    onClick={() => setBlockOpen(true)}
+                    className="text-[11px] text-gray-500 hover:text-red-400 transition-colors"
+                    title="Never offer or accept this album again"
+                  >
+                    Block this album
+                  </button>
+                )}
+                {blockError && <p className="mt-1 text-[11px] text-red-400">{blockError}</p>}
               </div>
             )}
           </div>

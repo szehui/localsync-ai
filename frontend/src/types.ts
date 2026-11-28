@@ -276,6 +276,8 @@ export interface CatalogCard {
   owned: boolean;
   owned_via?: OwnedVia;
   request?: OpenRequestRef | null;
+  /** The household has blocklisted this album, or its artist. */
+  blocked?: boolean;
 }
 
 export interface ArtistSuggestion {
@@ -406,4 +408,64 @@ export interface ReconcileResult {
   total: number;
   changed: number;
   failed: number;
+}
+
+// ─── Notifications ──────────────────────────────────────────────────────────
+
+export type NotificationEvent =
+  | 'request.created'
+  | 'request.available'
+  | 'request.failed';
+
+export interface NotificationConfig {
+  configured: boolean;
+  enabled: boolean;
+  /** A masked form of the webhook URL: the token is never sent to the client. */
+  webhook_hint?: string | null;
+  events: NotificationEvent[];
+  available_events: NotificationEvent[];
+  base_url?: string | null;
+}
+
+export interface NotificationConfigPayload {
+  /** Omitted means "keep the stored URL" — the API never returns it. */
+  webhook_url?: string;
+  enabled: boolean;
+  events?: NotificationEvent[];
+  base_url?: string;
+}
+
+export interface NotificationTestResult {
+  sent: boolean;
+  detail: string;
+}
+
+// ─── Blocklist ──────────────────────────────────────────────────────────────
+
+export type BlocklistScope = 'release_group' | 'artist';
+
+export interface BlocklistEntry {
+  id: number;
+  scope: BlocklistScope;
+  release_group_mbid?: string | null;
+  artist_mbid?: string | null;
+  artist_name?: string | null;
+  album_title?: string | null;
+  reason?: string | null;
+  created_by?: string | null;
+  created_at?: string | null;
+}
+
+export interface BlocklistListResponse {
+  entries: BlocklistEntry[];
+  total: number;
+}
+
+export interface BlocklistCreatePayload {
+  scope: BlocklistScope;
+  release_group_mbid?: string;
+  artist_mbid?: string;
+  artist_name?: string;
+  album_title?: string;
+  reason?: string;
 }

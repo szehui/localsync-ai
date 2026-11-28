@@ -157,22 +157,15 @@ def open_request_for(db: Session, release_group_mbid: str) -> Optional[Request]:
 
 def _blocked(db: Session, *, release_group_mbid: Optional[str],
              artist_mbid_: Optional[str]) -> Optional[Blocklist]:
-    """Return the blocking row, if this album or its artist is blocklisted."""
-    query = db.query(Blocklist)
-    conditions = []
-    if release_group_mbid:
-        conditions.append(
-            (Blocklist.scope == "release_group")
-            & (Blocklist.release_group_mbid == release_group_mbid))
-    if artist_mbid_:
-        conditions.append(
-            (Blocklist.scope == "artist") & (Blocklist.artist_mbid == artist_mbid_))
-    if not conditions:
-        return None
-    expr = conditions[0]
-    for extra in conditions[1:]:
-        expr = expr | extra
-    return query.filter(expr).first()
+    """Return the blocking row, if this album or its artist is blocklisted.
+
+    The query lives in ``services.blocklist`` so the catalog's filter and this
+    refusal check cannot disagree about what "blocked" means.
+    """
+    from app.services import blocklist as blocklist_svc
+
+    return blocklist_svc.blocked_rows(
+        db, release_group_mbid=release_group_mbid, artist_mbid_=artist_mbid_)
 
 
 def _owned_by_mbid(db: Session, release_group_mbid: str) -> bool:
@@ -550,6 +543,9 @@ async def retry(db: Session, request: Request, actor) -> Request:
 
     request.last_error = None
     request.status = "approved"
+    # A retry is a fresh attempt, so a second failure deserves its own
+    # notification rather than being suppressed by the first one's stamp.
+    request.notified_status = None
     db.commit()
 
     if request.kind == "artist":
@@ -683,7 +679,7 @@ async def plan_artist_request(
         if owns_client:
             await client.close()
 
-    wanted, owned, already = [], 0, 0
+    wanted, owned, already, blocked = [], 0, 0, 0
     seen: set[str] = set()
     for rg in release_groups:
         rgid = rg.get("id")
@@ -693,6 +689,9 @@ async def plan_artist_request(
         if not is_requestable(rg):
             continue
         if scope == "studio" and (rg.get("secondary-types") or []):
+            continue
+        if _blocked(db, release_group_mbid=rgid, artist_mbid_=None):
+            blocked += 1
             continue
         if _owned_by_mbid(db, rgid):
             owned += 1
@@ -723,7 +722,8 @@ async def plan_artist_request(
             "requestable": len(wanted),
             "owned": owned,
             "already_requested": already,
-            "total": len(wanted) + owned + already,
+            "blocked": blocked,
+            "total": len(wanted) + owned + already + blocked,
         },
     }
 

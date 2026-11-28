@@ -240,13 +240,18 @@ async def reconcile_open_requests(
 
     changed = 0
     newly_failed = 0
+    # Events are collected here and announced after the commit, never inside the
+    # per-row savepoint: an HTTP call inside a transaction holds a write lock for
+    # its whole timeout, and a webhook must not be able to slow the cycle.
+    announcements: list[tuple[str, int]] = []
     for request in rows:
         try:
             # A savepoint per row: a row that misbehaves rolls back only itself,
             # instead of discarding the transitions already made in this cycle.
             with db.begin_nested():
                 moved = await _reconcile_one(
-                    db, request, lidarr, index, in_queue, failures, now)
+                    db, request, lidarr, index, in_queue, failures, now,
+                    announcements)
         except Exception as exc:  # noqa: BLE001 - one bad row is not the cycle
             logger.warning("request reconcile: request %s failed (%s)", request.id, exc)
             continue
@@ -256,15 +261,47 @@ async def reconcile_open_requests(
                 newly_failed += 1
 
     db.commit()
-    _roll_up_parents(db, now)
+    _roll_up_parents(db, now, announcements)
     logger.info("requests synced: %d, changed: %d, failed: %d",
                 len(rows), changed, newly_failed)
+    await _announce(db, announcements)
     return {"total": len(rows), "changed": changed, "failed": newly_failed}
+
+
+async def _announce(db: Session, announcements: list[tuple[str, int]]) -> None:
+    """Send the cycle's notifications. Never raises, never blocks the caller long."""
+    if not announcements:
+        return
+    from app.services import notifier
+
+    for event, request_id in announcements:
+        try:
+            request = db.get(Request, request_id)
+            if request is None:
+                continue
+            # An artist request's children are quiet: one "available" per album
+            # in a thirty-album discography is noise, and the parent announces
+            # the moment the whole set lands. Failures are still per-album,
+            # because each one is something the owner has to act on.
+            if event == "request.available" and request.parent_request_id is not None:
+                continue
+            await notifier.notify(db, event, request)
+        except Exception as exc:  # noqa: BLE001 - a ping must not break a cycle
+            logger.warning("notification for request %s failed (%s)",
+                           request_id, exc)
 
 
 async def _reconcile_one(db: Session, request: Request, lidarr: LidarrService,
                          index: OwnershipIndex, in_queue: set, failures: dict,
-                         now: datetime) -> bool:
+                         now: datetime,
+                         announcements: Optional[list] = None) -> bool:
+    if request.kind == "artist":
+        # An artist request has no album of its own in Lidarr — its children are
+        # the evidence, and `_roll_up_parents` derives its status from them.
+        # Walking it here would find `album is None` and mark the parent failed
+        # on the first cycle, before a single child had a chance to download.
+        return False
+
     album = None
     if request.release_group_mbid:
         album = await lidarr.find_album_by_release_group(request.release_group_mbid)
@@ -308,10 +345,17 @@ async def _reconcile_one(db: Session, request: Request, lidarr: LidarrService,
     request.last_error = error
     if target == "available":
         request.available_evidence = target_evidence
+    if announcements is not None and target in ("available", "failed"):
+        # Only the two events the household asked for; `downloading` and
+        # `imported` are progress, and a five-minute cadence would make them
+        # chatter rather than news.
+        event = "request.available" if target == "available" else "request.failed"
+        announcements.append((event, request.id))
     return True
 
 
-def _roll_up_parents(db: Session, now: datetime) -> None:
+def _roll_up_parents(db: Session, now: datetime,
+                     announcements: Optional[list] = None) -> None:
     """Advance artist requests from their children.
 
     Children carry the evidence, so the parent's status is derived: all children
@@ -347,6 +391,8 @@ def _roll_up_parents(db: Session, now: datetime) -> None:
                         parent.id, parent.status, target)
             parent.status = target
             parent.last_synced_at = now
+            if announcements is not None and target == "available":
+                announcements.append(("request.available", parent.id))
             touched = True
     if touched:
         db.commit()
