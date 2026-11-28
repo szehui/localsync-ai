@@ -511,7 +511,7 @@ class TestGatherEarlyStop:
             "seed-3": [],
         })
 
-        candidates, calls, live = await discovery.gather_labs_candidates(
+        candidates, calls, live, _scanned = await discovery.gather_labs_candidates(
             db, USER, client, seeds)
 
         assert calls == 4          # all four were uncached, so all were fetched
@@ -533,7 +533,7 @@ class TestGatherEarlyStop:
         }
         client = FakeClient(mapping)
 
-        candidates, calls, live = await discovery.gather_labs_candidates(
+        candidates, calls, live, _scanned = await discovery.gather_labs_candidates(
             db, USER, client, seeds, target_candidates=50, min_live_seeds=6,
         )
 
@@ -551,7 +551,7 @@ class TestGatherEarlyStop:
         db.commit()
         client = FakeClient({})
 
-        _, calls, _ = await discovery.gather_labs_candidates(
+        _, calls, _, _scanned = await discovery.gather_labs_candidates(
             db, USER, client, seeds, max_calls=3,
         )
         assert calls == 3

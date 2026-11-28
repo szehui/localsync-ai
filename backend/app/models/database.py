@@ -543,6 +543,42 @@ class DiscoveryState(Base):
     candidates_seen = Column(Integer, default=0)
     offers_added = Column(Integer, default=0)
     calls_made = Column(Integer, default=0)
+    # Seeds that came from ListenBrainz history rather than library play
+    # counts. Kept separate because the two pools fail differently: a run whose
+    # lb_seeds_used is 0 is seeded only by what Navidrome counted, which is a
+    # narrower slice of taste than the user expects from "my listen history".
+    lb_seeds_used = Column(Integer, default=0)
+    # Rows aged out of the feed this run. Without an expiry the ledger only ever
+    # grows, and a feed nobody acts on stays frozen forever.
+    offers_expired = Column(Integer, default=0)
+
+
+class DiscoverySeedUse(Base):
+    """One seed recording a user's feed has already explored.
+
+    Labs neighbours are cached per recording for 7 days, so re-seeding the same
+    track always yields the same candidates — and since the offers ledger never
+    resurrects a row, repeated runs against an unchanged seed set can only ever
+    add zero. Rotating the pool is what makes the feed renew.
+
+    Existence of a row means "used at most `used_at`"; the refresh reads recent
+    rows and pushes those seeds to the back of the queue rather than excluding
+    them, so a thin pool still produces a feed.
+    """
+    __tablename__ = "discovery_seed_uses"
+    __table_args__ = (
+        UniqueConstraint("user_id", "recording_mbid",
+                         name="uq_discovery_seed_use_user_mbid"),
+    )
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    recording_mbid = Column(String, nullable=False, index=True)
+    used_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 def get_db():
@@ -680,6 +716,24 @@ def init_db():
                         f"ALTER TABLE blocklist ADD COLUMN {name} VARCHAR"))
                 conn.commit()
             logger.info("Migrated blocklist: added %s", ", ".join(missing_block))
+
+    # Discovery: seeds from ListenBrainz history and a feed that renews.
+    # `create_all()` builds discovery_seed_uses on a fresh database; an upgraded
+    # one only needs the two new counters on discovery_state.
+    if inspector.has_table("discovery_state"):
+        state_columns = [c["name"] for c in inspector.get_columns("discovery_state")]
+        missing_state = {name: ddl for name, ddl in (
+            ("lb_seeds_used", "INTEGER DEFAULT 0"),
+            ("offers_expired", "INTEGER DEFAULT 0"),
+        ) if name not in state_columns}
+        if missing_state:
+            with engine.connect() as conn:
+                for name, ddl in missing_state.items():
+                    conn.execute(sa.text(
+                        f"ALTER TABLE discovery_state ADD COLUMN {name} {ddl}"))
+                conn.commit()
+            logger.info("Migrated discovery_state: added %s",
+                        ", ".join(missing_state))
 
     # Backfill search_key from existing rows (no Navidrome calls needed).
     # recording_mbid CANNOT be backfilled — it requires a library resync.

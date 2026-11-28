@@ -302,6 +302,8 @@ class DiscoveryStateResponse(BaseModel):
     candidates_seen: int = 0
     offers_added: int = 0
     calls_made: int = 0
+    lb_seeds_used: int = 0
+    offers_expired: int = 0
 
 
 class DiscoveryCounts(BaseModel):

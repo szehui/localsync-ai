@@ -495,3 +495,59 @@ def test_discovery_offers_rebuild_attributes_to_the_only_user(tmp_path, monkeypa
         assert rows == [(1, "dismissed")]
     finally:
         engine.dispose()
+
+
+def test_discovery_state_gains_history_and_expiry_counters(tmp_path, monkeypatch):
+    """A deployed per-user discovery_state predates the Phase 6 counters.
+
+    `create_all()` does not alter existing tables, so without the ALTER the
+    refresh writes `lb_seeds_used` and dies with OperationalError — on the one
+    database that matters, while a fresh install looks perfect.
+    """
+    path = tmp_path / "pre_phase6.db"
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR NOT NULL,
+            display_name VARCHAR, navidrome_url VARCHAR NOT NULL,
+            navidrome_password VARCHAR NOT NULL, is_owner BOOLEAN,
+            created_at DATETIME, last_login DATETIME
+        );
+        INSERT INTO users (username, navidrome_url, navidrome_password, is_owner)
+            VALUES ('sze', 'http://nav:4533', 'secret', 1);
+        CREATE TABLE discovery_state (
+            user_id INTEGER PRIMARY KEY, last_run DATETIME, last_status VARCHAR,
+            last_error TEXT, seeds_used INTEGER, candidates_seen INTEGER,
+            offers_added INTEGER, calls_made INTEGER
+        );
+        INSERT INTO discovery_state
+            (user_id, last_status, seeds_used, candidates_seen, offers_added,
+             calls_made)
+            VALUES (1, 'ok', 30, 323, 0, 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    engine = create_engine(f"sqlite:///{path}",
+                           connect_args={"check_same_thread": False})
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal",
+                        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    try:
+        db_module.init_db()
+
+        cols = _columns(engine, "discovery_state")
+        assert "lb_seeds_used" in cols
+        assert "offers_expired" in cols
+        # The pre-existing run's numbers survive the ALTER.
+        with engine.connect() as c:
+            row = c.execute(sa.text(
+                "SELECT seeds_used, lb_seeds_used, offers_expired "
+                "FROM discovery_state WHERE user_id=1")).fetchone()
+        assert row == (30, 0, 0)
+        assert "discovery_seed_uses" in sa.inspect(engine).get_table_names()
+
+        # Idempotent: a second startup must not try to re-add the columns.
+        db_module.init_db()
+    finally:
+        engine.dispose()

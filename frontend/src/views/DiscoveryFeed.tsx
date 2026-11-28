@@ -140,6 +140,11 @@ export function DiscoveryFeedView() {
           <span>
             <span className="text-gray-500">Seeds:</span>{' '}
             <span className="text-white font-semibold">{state?.seeds_used ?? 0}</span>
+            {(state?.lb_seeds_used ?? 0) > 0 && (
+              <span className="text-gray-500">
+                {' '}({state?.lb_seeds_used} from listen history)
+              </span>
+            )}
           </span>
           <span>
             <span className="text-gray-500">API calls:</span>{' '}
@@ -223,7 +228,7 @@ export function DiscoveryFeedView() {
           message={
             state?.last_run
               ? 'No new candidates right now. Everything found has been added or dismissed — try refreshing later.'
-              : 'No discovery run yet. Hit "Refresh feed" to expand your top-played tracks into new artists.'
+              : 'No discovery run yet. Hit "Refresh feed" to expand your top-played tracks and listen history into new artists.'
           }
         />
       )}

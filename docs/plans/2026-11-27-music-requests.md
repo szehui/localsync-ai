@@ -1199,3 +1199,55 @@ there is no surrounding list to make an absence legible.
   feed already operates at track granularity upstream).
 - Migrating the YouTube import off title matching (separate, low-risk follow-up now that
   `_post_album` is shared).
+
+# Phase 6 — Discovery that renews (shipped 2026-11-28)
+
+Not in the original plan: Phase 5 verification exposed that the discovery feed
+had not added an offer in four days, and that its seeds never came from
+ListenBrainz at all. Both were fixed together.
+
+### Task 6.1: ListenBrainz history as a seed source — done
+
+`library_seed_pool()` (play counts) and `listenbrainz_seeds()` (90 days of
+history, one seed per artist, junk artists dropped) are merged by
+`merge_seed_pools()` under a quota: half the seed budget is reserved for
+history-only artists.
+
+Measured live: the play-count pool reached 66 artists and returned Labs
+neighbours for 5 of 12 sampled seeds; 89 artists appeared only in history and
+returned neighbours for 9 of 12. Merging without a quota would have kept the old
+bias, since the library pool alone can fill the budget.
+
+### Task 6.2: Seed rotation — done
+
+New `discovery_seed_uses` table. `order_for_rotation()` pushes seeds scanned in
+the last 14 days to the back of their pool; `record_seed_uses()` writes only the
+seeds the scan actually reached, not the full selected list (early stop would
+otherwise mark unexpanded seeds as explored).
+
+Ordering matters and was wrong in the first cut: rotation must run *before* the
+quota merge. After the merge there is nothing left to reorder, so run two
+re-expands run one's seeds and adds zero.
+
+Verified: run 2 added 122 offers from entirely different seeds.
+
+### Task 6.3: Owned-set from the server, not just the mirror — done
+
+`triage_candidates()` takes `owned_release_groups` and drops a candidate whose
+release group is owned even when its recording MBID is unknown. The set is the
+union of `albums.release_group_mbid` and a live `NavidromeNative.list_albums()`
+walk (mirror covered 1,318 of 2,656 album MBIDs). A failing live read degrades
+to the mirror and logs.
+
+### Task 6.4: Offer expiry — done
+
+`expire_stale_offers()` retires `offered` rows unseen for 45 days. `dismissed`
+and `saved` never expire. `discovery_state` gained `lb_seeds_used` and
+`offers_expired`, both ALTERed on upgrade; the UI shows the history share.
+
+### Deliberately not done
+
+- Per-seed diversity cap. Measured the result instead: 15 distinct seeds explain
+  the top 40 feed artists, with a maximum of 14 — no cap needed yet.
+- Re-offering expired rows. An expiry is not a dismissal, but resurrection is
+  how a discovery feed becomes a treadmill; revisit only if the feed starves.

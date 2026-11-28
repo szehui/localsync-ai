@@ -230,6 +230,8 @@ export interface DiscoveryState {
   candidates_seen: number;
   offers_added: number;
   calls_made: number;
+  lb_seeds_used: number;
+  offers_expired: number;
 }
 
 export interface DiscoveryFeed {

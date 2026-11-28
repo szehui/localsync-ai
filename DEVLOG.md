@@ -1,5 +1,50 @@
 # LocalSync AI — Development Log
 
+## 2026-11-28 — Phase 6: discovery fed by listen history, and a feed that renews
+
+The discovery feed had been frozen at 255 offers since 11-24, and refreshing it
+added zero. Three separate causes, all invisible from the UI.
+
+**Seeds never came from ListenBrainz.** `select_seeds` read `TrackAnnotation`,
+which the library sync writes from Navidrome's play counts on the last ~50
+played albums. Against a 2,087-listen account that pool was 66 artists. Measured
+against Labs, those seeds returned neighbours 5 times out of 12, while 89
+artists present only in listen history returned 9 of 12 — the "half the seeds
+are dead" problem we had documented was largely a symptom of where seeds came
+from. Seeds now come from both pools: play counts, and history out to 90 days.
+A fixed quota (half the budget) goes to history-only artists, because merging
+and truncating would let the play-count pool fill every slot and quietly keep
+the old bias.
+
+**The seed list never rotated.** Labs caches neighbours per recording for 7
+days and the ledger never resurrects an offered row, so the same 30 seeds
+yielded the same candidates forever. Seeds actually scanned now go into
+`discovery_seed_uses`, and seeds used in the last 14 days are pushed to the back
+of their pool. Rotation runs *before* the quota merge — rotating afterwards is a
+no-op, because the merge has already truncated to the budget. That ordering bug
+was live in the first cut and the rotation test caught it.
+
+**Ownership was checked against half a library.** Triage compared recording
+MBIDs against the local album mirror, which held 1,318 of the 2,656 album MBIDs
+Navidrome reports. No false discoveries had shipped yet, but only by luck.
+Triage now also checks the candidate's release group against a set unioned from
+the mirror and a live native-API walk, so a different edition of an owned album
+counts as owned rather than as a gap.
+
+Offers also expire: `offered` rows unseen for 45 days become `expired`.
+`dismissed` and `saved` are decisions and never age out.
+
+Deployed and run twice against the live stack. Cold run: 30 seeds (15 from
+history) → 300 candidates → **172 new offers** in 8 Labs calls. Second run →
+**122 more**, from entirely different seeds (Imagine Dragons, Gorillaz,
+Paramore, Conan Gray, Soundgarden, Vance Joy), which is the renewal working.
+Feed grew 255 → 549 offers over 255 artists, and a re-check of all 549 against
+the live Navidrome found **0 owned albums** — the first time that check has run
+with full coverage rather than on the mirror alone.
+
+1,034 tests, including a migration test for the two new `discovery_state`
+columns on an upgraded database.
+
 ## 2026-11-28 — Phase 5: notifications and the blocklist
 
 Two gaps closed, and a bug that had been breaking discography requests since
