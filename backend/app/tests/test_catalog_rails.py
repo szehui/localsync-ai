@@ -96,3 +96,56 @@ class TestRailsComposition:
              patch("app.services.lb_rails.popularity", AsyncMock(return_value={"rg-1": 5})):
             out = await catalog.rails(db, {"id": 1})
         assert [c["release_group_mbid"] for c in out["trending"]] == ["rg-1"]
+
+
+class TestUnreleasedAlbums:
+    """The rail says "last 14 days"; it must not be showing next month.
+
+    ListenBrainz's `days` window is centred on today, so a days=14 request spans
+    [today-14, today+14]. Sorting newest-first then made the pool entirely
+    future-dated: live, all 24 cards were 2026-12-11/12-12 and no album released
+    in the window appeared at all.
+    """
+
+    async def test_future_dated_rows_are_excluded(self, db):
+        today = dt.datetime.now(dt.timezone.utc).date()
+        rows = [_fresh_row(0)]
+        for i, offset in enumerate((1, 7, 14), start=1):
+            row = _fresh_row(i)
+            row["release_date"] = (today + dt.timedelta(days=offset)).isoformat()
+            rows.append(row)
+
+        with patch("app.services.lb_rails.fresh_releases", AsyncMock(return_value=rows)), \
+             patch("app.services.lb_rails.popularity", AsyncMock(return_value={})):
+            out = await catalog.rails(db, {"id": 1})
+
+        ids = [c["release_group_mbid"] for c in out["new_releases"]]
+        assert ids == ["rg-0"], ids
+
+    async def test_a_pile_of_future_rows_cannot_crowd_out_released_ones(self, db):
+        """The live failure: anticipation releases filled the 200-row pool."""
+        today = dt.datetime.now(dt.timezone.utc).date()
+        future = []
+        for i in range(catalog.RAIL_POOL + 5):
+            row = _fresh_row(i)
+            row["release_date"] = (today + dt.timedelta(days=1 + i % 10)).isoformat()
+            future.append(row)
+        released = [_fresh_row(900)]
+        released[0]["release_date"] = today.isoformat()
+
+        with patch("app.services.lb_rails.fresh_releases",
+                   AsyncMock(return_value=future + released)), \
+             patch("app.services.lb_rails.popularity", AsyncMock(return_value={})):
+            out = await catalog.rails(db, {"id": 1})
+
+        ids = [c["release_group_mbid"] for c in out["new_releases"]]
+        assert "rg-900" in ids, ids
+
+    async def test_undated_rows_are_kept(self, db):
+        """A row ListenBrainz did not date is still inside its own window."""
+        row = _fresh_row(0)
+        row.pop("release_date")
+        with patch("app.services.lb_rails.fresh_releases", AsyncMock(return_value=[row])), \
+             patch("app.services.lb_rails.popularity", AsyncMock(return_value={})):
+            out = await catalog.rails(db, {"id": 1})
+        assert [c["release_group_mbid"] for c in out["new_releases"]] == ["rg-0"]

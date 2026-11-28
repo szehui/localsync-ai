@@ -16,6 +16,7 @@ card must not cost a MusicBrainz call just to say "requested".
 """
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from sqlalchemy.orm import Session
@@ -398,10 +399,28 @@ async def rails(db: Session, user: dict, *, mb: Optional[MusicBrainzClient] = No
 
     fresh = await fresh_releases(db, days=days)
 
+    # ListenBrainz's `days` window is *centred* on today, not trailing: asking
+    # for 14 returned 2026-11-14..2026-12-12. Sorting newest-first and taking
+    # the top 200 therefore selected the future-dated rows exclusively — every
+    # card in a rail labelled "last 14 days" was dated two weeks ahead, and not
+    # one album actually released in the window appeared (258 of 3,682 rows
+    # were future-dated, and they filled the entire pool). Drop anything not yet
+    # released before ordering so the pool means what the label claims.
+    # Undated rows are kept: they are inside ListenBrainz's window by its own
+    # definition, and only the date we lack would exclude them.
+    cutoff = datetime.now(timezone.utc).date()
+
+    def released(row: dict) -> bool:
+        raw = (row.get("release_date") or "")[:10]
+        try:
+            return datetime.strptime(raw, "%Y-%m-%d").date() <= cutoff
+        except ValueError:
+            return True
+
     # Newest first, then slice. The feed is roughly date-ordered already and the
     # explicit sort costs nothing next to being wrong about "new".
     rows = sorted(
-        (r for r in fresh if r.get("release_group_mbid")),
+        (r for r in fresh if r.get("release_group_mbid") and released(r)),
         key=lambda r: (r.get("release_date") or "", r.get("year") or 0),
         reverse=True,
     )[:RAIL_POOL]
