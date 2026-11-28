@@ -970,6 +970,33 @@ artist does not match.
 
 # Phase 4 — Frontend
 
+> **Status: shipped 2026-11-28.** All tasks complete, 922 tests passing.
+> Files landed as `catalog.tsx` (shared card/pill/cover), `views/CatalogHome.tsx`,
+> `views/CatalogSearch.tsx`, `views/AlbumModal.tsx`, `views/ArtistView.tsx`,
+> `views/RequestsView.tsx` — not the `SearchView`/`AlbumDetail` names sketched
+> below, because home rails and the artist page were added to the phase.
+>
+> **Deviations, all recorded in DEVLOG:**
+> - Task 4.2 says the badge is exactly `In library` / `Requested by` / `Request`.
+>   Implemented as written, plus a fourth case: `Probably in library`, for a
+>   library copy matched by artist+name with no MBID tag. Calling that "In
+>   library" would overstate the evidence, and the Phase 0 ownership index
+>   already distinguishes it.
+> - Task 4.3 asks for a **track count** on the album modal. MusicBrainz release
+>   groups do not carry one without a separate release lookup, so the modal shows
+>   **edition count** instead ("2 editions"). Showing a number we did not fetch
+>   would be worse than showing the one we did.
+> - Task 4.6 (rails) was scheduled to be "new releases + trending". It shipped,
+>   but only after three fixes: ListenBrainz popularity parsed as a dict instead
+>   of a list (every call 500ed), rail titles read keys the feed does not have
+>   (every card blank), and 3,597 cards rendered in 37 s.
+> - The API needed one addition the plan did not anticipate: `/auth/me` now
+>   returns `is_owner`, `auto_approve`, and `can_request`. Without them the UI
+>   cannot decide whether to offer Approve except by provoking a 403.
+> - The compose network is now dual-stack. That is not a UI change, but the
+>   frontend is what made it visible: MusicBrainz is IPv6-first and Docker's
+>   default bridge is IPv4-only.
+
 ### Task 4.1: Types + API client
 
 **Files:** Modify `frontend/src/types.ts`, `frontend/src/api.ts`

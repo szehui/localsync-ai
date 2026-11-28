@@ -48,6 +48,101 @@ in 33 ms with no Lidarr calls, `POST /api/requests/sync` owner-only (401 anon).
 909 tests (70 new). Phase 4 (the UI) is next; nothing in the browser exposes
 any of this yet.
 
+## 2026-11-28 — Phase 4: the browser UI, and three bugs it exposed
+
+Search, album detail, artist discography, and the requests queue are usable by
+someone who is not holding curl. Nothing here is new *logic* — the point is that
+the phase-1-through-3 machinery had never been driven by the frontend, and
+driving it surfaced three production bugs that 909 green tests did not.
+
+### 1. `/catalog/rails` returned 500
+
+`lb_rails` parsed ListenBrainz popularity as `{mbid: count}`. The live API
+returns a **list of objects**:
+
+```
+[{"artist_mbid": "...", "total_listen_count": 77081947, "total_user_count": 366682}]
+```
+
+The unit tests encoded the same wrong assumption as the code, with fixtures
+written from it, so they passed while the endpoint 500ed on first live call.
+This is the failure mode a fake client invites: it asserts the shape you
+imagined. Both shapes parse now, and the fixtures carry the live payload
+verbatim (with a comment saying so, and where it came from).
+
+### 2. Every rail card rendered a blank title
+
+The fresh-releases feed has **no `release_group_name` field, and no `title`
+either** — zero of 3,597 live rows. Albums are named in `release_name`; the code
+read the two keys that do not exist and fell back to `""`. Same root cause as
+above: the test fixture invented the keys.
+
+Also fixed: 72% of rows carry `caa_release_mbid`, so artwork is now built from
+it directly (CAA redirects to the image, so it is a usable `<img>` src with no
+API call) instead of a per-album Cover Art Archive lookup.
+
+### 3. MusicBrainz was unreachable — a network bug, not a code bug
+
+Every search returned `503 MusicBrainz is busy`. The cause: MusicBrainz resolves
+to a Hetzner IPv6 address first; **Docker's default bridge is IPv4-only**; and
+on this network the IPv4 path to `142.132.241.153` stalls mid-TLS-handshake
+(`unexpected eof while reading`) from the host *and* from containers, while the
+IPv6 path is healthy. PMTU was ruled out (full-size ICMP passes), SNI filtering
+was ruled out (no-SNI handshake to the bare IP fails identically), and no tunnel
+is involved (`ip route` is plain wifi via the router).
+
+Fix: the compose network is dual-stack (`fd00:22:1::/64`). Docker sets up NAT66
+itself — no host firewall or sysctl changes. Both upstreams return 200 from
+inside the container now. Worth remembering: this class of failure looks exactly
+like an application error from the logs, and the app's own 503 mapping is what
+made it look deliberate.
+
+### Fixed while wiring
+
+- **Rails returned 3,597 cards in 37 seconds.** A rail is browsed, not
+  paged. Now sliced to 24 after sorting newest-first, with a 200-row pool for
+  ranking. ~3s.
+- **"Trending" ranked by artist popularity**, so the rail for *new releases*
+  surfaced Queen and Depeche Mode — artists with large back-catalogue followings
+  who happen to have a release this fortnight. It ranks by release-group listens
+  now, which is what the label claims.
+- **Search never used the cache module it imported.** Every debounced query cost
+  a MusicBrainz request. Upstream payloads are cached for 10 minutes; ownership
+  and request badges are deliberately *not* cached, so an album requested a
+  minute ago does not reappear as requestable. The cache key is versioned
+  (`v2`) because the first version of this change was invisible for ten minutes
+  — every query cached under the old behaviour served an empty artist list.
+- **Artist suggestions were only offered when nothing matched.** "twice"
+  returns nine albums titled *Twice* by unrelated artists and buries TWICE;
+  there was no route from that page to the band. The strip is unconditional.
+- **`/auth/me` had no permission fields.** The UI needs `is_owner` to decide
+  whether to show Approve; discovering it from a 403 is a worse answer than not
+  showing the button. Read from the database on every call, never from the JWT.
+- **Retry appeared on approved requests.** Approved requests are already moving
+  — the reconciler owns that, and "Check now" is how you force it. Retry is for
+  `failed`.
+
+### Verified in the browser, end to end
+
+Signed in (token injected into localStorage — no password handled by the
+browser), home rails render with titles and covers; *Season of Bloodshed* opened
+in the modal; **Request album** flipped the badge to **Approved** with "Sent to
+Lidarr, waiting for a download"; the database agreed (`request 1,
+lidarr_album_id 4894`). Requests tab showed the row with owner and relative
+time. Searching "twice" showed the artist strip above the results; clicking
+TWICE opened 39 albums with "9 in your library" and a scope selector that
+re-planned from **2 to request** to **30** on switching to albums+EPs.
+
+Cleanup: the test created artist 506 *and* 5 albums (`POST /album` creates the
+whole discography), all removed; the request row deleted; the queue is empty
+again. The cleanup script guards artist deletion on the artist having been
+created in the last two hours — a sibling-count check would have been wrong,
+because the request produces five siblings, not one.
+
+922 tests (13 new), including `test_catalog_rails.py`, which exercises the rails
+*composition* — the old rails tests mocked the service at the router boundary,
+which is how a 500 hid behind a green suite.
+
 ## 2026-11-28 — Phase 2: the request write-path (music Seerr)
 
 Requests, approval, and the Lidarr push. Everything is keyed by **release-group
