@@ -61,6 +61,25 @@ def _login(client, monkeypatch, mock_navidrome_client):
     return response.json()["access_token"]
 
 
+def _empty_db():
+    """MagicMock DB with no stored config, but a real tenant row.
+
+    get_current_user() loads the User row on every request, so a blanket
+    ``db.get.return_value = None`` now 401s before the endpoint is reached.
+    Only the User lookup is answered; every other model lookup stays None,
+    which is what these tests assert about (no ListenBrainz config stored).
+    """
+    from app.models.database import User
+
+    db = MagicMock()
+    db.get.side_effect = lambda model, key, *a, **k: (
+        User(id=1, username="user", navidrome_url="http://test",
+             navidrome_password="secret")
+        if model is User else None
+    )
+    return db
+
+
 def _headers(token):
     return {"Authorization": f"Bearer {token}"}
 
@@ -80,8 +99,7 @@ class TestGetConfig:
     def test_not_configured(self, client, monkeypatch, mock_navidrome_client):
         token = _login(client, monkeypatch, mock_navidrome_client)
 
-        db = MagicMock()
-        db.get.return_value = None
+        db = _empty_db()
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.get("/api/auth/listenbrainz", headers=_headers(token))
@@ -112,8 +130,7 @@ class TestPutConfig:
     def test_creates_when_absent(self, client, monkeypatch, mock_navidrome_client):
         token = _login(client, monkeypatch, mock_navidrome_client)
 
-        db = MagicMock()
-        db.get.return_value = None
+        db = _empty_db()
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.put(
@@ -180,8 +197,7 @@ class TestTestEndpoint:
 
     def test_requires_config(self, client, monkeypatch, mock_navidrome_client):
         token = _login(client, monkeypatch, mock_navidrome_client)
-        db = MagicMock()
-        db.get.return_value = None
+        db = _empty_db()
         app.dependency_overrides[get_db] = lambda: db
 
         response = client.post("/api/auth/listenbrainz/test", headers=_headers(token))

@@ -55,13 +55,23 @@ router = APIRouter()
 
 # ── JWT auth dependency ──────────────────────────────────────────────────────
 
-async def get_current_user(authorization: str | None = Header(default=None)) -> dict:
+async def get_current_user(authorization: str | None = Header(default=None),
+                           db: Session = Depends(get_db)) -> dict:
     """Verify the JWT and return the *tenant*, not just the login name.
 
     Returns a dict with 'id', 'username' and 'navidrome_url'; 'id' is what
     callers scope queries by. Tokens minted before multi-user support carry no
     'uid' and are rejected rather than silently treated as user 1 — scoping to
     the wrong tenant is worse than a 401.
+
+    The token is checked against the database, not trusted on its own. A
+    signature proves who signed in, not that the account still exists: removing
+    a household member deleted their row but left their token working for the
+    rest of its 24 hours, verified live against a deleted account — `/api/auth/me`
+    and `/api/library/stats` both answered 200, and endpoints that join on the
+    user row 500'd. A deleted user must be a 401 on the next request, and the
+    username and library URL come from the row so a renamed or repointed user is
+    not served stale claims.
     """
     if authorization is None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -77,10 +87,17 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
             status_code=401,
             detail="Token predates multi-user support — please log in again",
         )
+
+    user = db.get(User, uid)
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="This account no longer exists — please log in again",
+        )
     return {
-        "id": uid,
-        "username": payload.get("sub", "unknown"),
-        "navidrome_url": payload.get("url", ""),
+        "id": user.id,
+        "username": user.username,
+        "navidrome_url": user.navidrome_url or "",
     }
 
 

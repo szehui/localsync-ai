@@ -5,6 +5,153 @@ import React from 'react';
 const cx = (...classes: (string | boolean | undefined | null)[]) =>
   classes.filter(Boolean).join(' ');
 
+/**
+ * Horizontal rail with visible affordances.
+ *
+ * `overflow-x-auto` alone is not a control. It rendered cards clipped at the
+ * right edge with a 15px scrollbar in near-black on the dark theme, so a mouse
+ * user — no horizontal wheel, no touch — had no way to reach the rest of the
+ * row. The row was visibly truncating and visibly un-scrollable, which reads as
+ * a bug rather than as content.
+ *
+ * Three affordances, because they cover different input devices:
+ *   - Prev/next buttons: mouse users, and they double as a hint that the row
+ *     continues.
+ *   - An edge fade: passive signal that there is more off-screen.
+ *   - The native scrollbar, kept and styled: trackpad/touch users already have
+ *     the gesture, and the thumb shows position in the row.
+ *
+ * Buttons are hidden when the rail cannot scroll in that direction, so a short
+ * row does not sprout dead controls. Scroll position is measured on scroll,
+ * resize and child-size changes (cards load artwork asynchronously and change
+ * the row's width after mount).
+ */
+export function Rail({ children, className = '', label }: {
+  children: React.ReactNode;
+  className?: string;
+  label?: string;
+}) {
+  const ref = React.useRef<HTMLDivElement>(null);
+  const [edges, setEdges] = React.useState({ left: false, right: false });
+
+  const measure = React.useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const left = el.scrollLeft > 1;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
+    setEdges((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
+  }, []);
+
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    measure();
+    el.addEventListener('scroll', measure, { passive: true });
+    window.addEventListener('resize', measure);
+    // Cards resize after their artwork loads; the observer keeps the arrows
+    // correct instead of relying on a mount-time measurement.
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    Array.from(el.children).forEach((child) => observer.observe(child));
+    return () => {
+      el.removeEventListener('scroll', measure);
+      window.removeEventListener('resize', measure);
+      observer.disconnect();
+    };
+  }, [measure, children]);
+
+  const scrollBy = (direction: 1 | -1) => {
+    const el = ref.current;
+    if (!el) return;
+    // Most of a viewport per press: a full page risks landing on a card
+    // boundary that looks like nothing happened.
+    const step = Math.max(Math.round(el.clientWidth * 0.8), 240);
+    const max = el.scrollWidth - el.clientWidth;
+    const target = Math.min(Math.max(el.scrollLeft + direction * step, 0), max);
+
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      el.scrollLeft = target;
+    } else {
+      // A smooth scroll is not guaranteed to happen: it is a silent no-op in
+      // headless browsers and GPU-less sessions, and there is no promise to
+      // await. Verified the hard way — the handler fired and scrollLeft stayed
+      // at 0. So attempt the animation, then confirm it moved and fall back to
+      // an instant jump. A dead-looking arrow is worse than a jump cut.
+      const start = el.scrollLeft;
+      el.scrollBy({ left: direction * step, behavior: 'smooth' });
+      window.setTimeout(() => {
+        if (Math.abs(el.scrollLeft - start) < 2) el.scrollLeft = target;
+      }, 200);
+    }
+
+    // Derived from where we are going, not from a scroll event. Scroll events
+    // are not dependable: this renderer dispatched none at all while
+    // scrollLeft changed by 1,000px (an independent listener counted zero),
+    // and coalescing can drop the last one. Waiting to be told left the
+    // "previous" arrow permanently missing.
+    setEdges({ left: target > 1, right: target < max - 1 });
+  };
+
+  return (
+    <div className="relative group/rail">
+      <div
+        ref={ref}
+        role="group"
+        aria-label={label}
+        tabIndex={0}
+        className={cx(
+          'flex gap-3 overflow-x-auto pb-3 -mx-1 px-1 rounded-lg',
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60',
+          // Scrollbar styling is global (index.css) so every scroller matches.
+          className,
+        )}
+      >
+        {children}
+      </div>
+
+      {edges.left && (
+        <>
+          <div className="pointer-events-none absolute inset-y-0 left-0 w-12 bg-gradient-to-r from-surface to-transparent" />
+          <RailButton direction="left" onClick={() => scrollBy(-1)} label={label} />
+        </>
+      )}
+      {edges.right && (
+        <>
+          <div className="pointer-events-none absolute inset-y-0 right-0 w-12 bg-gradient-to-l from-surface to-transparent" />
+          <RailButton direction="right" onClick={() => scrollBy(1)} label={label} />
+        </>
+      )}
+    </div>
+  );
+}
+
+function RailButton({ direction, onClick, label }: {
+  direction: 'left' | 'right';
+  onClick: () => void;
+  label?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Scroll ${direction}${label ? ` ${label}` : ''}`}
+      className={cx(
+        'absolute top-1/2 -translate-y-1/2 z-10',
+        'h-9 w-9 rounded-full flex items-center justify-center',
+        'bg-surface-overlay/90 backdrop-blur border border-surface-border text-white',
+        'shadow-lg shadow-black/40 hover:bg-surface-highlight hover:border-accent/60',
+        'transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+        direction === 'left' ? 'left-1' : 'right-1',
+      )}
+    >
+      <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor"
+           strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <polyline points={direction === 'left' ? '15 18 9 12 15 6' : '9 18 15 12 9 6'} />
+      </svg>
+    </button>
+  );
+}
+
 export function Card({ children, className = '', hover = false }: { children: React.ReactNode; className?: string; hover?: boolean }) {
   return (
     <div

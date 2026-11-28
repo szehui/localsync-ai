@@ -8,7 +8,7 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.ts';
 import type { CatalogCard, RailsResponse } from '../types.ts';
-import { Card, EmptyState, SectionHeader, Spinner } from '../components.tsx';
+import { Card, EmptyState, Rail, SectionHeader, Spinner } from '../components.tsx';
 import { AlbumCard } from '../catalog.tsx';
 
 interface Props {
@@ -82,7 +82,7 @@ export function CatalogHome({ onOpenAlbum, onOpenArtist, onGoToSearch }: Props) 
       {sections.map((section) => (
         <div key={section.key} className="space-y-2">
           <h3 className="text-sm font-medium text-gray-300">{section.title}</h3>
-          <div className="flex gap-3 overflow-x-auto pb-2 -mx-1 px-1">
+          <Rail label={section.title}>
             {section.cards.map((card) => (
               <AlbumCard
                 key={`${section.key}-${card.release_group_mbid}`}
@@ -92,7 +92,7 @@ export function CatalogHome({ onOpenAlbum, onOpenArtist, onGoToSearch }: Props) 
                 rail
               />
             ))}
-          </div>
+          </Rail>
         </div>
       ))}
     </div>

@@ -126,7 +126,12 @@ def _auth_header(token):
 
 
 def _token_for(uid, username="ghost", url="http://test"):
-    """Mint a valid token for a tenant that may not exist in the DB."""
+    """Mint a valid token for a tenant.
+
+    Note this only signs the claims: the API now also checks the tenant row
+    still exists, so a token minted here authenticates only if a matching row
+    is in the DB (see _ghost_tenant).
+    """
     from app.config import settings
 
     return jwt.encode(
@@ -134,6 +139,21 @@ def _token_for(uid, username="ghost", url="http://test"):
         settings.jwt_secret_key,
         algorithm=settings.jwt_algorithm,
     )
+
+
+def _ghost_tenant(db, uid=999, username="ghost", url="http://test"):
+    """Create the tenant row a bare token needs to authenticate.
+
+    Tests that only care about "a user with no stored credentials" mint a token
+    rather than logging in. That token is now checked against the users table,
+    so the row has to exist — an id with no row is exactly the deleted-account
+    case, which must 401.
+    """
+    if db.get(User, uid) is None:
+        db.add(User(id=uid, username=username, navidrome_url=url,
+                    navidrome_password="secret", is_owner=False))
+        db.commit()
+    return uid
 
 
 def _decode(token):
@@ -311,7 +331,7 @@ def test_get_current_user_returns_id(client, monkeypatch, db):
     token, _nav = _login_as(client, monkeypatch, db)
     uid = _decode(token)["uid"]
 
-    user = asyncio.run(get_current_user(authorization=f"Bearer {token}"))
+    user = asyncio.run(get_current_user(authorization=f"Bearer {token}", db=db))
     assert user["id"] == uid
     assert user["username"] == "user"
     assert user["navidrome_url"] == "http://test"
@@ -375,7 +395,7 @@ def test_connection_status_not_configured(client, monkeypatch, db):
     nav = AsyncMock()
     _patch_navidrome(monkeypatch, lambda *args, **kwargs: nav)
 
-    response = client.get("/api/auth/status", headers=_auth_header(_token_for(999)))
+    response = client.get("/api/auth/status", headers=_auth_header(_token_for(_ghost_tenant(db))))
     assert response.status_code == 200
     data = response.json()
     assert data["connected"] is False
@@ -427,7 +447,7 @@ def test_connection_status_unreachable_server(client, monkeypatch, db):
 
 def test_sync_status_not_connected(client, monkeypatch, db):
     """Sync status with no service for this tenant reports 'Not connected'."""
-    token = _token_for(999)
+    token = _token_for(_ghost_tenant(db))
 
     response = client.get("/api/auth/sync-status", headers=_auth_header(token))
     assert response.status_code == 200
@@ -517,11 +537,22 @@ def test_status_and_sync_status_are_per_caller(client, monkeypatch, db):
 
 
 def test_sync_not_connected(client, monkeypatch, db):
-    """Sync endpoint returns 400 when the tenant has no usable client."""
-    nav = AsyncMock()
-    _patch_navidrome(monkeypatch, lambda *args, **kwargs: nav)
+    """Sync endpoint returns 400 when the tenant has no usable client.
 
-    response = client.post("/api/auth/sync", headers=_auth_header(_token_for(999)))
+    This used to pass a token for a user id with no row, and got its 400 from
+    the missing row. That case is now a 401 (a deleted account), so the error
+    path is exercised where it actually lives: client construction failing.
+    """
+    token, _nav = _login_as(client, monkeypatch, db)
+
+    async def _no_client(*args, **kwargs):
+        raise RuntimeError("no stored credentials")
+
+    import app.routers.auth as auth_module
+
+    monkeypatch.setattr(auth_module, "get_client", _no_client)
+
+    response = client.post("/api/auth/sync", headers=_auth_header(token))
     assert response.status_code == 400
     assert "Not connected to Navidrome" in response.json()["detail"]
 
@@ -761,3 +792,44 @@ def test_listenbrainz_config_is_per_user(client, monkeypatch, db):
 
     assert client.delete("/api/auth/listenbrainz", headers=_auth_header(token_a)).status_code == 200
     assert client.get("/api/auth/listenbrainz", headers=_auth_header(token_a)).json()["configured"] is False
+
+
+# ─── Deleted accounts ───────────────────────────────────────────────────────
+
+
+def test_token_for_deleted_user_is_rejected(client, monkeypatch, db):
+    """A valid token must stop working when its tenant row is gone.
+
+    Found live: deleting the probe account from the Phase 5 verification left
+    its token authenticating — /api/auth/me and /api/library/stats answered 200
+    for a user that no longer existed, and endpoints joining on the user row
+    500'd. Signature validity is not authorisation; the row has to exist.
+    """
+    token, _nav = _login_as(client, monkeypatch, db)
+    uid = _decode(token)["uid"]
+    assert client.get("/api/auth/me", headers=_auth_header(token)).status_code == 200
+
+    db.query(User).filter(User.id == uid).delete()
+    db.commit()
+
+    response = client.get("/api/auth/me", headers=_auth_header(token))
+    assert response.status_code == 401
+    assert "no longer exists" in response.json()["detail"]
+
+
+def test_token_for_never_existing_user_is_rejected(client, monkeypatch, db):
+    """A signed token for an id that was never issued does not authenticate."""
+    response = client.get("/api/auth/me", headers=_auth_header(_token_for(4242)))
+    assert response.status_code == 401
+    assert "no longer exists" in response.json()["detail"]
+
+
+def test_deleted_user_token_cannot_read_other_endpoints(client, monkeypatch, db):
+    """The check is in the shared dependency, so every router is covered."""
+    token, _nav = _login_as(client, monkeypatch, db)
+    uid = _decode(token)["uid"]
+    db.query(User).filter(User.id == uid).delete()
+    db.commit()
+
+    for path in ("/api/auth/sync-status", "/api/auth/listenbrainz"):
+        assert client.get(path, headers=_auth_header(token)).status_code == 401, path

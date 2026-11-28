@@ -1,3 +1,39 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* Dark-theme scrollbars.
+ *
+ * Without this the browser paints its default light scrollbar, which showed up
+ * as a bright band under the nav (it is an overflow-x-auto strip) and down the
+ * right edge of an otherwise near-black UI. Styling it once here covers every
+ * scroller, including the album rails, instead of each component having to ask
+ * for it.
+ */
+@layer base {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #323236 transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track,
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: #323236;
+    border: 2px solid transparent;
+    border-radius: 9999px;
+    background-clip: padding-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background-color: #4a4a51;
+  }
+}
