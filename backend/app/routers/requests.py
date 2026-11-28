@@ -185,6 +185,29 @@ async def plan_artist_request(
         raise _error(exc)
 
 
+@router.post("/sync")
+async def sync_requests(
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reconcile every in-flight request now, instead of waiting for the cycle.
+
+    Owner-only: it is one shared query against Lidarr, and a household member
+    hammering it is throttling for everyone else's downloads. Declared before
+    the ``/{request_id}`` routes so "sync" is never parsed as an id.
+    """
+    caller = db.get(User, user["id"])
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Unknown user")
+    if not caller.is_owner:
+        raise HTTPException(status_code=403,
+                            detail="Only the owner can trigger a sync")
+
+    from app.services.request_sync import reconcile_open_requests
+
+    return await reconcile_open_requests(db)
+
+
 @router.get("/{request_id}", response_model=RequestResponse)
 async def get_request(
     request_id: int,

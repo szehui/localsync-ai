@@ -11,7 +11,7 @@ from app.routers import auth, library, playlists, triggers
 from app.routers import youtube_import, discovery, catalog
 from app.routers import requests as requests_router
 from app.config import settings
-from app.services.scheduler import init_scheduler, add_trigger_job
+from app.services.scheduler import init_scheduler, add_trigger_job, add_request_sync_job
 from app.services.lidarr import LidarrService
 
 logging.basicConfig(level=logging.INFO)
@@ -64,6 +64,13 @@ async def lifespan(app: FastAPI):
 
     # Load existing trigger jobs from DB
     load_existing_triggers()
+
+    # Keep request status honest against Lidarr and the library. Registered
+    # after the scheduler starts; the cycle short-circuits when nothing is open.
+    try:
+        add_request_sync_job()
+    except Exception as exc:  # noqa: BLE001 - a bad reconciler must not stop startup
+        logger.warning("Could not schedule the request reconciler: %s", exc)
 
     # Try to restore Lidarr connection from saved config
     from app.models.database import LidarrConfig

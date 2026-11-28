@@ -1,5 +1,53 @@
 # LocalSync AI — Development Log
 
+## 2026-11-28 — Phase 3: status truth
+
+Requests now report what is *true* instead of what was asked for. A row moves
+`approved → downloading → imported → available`, and every step is evidence from
+Lidarr or the library, never from the request itself.
+
+**The failure mode this exists to prevent.** Phase 2 could say "approved" and
+mean nothing: Lidarr accepted the album, then found no release, and the row sat
+there forever. Worse, `POST /album` makes Lidarr create the artist *and* its
+whole discography, so a matching album row can exist having never been asked for.
+An album row is not evidence. Album **statistics** are.
+
+**One fetch each, not one per request.** The queue (42 records live) and the
+history (43,749 records, top 100 read) are pulled once per cycle and indexed by
+album id. Ten open requests used to mean ten identical queue pulls.
+
+**The ladder only goes up.** Lidarr removes a record from the queue *before* the
+importer writes the files, so a cycle that sees an empty queue and no files must
+not demote `downloading` to `approved`. `failed` is the one state that can be
+left, and only on positive evidence (files appeared) — silence never undoes a
+failure, because that is what the retry action is for.
+
+**Honest about the last mile.** Files in Lidarr but not yet scanned by Navidrome
+is `imported`, not `available`: the library cannot play it. Verified live on
+*Coldplay — A Rush of Blood to the Head*, which Lidarr holds completely and
+Navidrome does not have — one instance of the pre-existing 499-album gap, now
+visible instead of invisible.
+
+**Two real bugs found on the way.** `catalog.OPEN_STATUSES` read
+`("pending", "approved", "processing")` — `processing` is not a status in this
+state machine, and `downloading`/`imported` were missing, so a card for an album
+already being downloaded still offered "Request". It is now derived from the one
+status machine in `services/requests.py`. And `albumImportIncomplete` fires on
+every partial import (3 of the 5 most recent live history events) — treating it
+as a failure would have marked healthy downloads dead.
+
+**Deliberate deviation:** a vanished album is reported `failed` ("no longer in
+Lidarr — retry to add it again") rather than silently re-added. Re-adding an
+album someone deleted in Lidarr is resurrecting content they removed on purpose.
+
+Deployed and verified live: `available` via MBID evidence (TWICE — *&TWICE*),
+`downloading` from the real queue (*2Pac — Better Dayz*), `imported`
+(*A Rush of Blood to the Head*), second cycle changed 0, idle cycle returns zeros
+in 33 ms with no Lidarr calls, `POST /api/requests/sync` owner-only (401 anon).
+
+909 tests (70 new). Phase 4 (the UI) is next; nothing in the browser exposes
+any of this yet.
+
 ## 2026-11-28 — Phase 2: the request write-path (music Seerr)
 
 Requests, approval, and the Lidarr push. Everything is keyed by **release-group

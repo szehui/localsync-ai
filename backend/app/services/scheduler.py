@@ -1499,3 +1499,44 @@ def resume_trigger_job(trigger_id: int):
         logger.info(f"Resumed scheduler job {job_id}")
     except Exception:
         pass
+
+
+# ─── Request reconciliation ──────────────────────────────────────────────────
+
+# How often open requests are re-checked against Lidarr and the library. Five
+# minutes is the useful resolution for a download that takes tens of minutes,
+# and an idle household costs nothing: the cycle returns before touching Lidarr
+# when no request is in flight.
+REQUEST_SYNC_MINUTES = 5
+REQUEST_SYNC_JOB_ID = "request-reconcile"
+
+
+def add_request_sync_job(minutes: int = REQUEST_SYNC_MINUTES) -> bool:
+    """Register the recurring request-status reconciler.
+
+    `coalesce` collapses missed runs into one (a laptop suspended overnight
+    should not fire twelve catch-up cycles), and `max_instances=1` stops a slow
+    cycle from overlapping the next one and double-writing a row.
+
+    Returns False when the scheduler is not running, which is the case in tests
+    and in any command that imports the app without starting it.
+    """
+    from app.services.request_sync import reconcile_job
+
+    try:
+        sched = _get_scheduler()
+    except RuntimeError:
+        logger.debug("Request reconciler not registered: scheduler is not running")
+        return False
+
+    sched.add_job(
+        reconcile_job,
+        trigger="interval",
+        minutes=minutes,
+        id=REQUEST_SYNC_JOB_ID,
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+    )
+    logger.info("Request reconciler scheduled every %d minutes", minutes)
+    return True

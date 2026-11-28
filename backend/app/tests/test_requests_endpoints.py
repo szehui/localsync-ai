@@ -344,3 +344,43 @@ def test_artist_request_creates_children_and_reports_rollup(client, db, monkeypa
     detail = client.get(f"/api/requests/{created['id']}").json()
     assert len(detail["children"]) == 2
     assert {c["release_group_mbid"] for c in detail["children"]} == {"rg-a", "rg-b"}
+
+
+# ── Manual reconciliation ───────────────────────────────────────────────────
+
+
+def test_sync_is_owner_only(client, people):
+    as_guest(people)
+    assert client.post("/api/requests/sync").status_code == 403
+
+
+def test_sync_reports_counts(client, monkeypatch):
+    from app.services import request_sync
+
+    calls = {}
+
+    async def fake_reconcile(db, **kwargs):
+        calls["ran"] = True
+        return {"total": 3, "changed": 2, "failed": 1}
+
+    monkeypatch.setattr(request_sync, "reconcile_open_requests", fake_reconcile)
+
+    response = client.post("/api/requests/sync")
+
+    assert response.status_code == 200
+    assert response.json() == {"total": 3, "changed": 2, "failed": 1}
+    assert calls.get("ran") is True
+
+
+def test_sync_is_not_shadowed_by_the_id_route(client, monkeypatch):
+    """"sync" must never be parsed as a request id."""
+    from app.services import request_sync
+
+    monkeypatch.setattr(
+        request_sync, "reconcile_open_requests",
+        AsyncMock(return_value={"total": 0, "changed": 0, "failed": 0}))
+
+    response = client.post("/api/requests/sync")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == 0

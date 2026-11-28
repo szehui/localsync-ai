@@ -872,6 +872,29 @@ message and no Lidarr call.
 
 # Phase 3 — Status truth
 
+> **Status: shipped 2026-11-28.** All three tasks complete, 909 tests passing,
+> deployed, verified live against real Lidarr (4,753 albums, 42-item queue) and
+> the real library (2,069 tagged albums). Deviations from the plan as written:
+> - **A vanished album is not auto-re-added.** The plan called for one re-add
+>   then `failed`; instead the reconciler marks `failed` with "no longer in
+>   Lidarr — retry to add it again" and leaves re-adding to the owner's retry
+>   action. Silently resurrecting an album somebody deleted in Lidarr is worse
+>   than reporting it.
+> - **`failed` rows stay watched for 30 days** (when Lidarr still has the album).
+>   Lidarr's own RSS/auto-search can deliver after our attempt failed, and a
+>   request that quietly became available should say so. The plan only
+>   reconciled "open" requests, which would have left those rows frozen.
+> - **`albumImportIncomplete` is not treated as a failure.** It fires on every
+>   partial import — it was 3 of the 5 most recent history events on the live
+>   instance — and album statistics describe that case more precisely.
+> - **`catalog.OPEN_STATUSES` was wrong and is now derived.** It read
+>   `("pending", "approved", "processing")`: `processing` is not a status in the
+>   machine, and `downloading`/`imported` were missing, so a card for an album
+>   already downloading offered "Request" again.
+> - **Track-count agreement is only enforced when a count is known.** `requests`
+>   has no `song_count` column, so with no Lidarr row there is nothing to compare
+>   and the folded-name path stays permissive — the same call the cards make.
+
 ### Task 3.1: Reconciler
 
 **Files:** Create `backend/app/services/request_sync.py`; test `test_request_sync.py`

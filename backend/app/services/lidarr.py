@@ -356,6 +356,60 @@ class LidarrService:
             return rows[0]
         return None
 
+    # ── Status truth ────────────────────────────────────────────────────────
+    #
+    # The reconciler needs the queue and history, and it needs each exactly
+    # once per cycle rather than once per open request: a household with ten
+    # pending requests would otherwise pull the same 42-record queue ten times.
+
+    async def get_queue(self, page_size: int = 200, max_pages: int = 5) -> List[Dict[str, Any]]:
+        """Every record currently in Lidarr's download queue.
+
+        `status` is the coarse state (downloading / delay / queued) and
+        `trackedDownloadState` is the importer's view, which is null for
+        records that have not reached the importer yet — so the reconciler
+        treats presence in the queue as "downloading" and lets album
+        statistics decide when files have actually landed.
+        """
+        records: List[Dict[str, Any]] = []
+        page = 1
+        while page <= max_pages:
+            body = await self._request(
+                "GET", "queue",
+                params={"page": page, "pageSize": page_size,
+                        "includeUnknownArtistItems": "true"},
+            )
+            batch = (body or {}).get("records") or []
+            records.extend(batch)
+            total = (body or {}).get("totalRecords")
+            # Stop on a short page, or when the server says we have it all.
+            if len(batch) < page_size or (total is not None and len(records) >= total):
+                break
+            page += 1
+        return records
+
+    async def get_history(self, page_size: int = 100) -> List[Dict[str, Any]]:
+        """The most recent history events, newest first.
+
+        Deliberately not paginated deep: the reconciler only cares about
+        failures newer than a request's `requested_at`, and those are recent
+        by definition. A 43k-record history would otherwise be walked every
+        five minutes to answer a question about the last few hours.
+        """
+        body = await self._request(
+            "GET", "history",
+            params={"page": 1, "pageSize": page_size,
+                    "sortKey": "date", "sortDirection": "descending"},
+        )
+        return (body or {}).get("records") or []
+
+    async def delete_album(self, album_id: int, delete_files: bool = False) -> Any:
+        """Remove an album entry. `delete_files=False` leaves downloads alone."""
+        return await self._request(
+            "DELETE", f"album/{album_id}",
+            params={"deleteFiles": str(delete_files).lower()},
+        )
+
     async def collapse_artist_monitoring(self, artist_id: int,
                                          keep_album_id: Optional[int] = None,
                                          attempts: int = 4,

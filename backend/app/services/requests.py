@@ -59,6 +59,32 @@ logger = logging.getLogger(__name__)
 # through.
 CLOSED_STATUSES = ("denied", "cancelled")
 
+# The positive complement, for readers that need "is this still in flight?".
+# Terminal-in-truth `denied`/`cancelled`/`failed` are excluded, and so is
+# `available` (the album is in the library, so a card shows it as owned rather
+# than as someone's open request). Derived rather than written out, so it cannot
+# drift from CLOSED_STATUSES.
+ALL_STATUSES = ("pending", "approved", "downloading", "partially_available",
+                "imported", "available", "failed", "denied", "cancelled")
+OPEN_STATUSES = tuple(
+    s for s in ALL_STATUSES
+    if s not in CLOSED_STATUSES and s not in ("available", "failed")
+)
+
+# How far forward a request may travel. The reconciler will not move a row
+# backwards: an `available` album that Lidarr briefly forgets is still in the
+# library, and a `downloading` row must not fall back to `approved` just because
+# the queue listing was empty for one cycle (Lidarr swaps records between the
+# queue and the importer). `failed` is handled separately — see `_may_advance`.
+STATUS_RANK = {
+    "pending": 0,
+    "approved": 1,
+    "downloading": 2,
+    "partially_available": 3,
+    "imported": 4,
+    "available": 5,
+}
+
 # A single artist request expanding to hundreds of albums is either a mistake or
 # a data problem (a bogus via-alias). 100 is generous for a discography and small
 # enough that the expansion is reviewable before approval.

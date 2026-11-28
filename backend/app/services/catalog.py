@@ -32,6 +32,7 @@ from app.services.musicbrainz import (
     first_release_year,
     is_requestable,
 )
+from app.services.requests import OPEN_STATUSES
 from app.services.title_norm import album_key
 
 logger = logging.getLogger(__name__)
@@ -40,35 +41,86 @@ logger = logging.getLogger(__name__)
 # the user cannot see is a request nobody needed.
 COVER_LIMIT = 10
 
-OPEN_STATUSES = ("pending", "approved", "processing")
+# A name match is allowed to be one track off. Different editions of the same
+# album routinely differ by a bonus track, and refusing those would report a
+# genuinely owned album as missing.
+TRACK_COUNT_TOLERANCE = 1
+
+# Every status in which a release group is still "spoken for". The definition
+# lives with the status machine in services.requests, so a card badge, the
+# request list and the partial unique index cannot disagree about whether a
+# second ask is a duplicate.
 
 
 # ── Ownership and requests ──────────────────────────────────────────────────
 
 
 class OwnershipIndex:
-    """Which library albums exist, by MBID and by folded artist|album."""
+    """Which library albums exist, by MBID and by folded artist|album.
 
-    def __init__(self, mbids: set[str], names: set[str]):
-        self.mbids = mbids
-        self.names = names
+    The name path optionally requires track-count agreement. Titles repeat
+    across editions and artists release live/remaster versions of the same
+    album, so `artist|title` alone reports "owned" for things that are not
+    there; a track count within one of what MusicBrainz says turns that into a
+    real match. Cards pass no count (they would need an extra MB call per
+    result) and so keep the looser behaviour; the reconciler always passes the
+    count Lidarr reports, because there a false "available" is a lie to the
+    person waiting on the request.
+    """
 
-    def lookup(self, release_group_mbid: Optional[str], artist: str, title: str):
+    def __init__(self, rows: Iterable[tuple]):
+        # rows: (release_group_mbid, artist_name, album_name, song_count)
+        self.mbids: set[str] = set()
+        self.names: dict[str, list[int]] = {}
+        for mbid, artist, name, song_count in rows:
+            if mbid:
+                self.mbids.add(mbid)
+            if name:
+                key = album_key(artist or "", name)
+                self.names.setdefault(key, []).append(song_count or 0)
+
+    def lookup(self, release_group_mbid: Optional[str], artist: str, title: str,
+               song_count: Optional[int] = None):
+        """Return ``(owned, evidence)`` where evidence is ``"mbid"``/``"name"``."""
         if release_group_mbid and release_group_mbid in self.mbids:
             return True, "mbid"
-        if album_key(artist or "", title or "") in self.names:
+        if not title:
+            return False, None
+        counts = self.names.get(album_key(artist or "", title))
+        if counts is None:
+            return False, None
+        if song_count is None:
+            return True, "name"
+        if any(abs(have - song_count) <= TRACK_COUNT_TOLERANCE for have in counts):
             return True, "name"
         return False, None
 
 
 def ownership_index(db: Session) -> OwnershipIndex:
-    rows = db.query(Album.release_group_mbid, Album.artist_name, Album.name).all()
-    mbids = {row[0] for row in rows if row[0]}
-    names = set()
-    for _, artist, name in rows:
-        if name:
-            names.add(album_key(artist or "", name))
-    return OwnershipIndex(mbids, names)
+    rows = db.query(
+        Album.release_group_mbid, Album.artist_name, Album.name, Album.song_count
+    ).all()
+    return OwnershipIndex(rows)
+
+
+def library_has_release_group(
+    db: Session,
+    release_group_mbid: Optional[str],
+    artist: str,
+    title: str,
+    song_count: Optional[int] = None,
+    *,
+    index: Optional[OwnershipIndex] = None,
+) -> Optional[str]:
+    """The single availability predicate: ``"mbid"``, ``"name"`` or ``None``.
+
+    Both the catalog cards and the request reconciler come through here, so the
+    ``In library`` badge in search and the ``available`` status on a request
+    cannot be computed two different ways.
+    """
+    index = index or ownership_index(db)
+    owned, evidence = index.lookup(release_group_mbid, artist, title, song_count)
+    return evidence if owned else None
 
 
 def _open_requests(db: Session, mbids: Iterable[str]) -> dict[str, dict]:
