@@ -71,6 +71,39 @@ not re-ranked by popularity, so a user searching "Random Access Memories" sees t
 cover versions before Daft Punk's. Worth a ListenBrainz-popularity re-rank once the
 rails have cache warmed.
 
+### Deployed and run against production (same day)
+Rebuilt the container from `77441dd` and ran the backfill in place. The migration
+added the five `albums` columns and both new tables on the live DB without incident
+(backup at `~/localsync-db-backup-20261127-201148.db`).
+
+| tier | albums resolved | MusicBrainz calls |
+|---|---|---|
+| Navidrome tags | 1,322 | 0 |
+| Lidarr oracle | 1,030 (17 ambiguous skipped, 758 unmatched) | 0 |
+| MusicBrainz tail | 42 (39 high, 3 medium) | ~600, 178 artists |
+| **total** | **2,394 of 3,127 = 76.6 %** | |
+
+The tail's 471 `skipped_singles` and 168 `unmatched` are the structural floor
+predicted in Phase 0. `never_checked` is now 0, so re-runs are no-ops unless
+`--retry-failed` is passed.
+
+**Live ownership verified** against the real library: `Hot Space` (Queen),
+`(What's the Story) Morning Glory?` (Oasis), `Good Girl Gone Bad` (Rihanna) and
+`Hysteria` (Def Leppard) all report `owned: true, owned_via: "mbid"`, while
+`Good Girl Gone Bad Live` and `Good Girl Gone Bad: The Remixes` correctly report
+not-owned. App health held at 2–3 ms throughout the backfill's writes, and
+`/api/catalog/*` answers 401 unauthenticated while unknown paths answer 404.
+
+### Gap found in production (pre-existing, not caused by this work)
+The `albums` table holds 3,127 rows but Navidrome reports 3,626 albums: Subsonic's
+`getAlbumList2` omits ~499 albums that the native API knows about. Those albums are
+invisible to the whole app (playlists too), and since `full_sync` prunes anything
+Subsonic did not return, inserting them from the native pass would be undone on the
+next sync. Ownership therefore cannot report 14 % of the library — worth
+root-causing separately (likely albums whose files are missing, or a music-folder
+visibility difference) rather than papered over here.
+
+
 ## 2026-11-27 — Multi-user support
 
 Household members now get their own playlists, from their own listening history.
