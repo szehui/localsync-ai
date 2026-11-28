@@ -102,9 +102,24 @@ class TestGetOrCreateUser:
         assert refreshed.navidrome_password == "sze-pass"
         assert refreshed.username == "sze"
 
-    def test_same_username_different_server_is_two_users(self, db):
+    def test_same_username_different_server_is_refused(self, db):
+        """Reverses the earlier (url, username) contract, on production evidence.
+
+        Same server at a different address produced an empty duplicate tenant
+        with none of the user's history. Refusing is recoverable; see
+        UsernameOnOtherUrl.
+        """
+        users_service.get_or_create_user(db, "http://a", "sze", "pw")
+        with pytest.raises(users_service.UsernameOnOtherUrl) as exc:
+            users_service.get_or_create_user(db, "http://b", "sze", "pw")
+
+        assert exc.value.existing_url == "http://a"
+        assert db.query(User).count() == 1
+
+    def test_different_username_on_different_server_is_allowed(self, db):
+        """Two real servers still work, as long as the usernames differ."""
         a = users_service.get_or_create_user(db, "http://a", "sze", "pw")
-        b = users_service.get_or_create_user(db, "http://b", "sze", "pw")
+        b = users_service.get_or_create_user(db, "http://b", "rebecca", "pw")
 
         assert a.id != b.id
         assert db.query(User).count() == 2

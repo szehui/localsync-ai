@@ -39,8 +39,13 @@ class User(Base):
     different Navidrome instance; auth itself is still delegated to Navidrome,
     so the password here is only replayed when the backend talks upstream.
 
-    (navidrome_url, username) is unique rather than username alone: the same
-    username on two servers is two distinct tenants.
+    The unique constraint is (navidrome_url, username), but that pair is *not*
+    how identity is decided at login: a username registered at one URL refuses
+    login at another (``UsernameOnOtherUrl``) rather than minting a second
+    tenant. One Navidrome server is routinely reachable at two addresses — the
+    public hostname and a LAN IP — and the constraint cannot tell that apart
+    from a genuinely different server. Silently creating the duplicate gave the
+    user an empty account with no play history and no discovery seeds.
     """
     __tablename__ = "users"
     __table_args__ = (UniqueConstraint("navidrome_url", "username", name="uq_users_url_username"),)

@@ -94,11 +94,15 @@ def _login_as(
     username="user",
     url="http://test",
     version="0.50.0",
+    expect=200,
 ):
     """Log in for real and return (token, navidrome mock).
 
     The mock is built per call so two logins in one test get distinct clients —
     which is what makes the per-caller assertions meaningful.
+
+    Pass ``expect`` to assert a refusal instead; the raw response is returned
+    then, since there is no token to hand back.
     """
     nav = AsyncMock()
     nav.ping.return_value = {"version": version}
@@ -106,6 +110,9 @@ def _login_as(
 
     creds = LoginRequest(url=url, username=username, password="pass")
     response = client.post("/api/auth/login", json=creds.model_dump())
+    if expect != 200:
+        assert response.status_code == expect, f"Expected {expect}: {response.text}"
+        return response
     assert response.status_code == 200, f"Login failed: {response.text}"
     return response.json()["access_token"], nav
 
@@ -214,10 +221,30 @@ def test_second_login_creates_second_user(client, monkeypatch, db):
     assert {u.username for u in users} == {"user", "other"}
 
 
-def test_same_username_two_servers_is_two_tenants(client, monkeypatch, db):
-    """(url, username) is the tenant key — not username alone."""
+def test_same_username_other_url_is_refused_not_duplicated(client, monkeypatch, db):
+    """A second URL for an existing username is refused, not minted as a tenant.
+
+    This reverses the original multi-user contract, on evidence: the same
+    Navidrome server is commonly reached at two addresses (public hostname and
+    LAN IP), and logging in at the second one silently created an empty tenant
+    with no play history, no discovery seeds and no playlists. Refusing the
+    login and naming the existing URL is recoverable; a silent second account
+    is not. Genuinely separate servers still work, provided the usernames
+    differ — see test_different_username_on_other_url_is_created.
+    """
     _login_as(client, monkeypatch, db, username="user", url="http://a")
-    _login_as(client, monkeypatch, db, username="user", url="http://b")
+    response = _login_as(client, monkeypatch, db, username="user", url="http://b",
+                         expect=409)
+
+    assert response.status_code == 409
+    assert "http://a" in response.json()["detail"]
+    assert db.query(User).count() == 1
+
+
+def test_different_username_on_other_url_is_created(client, monkeypatch, db):
+    """The other-server case still works when the usernames actually differ."""
+    _login_as(client, monkeypatch, db, username="user", url="http://a")
+    _login_as(client, monkeypatch, db, username="other", url="http://b")
 
     assert db.query(User).count() == 2
 

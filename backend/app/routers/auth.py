@@ -46,6 +46,7 @@ from app.services.users import (
     peek_client,
     peek_sync_service,
     set_client_for_user,
+    UsernameOnOtherUrl,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,6 +168,12 @@ async def login(creds: LoginRequest, db: Session = Depends(get_db)):
     """
     try:
         user, _client, _version = await _connect(db, creds)
+    except UsernameOnOtherUrl as e:
+        # Credentials verified against the new URL, but this username already
+        # belongs to a tenant elsewhere. 409 with the reason, not a generic 401:
+        # the person needs to know they must use the other address.
+        logger.warning("Login refused: %s", e)
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Authentication failed: {e}")
 

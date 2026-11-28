@@ -35,6 +35,35 @@ _clients: dict[int, NavidromeClient] = {}
 _sync_services: dict[int, Any] = {}
 
 
+class UsernameOnOtherUrl(Exception):
+    """This username already has a tenant, but at a different Navidrome URL.
+
+    Raised instead of creating a second tenant. The same server reaches the app
+    under more than one address in practice (``https://navidrome.example.org``
+    and ``http://192.168.1.10:4533`` are one library), and the ``(url,
+    username)`` key cannot tell that apart from a genuinely different server.
+
+    Silently creating the second tenant is the worse failure: the person lands
+    in an empty account with no play history, no discovery seeds and no
+    playlists, and nothing in the UI explains why. Refusing the login and
+    naming the URL that already owns the username makes the situation obvious
+    and recoverable.
+
+    Only reachable after ``ping`` succeeded with the supplied credentials, so
+    revealing the existing URL does not leak anything to someone who cannot
+    already authenticate as that user.
+    """
+
+    def __init__(self, username: str, existing_url: str):
+        self.username = username
+        self.existing_url = existing_url
+        super().__init__(
+            f"The username '{username}' is already registered against "
+            f"{existing_url}. Log in with that address instead — a different "
+            f"Navidrome URL creates a separate account with its own history."
+        )
+
+
 def get_or_create_user(db, url: str, username: str, password: str) -> User:
     """Return the tenant for ``(url, username)``, creating it on first login.
 
@@ -54,6 +83,17 @@ def get_or_create_user(db, url: str, username: str, password: str) -> User:
     )
 
     if user is None:
+        # Before minting a new tenant, make sure this username is not already
+        # registered at another URL for the same server. See UsernameOnOtherUrl
+        # for why refusing beats silently creating a second empty account.
+        clash = (
+            db.query(User)
+            .filter(User.username == username)
+            .first()
+        )
+        if clash is not None:
+            raise UsernameOnOtherUrl(username, clash.navidrome_url)
+
         user = User(
             username=username,
             display_name=username,
