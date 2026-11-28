@@ -114,6 +114,13 @@ class SyncService:
                     stats["pruned_tracks"], stats["pruned_albums"], stats["pruned_artists"],
                 )
 
+            # 5. Enrichment: copy release-group MBIDs from Navidrome's own API.
+            # Subsonic only exposes the release MBID, which is a different id
+            # space and never matches Lidarr. Best-effort: a library sync that
+            # succeeded must not be reported as failed because enrichment could
+            # not run.
+            stats["mbid_tagged"] = await self._sync_album_mbids(db)
+
             self.last_sync = datetime.utcnow()
             self.last_stats = stats
             return stats
@@ -124,6 +131,31 @@ class SyncService:
             raise
         finally:
             self.is_syncing = False
+
+    async def _sync_album_mbids(self, db: Session) -> int:
+        """Best-effort release-group MBID pass via Navidrome's native API.
+
+        Returns the number of albums that ended up tagged. Any failure is logged
+        and swallowed: this runs at the tail of a successful library sync, and
+        losing an enrichment pass must not discard a sync that already worked.
+        """
+        from app.models.database import User
+        from app.services.navidrome_native import NavidromeNative, sync_album_mbids
+
+        user = db.get(User, self.user_id)
+        if user is None:
+            return 0
+
+        native = NavidromeNative(user.navidrome_url, user.username,
+                                 user.navidrome_password)
+        try:
+            stats = await sync_album_mbids(db, native)
+            return stats.get("tagged", 0)
+        except Exception as exc:  # noqa: BLE001 - enrichment is optional
+            logger.warning("Album MBID enrichment skipped: %s", exc)
+            return 0
+        finally:
+            await native.close()
 
     async def incremental_sync(self, db: Session) -> dict:
         """Incremental sync: only recently added albums/tracks."""

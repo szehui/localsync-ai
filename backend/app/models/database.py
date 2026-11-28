@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import create_engine, event, or_, Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import create_engine, event, or_, Column, Integer, String, Float, DateTime, Boolean, Text, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -98,6 +98,95 @@ class Album(Base):
     rating = Column(Integer, default=0)
     created_at = Column(DateTime, nullable=True)  # When added to Navidrome
     last_synced = Column(DateTime, default=datetime.utcnow)
+
+    # MusicBrainz release-group MBID — the key the whole request system hangs on.
+    # Filled from three sources, in order of cheapness (services/mbid_backfill.py):
+    # Navidrome's own tags, Lidarr's `foreignAlbumId`, then a MusicBrainz tail pass.
+    release_group_mbid = Column(String, nullable=True, index=True)
+    # Release MBID. A *different* id space from the release group: in the whole
+    # library, every album that carries both carries different values, so this
+    # must never be compared against Lidarr's release-group key.
+    mbz_album_id = Column(String, nullable=True)
+    mbid_source = Column(String, nullable=True)      # navidrome_tag|lidarr_oracle|musicbrainz_backfill
+    mbid_confidence = Column(String, nullable=True)  # high|medium|low
+    # NULL means "never attempted". Without this the backfill job cannot tell
+    # "not looked yet" from "looked, genuinely nothing there" and would re-query
+    # the unmatchable floor on every run.
+    mbid_checked_at = Column(DateTime, nullable=True)
+
+
+class AlbumAlias(Base):
+    """Alternate title for a release group, harvested from its releases.
+
+    A release group's releases carry localised titles: ``싸다9`` contains three
+    official releases, one of them titled ``PSY 9th``. Storing those lets a
+    household member find a Korean album by its English name, and makes later
+    typeahead instant without an upstream call.
+
+    Aliases belong to the release group, not to a user or a library row.
+    """
+    __tablename__ = "album_aliases"
+    release_group_mbid = Column(String, primary_key=True)
+    alias = Column(String, primary_key=True)
+    source = Column(String, nullable=False, default="release_title")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CatalogCache(Base):
+    """Cached upstream catalog responses, so repeats cost nothing.
+
+    MusicBrainz allows ~1 req/s; a typeahead that re-searched on every keystroke
+    would spend the whole budget on one user.
+    """
+    __tablename__ = "catalog_cache"
+    key = Column(String, primary_key=True)             # e.g. "search:daft punk:0"
+    kind = Column(String, nullable=False, index=True)  # search|album|artist|rails|coverart
+    payload = Column(Text, nullable=False)             # JSON
+    fetched_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Request(Base):
+    """A user's ask for an album or artist to be added to Lidarr.
+
+    Defined here (ahead of the request workflow) because catalog cards annotate
+    ``request`` — a card has to know whether the album is already requested by
+    someone, and that fact lives in this table.
+
+    ``release_group_mbid`` is the join key everything else uses: availability is
+    decided by MBID, never by title, because the title lookup in Lidarr returns
+    the wrong album for compilation and non-Latin releases.
+    """
+    __tablename__ = "requests"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    kind = Column(String, nullable=False, default="album")      # album | artist
+    release_group_mbid = Column(String, nullable=True, index=True)
+    artist_mbid = Column(String, nullable=True, index=True)
+    artist_name = Column(String, nullable=True)
+    album_title = Column(String, nullable=True)
+    year = Column(Integer, nullable=True)
+    primary_type = Column(String, nullable=True)
+    cover_url = Column(String, nullable=True)
+    scope = Column(String, nullable=True)              # artist requests: studio|studio_eps|everything
+    parent_request_id = Column(Integer, ForeignKey("requests.id", ondelete="CASCADE"),
+                               nullable=True, index=True)
+    status = Column(String, nullable=False, default="pending", index=True)
+    note = Column(Text, nullable=True)
+    requested_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    decided_at = Column(DateTime, nullable=True)
+    decided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    lidarr_album_id = Column(Integer, nullable=True)
+    lidarr_artist_id = Column(Integer, nullable=True)
+    last_synced_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+    available_evidence = Column(String, nullable=True)  # mbid | name
+
+    __table_args__ = (
+        Index("ix_requests_open_rg", "release_group_mbid",
+              sqlite_where=text("kind = 'album' AND status NOT IN ('denied','cancelled')"),
+              unique=True),
+    )
 
 
 class Track(Base):
@@ -380,6 +469,30 @@ def init_db():
             conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_id VARCHAR"))
             conn.execute(sa.text("ALTER TABLE generated_playlists ADD COLUMN seed_playlist_name VARCHAR"))
             conn.commit()
+
+    # MusicBrainz ids on albums, for the request catalog. Deployed databases
+    # already hold library rows, so these must be added in place rather than
+    # relying on create_all() to rebuild the table.
+    album_columns = [c["name"] for c in inspector.get_columns("albums")]
+    album_additions = {
+        "release_group_mbid": "VARCHAR",
+        "mbz_album_id": "VARCHAR",
+        "mbid_source": "VARCHAR",
+        "mbid_confidence": "VARCHAR",
+        "mbid_checked_at": "DATETIME",
+    }
+    missing_album = {name: ddl for name, ddl in album_additions.items()
+                     if name not in album_columns}
+    if missing_album:
+        with engine.connect() as conn:
+            for name, ddl in missing_album.items():
+                conn.execute(sa.text(f"ALTER TABLE albums ADD COLUMN {name} {ddl}"))
+            conn.execute(sa.text(
+                "CREATE INDEX IF NOT EXISTS ix_albums_release_group_mbid "
+                "ON albums (release_group_mbid)"
+            ))
+            conn.commit()
+        logger.info("Migrated albums: added %s", ", ".join(missing_album))
 
     # ListenBrainz support: recording MBID + normalized search key on tracks.
     track_columns = [c["name"] for c in inspector.get_columns("tracks")]

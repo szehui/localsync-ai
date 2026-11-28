@@ -74,6 +74,15 @@ class LidarrService:
         """Get all artists currently monitored by Lidarr."""
         return await self._request("GET", "artist")
 
+    async def get_all_albums(self) -> List[Dict[str, Any]]:
+        """Every album row Lidarr holds, with its resolved `foreignAlbumId`.
+
+        Used as an MBID oracle: Lidarr already resolved a release group for each
+        album it knows, so its id can be copied onto the matching library row
+        instead of re-deriving it from MusicBrainz (see services/mbid_backfill).
+        """
+        return await self._request("GET", "album")
+
     async def add_artist(
         self, artist_data: Dict[str, Any], root_folder: Dict[str, Any]
     ) -> Dict[str, Any]:
