@@ -1,5 +1,70 @@
 # LocalSync AI — Development Log
 
+## 2026-11-28 — Phase 2: the request write-path (music Seerr)
+
+Requests, approval, and the Lidarr push. Everything is keyed by **release-group
+MBID**; the title-based `album/lookup` path is never used for a request.
+
+### Why MBID, concretely
+Phase 1's discovery "Add" called `add_single_album(artist_name, release_name)`.
+Live evidence of the failure: the *Shang-Chi* soundtrack resolved to **Savage
+Mode** — right artist, wrong album, queued for download while the UI said
+"Added to Lidarr". `album/lookup?term=<names>` ranks by relevance and the top hit
+is whatever MusicBrainz thinks is closest. A request therefore resolves its
+release group first (`album/lookup?term=mbid:<uuid>`) and refuses when Lidarr has
+no row for *that* id (`unresolved`), rather than substituting a neighbour.
+
+### Data model
+- `requests` (+ `request_votes`, `blocklist`): one row per ask, with the display
+  fields cached so the list and approval need no upstream calls.
+- **Partial unique index** `ix_requests_open_rg` on `(user_id, release_group_mbid)
+  WHERE kind='album' AND status NOT IN ('denied','cancelled')`. A second ask for
+  the same album becomes a **vote** (201, same id) instead of a duplicate Lidarr
+  add; the index is what makes that race-safe, so the insert path catches
+  `IntegrityError` and converts it to a vote rather than pre-checking and hoping.
+- `users.auto_approve` / `users.can_request`. Owner defaults to auto-approve,
+  members do not — matching Seerr: members ask, the owner approves, and the owner
+  does not queue requests for their own permission. The owner UPDATE runs only in
+  the one-time "column is new" window so a deliberate opt-out survives restarts.
+
+### Lifecycle
+`pending → approved → downloading → imported / partially_available → available`,
+with `denied` (owner) and `cancelled` (requester or owner) as the only states that
+free the release group for a new request. A transient Lidarr failure stays
+`approved` with `last_error` set rather than becoming `failed`, because 503 from
+Lidarr's MusicBrainz proxy is throttling, not a verdict.
+
+### Found live, fixed
+MusicBrainz answers **400**, not 404, for a well-formed UUID it has never seen, so
+the client's `allow_404` flag did not cover it and `POST /api/requests` returned an
+HTML 500 page on a bogus MBID. Now translated: 4xx → `404 not_found`, 5xx/transport
+→ `503 upstream`. Both pinned by tests.
+
+Also folded in here (deferred from the previous entry): **`discovery_state` is now
+per-user**, `user_id` primary key, legacy singleton row attributed to the owner.
+Under multi-user the singleton showed whichever user refreshed last, so one
+person's error could appear on another's Discover page.
+
+### Verified live, against the real stack
+Minted a session token and drove the running app:
+- `POST /api/requests` → 201 pending with real MusicBrainz metadata (Boards of
+  Canada — *Hooper Bay*); Lidarr album count unchanged while pending (4753 → 4753)
+- duplicate ask → 201, **same request id** (vote, not a second row)
+- `approve` → 200 approved, `add_albums_by_mbid` resolved the MBID and monitored
+  the album; `monitoring_ok` verified against `GET /album`
+- bogus MBID → 404 `not_found`, nothing created
+- `lookup_album_by_mbid` on an owned MBID → found; on a bogus one → `None`
+
+Test album removed from Lidarr afterwards (`DELETE /album/4893?deleteFiles=false`,
+4754 → 4753, confirmed gone); test request rows removed.
+
+One thing worth knowing: Lidarr's `RefreshArtist` runs asynchronously after an add
+and can re-create album rows unmonitored moments after a collapse pass. The
+monitor pass therefore *verifies* against `GET /album` and reports
+`monitoring_ok=False` instead of assuming success; a retry converges.
+
+**839 tests passing** (769 at Phase 1 close; 70 new).
+
 ## 2026-11-27 — Duplicate tenant from a second Navidrome URL
 
 Discovered page showed "no seeds available: this user has no played tracks with a

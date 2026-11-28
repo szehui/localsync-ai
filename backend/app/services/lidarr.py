@@ -260,6 +260,31 @@ class LidarrService:
             "root_folder": roots[0]["path"],
         }
 
+    async def lookup_album_by_mbid(self, mbid: str) -> Optional[Dict[str, Any]]:
+        """Exact release-group lookup. Returns None rather than a best guess.
+
+        `album/lookup?term=mbid:<uuid>` is the only lookup form that cannot
+        pick the wrong artist, and it returns exactly one row — but the caller
+        still verifies `foreignAlbumId`, because "one row" is an observed
+        property of this Lidarr version, not a documented contract, and adding
+        the wrong album is unrecoverable from the user's point of view.
+        """
+        if not mbid:
+            return None
+        rows = await self.lookup_album(f"mbid:{mbid}")
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if (row.get("foreignAlbumId") or "").lower() == mbid.lower():
+                return row
+        if rows:
+            logger.warning(
+                "Lidarr: lookup for mbid:%s returned %d row(s) with a different "
+                "foreignAlbumId (%s) — refusing to use them",
+                mbid, len(rows), rows[0].get("foreignAlbumId"),
+            )
+        return None
+
     def _exact_album(self, results: List[Dict[str, Any]], release_name: str,
                      artist_name: str) -> Optional[Dict[str, Any]]:
         """Row whose artist AND title both match exactly (after folding)."""
@@ -414,26 +439,43 @@ class LidarrService:
         return await self.collapse_artist_monitoring(
             artist_id, keep_album_ids=keep)
 
-    async def _add_album_core(self, artist_name: str, release_name: str,
-                              search: bool = False) -> Dict[str, Any]:
-        """Add one album's wanted entry. Does NOT touch artist monitoring.
-
-        Split out from `add_single_album` so batch callers can defer the
-        monitoring collapse to a single pass at the end: collapsing per add
-        makes each album un-monitor the one before it.
-        """
+    async def _resolve_album(self, artist_name: str,
+                             release_name: str) -> Dict[str, Any]:
+        """Find the Lidarr lookup row for an artist+title pair."""
         if not artist_name or not release_name:
             raise ValueError(
                 "cannot add an album without both an artist and a release name")
-
-        defaults = await self.get_album_defaults()
         results = await self.lookup_album_for(artist_name, release_name)
         album = self._pick_album(results if isinstance(results, list) else [],
                                  release_name, artist_name)
         if album is None:
             raise ValueError(
                 f"Lidarr lookup found no album for '{artist_name} - {release_name}'")
+        return album
 
+    async def _resolve_album_by_mbid(self, mbid: str) -> Dict[str, Any]:
+        """Find the Lidarr lookup row for a release-group MBID, or fail loudly.
+
+        There is no fuzzy step and no substitute: the request names a specific
+        release group, and adding a different one under the same artist would
+        look like success while downloading something the user never asked for.
+        """
+        album = await self.lookup_album_by_mbid(mbid)
+        if album is None:
+            raise ValueError(f"Lidarr has no album for release group {mbid}")
+        return album
+
+    async def _post_album(self, album: Dict[str, Any],
+                          defaults: Dict[str, Any],
+                          search: bool = False) -> Dict[str, Any]:
+        """POST one resolved album to Lidarr. The single add path.
+
+        Both resolvers (title and MBID) land here, so there is exactly one
+        place that builds the payload and knows the already-present semantics.
+        Does NOT touch artist monitoring: batch callers collapse once per artist
+        afterwards, and a per-add collapse would un-monitor the previous add
+        (34 of 88 lost in a live run before this rule).
+        """
         release_group_id = album.get("foreignAlbumId")
         if not release_group_id:
             raise ValueError("Lidarr lookup returned no foreignAlbumId")
@@ -449,7 +491,7 @@ class LidarrService:
                 "album_id": existing.get("id"),
                 "artist_id": existing.get("artistId"),
                 "artist_name": (existing.get("artist") or {}).get("artistName")
-                               or artist_name,
+                               or (album.get("artist") or {}).get("artistName"),
                 "release_name": existing.get("title"),
                 "already_present": True,
             }
@@ -502,6 +544,26 @@ class LidarrService:
             "already_present": False,
         }
 
+    async def _add_album_core(self, artist_name: str, release_name: str,
+                              search: bool = False) -> Dict[str, Any]:
+        """Add one album by artist+title. Does NOT touch artist monitoring.
+
+        The title path still exists for the YouTube import, which is handed
+        names rather than MBIDs. Requests do not use it: `add_albums_by_mbid`
+        goes through `_resolve_album_by_mbid` instead, so the fuzzy picker can
+        never choose an album on the request path.
+        """
+        # Order matters and both halves are pinned by tests: reject blank names
+        # before touching the network, then verify Lidarr is configured, and
+        # only then spend a lookup. (Resolving first made a misconfigured Lidarr
+        # report a lookup failure instead of the real problem.)
+        if not artist_name or not release_name:
+            raise ValueError(
+                "cannot add an album without both an artist and a release name")
+        defaults = await self.get_album_defaults()
+        album = await self._resolve_album(artist_name, release_name)
+        return await self._post_album(album, defaults, search)
+
     async def add_albums(self, items: Iterable[tuple], search: bool = False,
                          delay: float = 1.5,
                          ) -> Dict[str, Any]:
@@ -545,6 +607,79 @@ class LidarrService:
             if index < len(items) - 1:
                 await asyncio.sleep(delay)
 
+        monitored_ok = await self._collapse_by_artist(by_artist)
+
+        added = [r for r in results if r.get("album_id") and not r.get("error")]
+        return {
+            "added": [r for r in added if not r.get("already_present")],
+            "already_present": [r for r in added if r.get("already_present")],
+            "failed": [r for r in results if r.get("error")],
+            "monitoring_ok": monitored_ok,
+            "results": results,
+        }
+
+    async def add_albums_by_mbid(self, mbids: Iterable[str],
+                                 search: bool = False,
+                                 delay: float = 1.0) -> Dict[str, Any]:
+        """Add several release groups by MBID, collapsing monitoring once per artist.
+
+        This is the request-approval path. Compared with `add_albums`, the
+        lookup cannot be wrong: each MBID is resolved exactly and an unresolved
+        id is *reported*, never substituted with a fuzzy match. A discography
+        request therefore either adds the albums the user chose or says which
+        ones failed and why.
+
+        `delay` is shorter than the title path's 1.5s because each iteration is
+        a single MBID lookup rather than one or two fuzzy searches.
+        """
+        results: List[Dict[str, Any]] = []
+        by_artist: Dict[int, List[int]] = {}
+        mbids = list(mbids)
+
+        if not mbids:
+            return {"added": [], "already_present": [], "unresolved": [],
+                    "failed": [], "monitoring_ok": True, "results": []}
+
+        defaults = await self.get_album_defaults()
+
+        for index, mbid in enumerate(mbids):
+            try:
+                album = await self._resolve_album_by_mbid(mbid)
+                res = await self._post_album(album, defaults, search=search)
+                res = {**res, "release_group_mbid": mbid}
+                results.append(res)
+                artist_id, album_id = res.get("artist_id"), res.get("album_id")
+                if artist_id and album_id:
+                    by_artist.setdefault(int(artist_id), []).append(int(album_id))
+            except Exception as e:
+                logger.warning("Lidarr: could not add MBID %s: %s", mbid, e)
+                results.append({"release_group_mbid": mbid, "error": str(e)})
+
+            if index < len(mbids) - 1:
+                await asyncio.sleep(delay)
+
+        monitored_ok = await self._collapse_by_artist(by_artist)
+
+        added = [r for r in results if r.get("album_id") and not r.get("error")]
+        failed = [r for r in results if r.get("error")]
+        return {
+            "added": [r for r in added if not r.get("already_present")],
+            "already_present": [r for r in added if r.get("already_present")],
+            # Unresolved is distinct from failed: "Lidarr does not know this
+            # release group" is a dead end the user must be told about, while a
+            # transport error is worth retrying.
+            "unresolved": [r for r in failed if "no album for release group" in r["error"]],
+            "failed": [r for r in failed if "no album for release group" not in r["error"]],
+            "monitoring_ok": monitored_ok,
+            "results": results,
+        }
+
+    async def _collapse_by_artist(self, by_artist: Dict[int, List[int]]) -> bool:
+        """Collapse monitoring once per artist, verifying against the API.
+
+        Shared by the title and MBID batch paths so neither can drift into the
+        per-add collapse that un-monitors its own earlier adds.
+        """
         monitored_ok = True
         for artist_id, album_ids in by_artist.items():
             try:
@@ -561,15 +696,7 @@ class LidarrService:
                 logger.warning(
                     "Lidarr: monitoring pass failed for artist %s: %s",
                     artist_id, e)
-
-        added = [r for r in results if r.get("album_id") and not r.get("error")]
-        return {
-            "added": [r for r in added if not r.get("already_present")],
-            "already_present": [r for r in added if r.get("already_present")],
-            "failed": [r for r in results if r.get("error")],
-            "monitoring_ok": monitored_ok,
-            "results": results,
-        }
+        return monitored_ok
 
     async def add_single_album(self, artist_name: str, release_name: str,
                                search: bool = False) -> Dict[str, Any]:

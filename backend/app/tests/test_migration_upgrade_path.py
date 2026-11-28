@@ -76,6 +76,16 @@ CREATE TABLE discovery_offers (
 CREATE INDEX ix_discovery_offers_recording_mbid ON discovery_offers (recording_mbid);
 CREATE INDEX ix_discovery_offers_artist_name ON discovery_offers (artist_name);
 CREATE INDEX ix_discovery_offers_status ON discovery_offers (status);
+-- Singleton discovery status: one row for the whole install, so with more than
+-- one user the Discover page showed whoever refreshed last.
+CREATE TABLE discovery_state (
+    id INTEGER PRIMARY KEY DEFAULT 1, last_run DATETIME, last_status VARCHAR,
+    last_error TEXT, seeds_used INTEGER, candidates_seen INTEGER,
+    offers_added INTEGER, calls_made INTEGER
+);
+INSERT INTO discovery_state
+    (id, last_run, last_status, seeds_used, candidates_seen, offers_added, calls_made)
+    VALUES (1, '2026-11-26 20:00:00', 'ok', 20, 480, 37, 96);
 INSERT INTO connection_config (id, url, username, password)
     VALUES (1, 'http://nav:4533', 'sze', 'secret');
 INSERT INTO listenbrainz_config (id, user_token, username)
@@ -285,6 +295,165 @@ def test_discovery_offers_rebuild_is_a_no_op_on_restart(legacy_db):
 
     assert "user_id" in _columns(engine, "discovery_offers")
     assert "discovery_offers_old" not in sa.inspect(engine).get_table_names()
+
+
+def test_discovery_state_rebuilt_per_user(legacy_db):
+    """The singleton status row becomes the owner's, keeping its counters.
+
+    Multi-user made the singleton actively misleading: the Discover page showed
+    the last refresh by *anyone*, so a failure belonging to one user appeared on
+    another's page with their own numbers attached.
+    """
+    path, engine = legacy_db
+    db_module.init_db()
+
+    cols = _columns(engine, "discovery_state")
+    assert "user_id" in cols
+    assert "id" not in cols
+    assert "discovery_state_old" not in sa.inspect(engine).get_table_names()
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        owner = db.query(db_module.User).filter_by(is_owner=True).one()
+        states = db.query(db_module.DiscoveryState).all()
+        assert len(states) == 1
+        state = states[0]
+        assert state.user_id == owner.id
+        # The counters describe a real run and are worth keeping.
+        assert state.last_status == "ok"
+        assert state.seeds_used == 20
+        assert state.offers_added == 37
+
+
+def test_discovery_state_is_isolated_between_users(legacy_db):
+    """Each user gets their own row; one user's error stays on their page."""
+    path, engine = legacy_db
+    db_module.init_db()
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        owner = db.query(db_module.User).filter_by(is_owner=True).one()
+        db.add(db_module.User(
+            username="rebecca", navidrome_url="http://nav:4533",
+            navidrome_password="secret",
+        ))
+        db.commit()
+        other = db.query(db_module.User).filter_by(username="rebecca").one()
+
+        from app.services.discovery import get_state
+
+        owner_state = get_state(db, owner.id)
+        other_state = get_state(db, other.id)
+
+        assert owner_state is not other_state
+        assert owner_state.last_status == "ok"
+
+        other_state.last_status = "error: no seeds available"
+        other_state.last_error = "no seeds available"
+        db.commit()
+
+        # The owner's row must be untouched by the other user's failure.
+        refreshed = get_state(db, owner.id)
+        assert refreshed.last_status == "ok"
+        assert refreshed.last_error is None
+
+
+def test_discovery_state_rebuild_is_a_no_op_on_restart(legacy_db):
+    path, engine = legacy_db
+    db_module.init_db()
+    db_module.init_db()
+
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        assert db.query(db_module.DiscoveryState).count() == 1
+    assert "user_id" in _columns(engine, "discovery_state")
+
+
+def test_owner_gets_auto_approve_but_members_do_not(tmp_path, monkeypatch):
+    """The owner asking themselves for permission is friction, not policy.
+
+    Members default to off — that is the whole point of an approval queue. The
+    owner defaults on, matching Seerr, so clicking Add in Discover downloads
+    instead of silently queueing a request nobody is watching.
+    """
+    path = tmp_path / "two_users.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(LEGACY_SCHEMA)
+    conn.execute("DELETE FROM connection_config")   # no adoption; users stand as-is
+    # Old-shape users table: no auto_approve / can_request, i.e. a database
+    # created by the previous release.
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR NOT NULL,
+            display_name VARCHAR, navidrome_url VARCHAR NOT NULL,
+            navidrome_password VARCHAR NOT NULL, is_owner BOOLEAN,
+            created_at DATETIME, last_login DATETIME
+        );
+        INSERT INTO users (id, username, navidrome_url, navidrome_password, is_owner)
+            VALUES (1, 'sze', 'http://nav', 'secret', 1);
+        INSERT INTO users (id, username, navidrome_url, navidrome_password, is_owner)
+            VALUES (2, 'rebecca', 'http://nav', 'secret', 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    engine = create_engine(f"sqlite:///{path}",
+                           connect_args={"check_same_thread": False})
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal",
+                        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    try:
+        db_module.init_db()
+        with engine.connect() as c:
+            rows = dict(c.execute(sa.text(
+                "SELECT username, auto_approve FROM users")).fetchall())
+        assert rows == {"sze": 1, "rebecca": 0}
+    finally:
+        engine.dispose()
+
+
+def test_owner_auto_approve_is_not_reasserted_on_restart(tmp_path, monkeypatch):
+    """An owner who turns auto-approve off keeps it off across restarts.
+
+    The UPDATE only runs inside the one-time "column is new" window. Re-running
+    it every boot would silently undo the owner's own setting.
+    """
+    path = tmp_path / "restart.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(LEGACY_SCHEMA)
+    conn.execute("DELETE FROM connection_config")
+    conn.executescript("""
+        CREATE TABLE users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username VARCHAR NOT NULL,
+            display_name VARCHAR, navidrome_url VARCHAR NOT NULL,
+            navidrome_password VARCHAR NOT NULL, is_owner BOOLEAN,
+            created_at DATETIME, last_login DATETIME
+        );
+        INSERT INTO users (id, username, navidrome_url, navidrome_password, is_owner)
+            VALUES (1, 'sze', 'http://nav', 'secret', 1);
+    """)
+    conn.commit()
+    conn.close()
+
+    engine = create_engine(f"sqlite:///{path}",
+                           connect_args={"check_same_thread": False})
+    monkeypatch.setattr(db_module, "engine", engine)
+    monkeypatch.setattr(db_module, "SessionLocal",
+                        sessionmaker(autocommit=False, autoflush=False, bind=engine))
+    try:
+        db_module.init_db()
+        with engine.connect() as c:
+            c.execute(sa.text("UPDATE users SET auto_approve = 0, is_owner = 1"))
+            c.commit()
+
+        db_module.init_db()          # second boot: column already exists
+
+        with engine.connect() as c:
+            value = c.execute(sa.text(
+                "SELECT auto_approve FROM users WHERE is_owner = 1")).scalar()
+        assert value == 0
+    finally:
+        engine.dispose()
 
 
 def test_discovery_offers_rebuild_attributes_to_the_only_user(tmp_path, monkeypatch):

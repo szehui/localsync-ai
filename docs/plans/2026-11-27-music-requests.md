@@ -638,6 +638,18 @@ search returns artist suggestions; Latin query is passed through unchanged.
 
 # Phase 2 — Requests
 
+> **Status: shipped 2026-11-28.** All eight tasks complete, 839 tests passing,
+> deployed, and verified live against real MusicBrainz + Lidarr. See DEVLOG.
+> Deviations from the plan as written:
+> - Task 2.1 also folded in the per-user `discovery_state` rebuild (deferred from
+>   the 11-27 entry) — a singleton row was showing one user's status to another.
+> - `fetch_release_group` translates MusicBrainz **400** to `404 not_found`; a
+>   well-formed nonexistent UUID is a 400, not a 404, and it was 500ing live.
+> - The partial index is named `ix_requests_open_rg` (created with the model in
+>   Phase 1), not `uq_requests_open_rg`. Same predicate, one index, no duplicate.
+> - `add_albums_by_mbid` verifies monitoring against `GET /album` and reports
+>   `monitoring_ok`; Lidarr's async `RefreshArtist` can re-create rows unmonitored.
+
 ### Task 2.1: Models and migrations
 
 **Files:** Modify `backend/app/models/database.py`; test `test_requests_models.py`

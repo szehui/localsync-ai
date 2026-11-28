@@ -278,16 +278,16 @@ def build_feed(offers: list[DiscoveryOffer], limit_artists: int = DEFAULT_FEED_A
 # ── persistence ──────────────────────────────────────────────────────────────
 
 def get_state(db: Session, user_id: int) -> DiscoveryState:
-    """Fetch (or lazily create) the discovery state row.
+    """Fetch (or lazily create) this user's discovery state row.
 
-    The row is still a single shared record: the refresh is one rate-limited
-    background job, so there is no per-user status to read yet. ``user_id`` is
-    accepted here anyway so every entry point in this module is uniformly
-    per-user — when the state row goes per-user, no caller has to change.
+    The row is per-user: the refresh job reads that user's own play history, so
+    a shared row meant the Discover page showed whichever user refreshed last —
+    including their error text, next to someone else's counts.
     """
-    state = db.query(DiscoveryState).filter(DiscoveryState.id == 1).first()
+    state = db.query(DiscoveryState).filter(
+        DiscoveryState.user_id == user_id).first()
     if state is None:
-        state = DiscoveryState(id=1)
+        state = DiscoveryState(user_id=user_id)
         db.add(state)
         db.commit()
         db.refresh(state)

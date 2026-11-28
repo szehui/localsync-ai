@@ -188,6 +188,9 @@ class HouseholdUserResponse(BaseModel):
     username: str
     display_name: Optional[str] = None
     is_owner: bool = False
+    # Request policy, visible so a member can see why their button is disabled.
+    auto_approve: bool = False
+    can_request: bool = True
     created_at: Optional[datetime] = None
     last_login: Optional[datetime] = None
     listenbrainz_configured: bool = False
@@ -196,6 +199,17 @@ class HouseholdUserResponse(BaseModel):
 class DeleteUserResponse(BaseModel):
     deleted: bool
     user_id: int
+
+
+class UserFlagsUpdate(BaseModel):
+    """Owner-only policy change for another household member.
+
+    Both fields are optional so a PATCH can flip one without restating the
+    other, and an empty body is rejected rather than silently doing nothing.
+    """
+
+    auto_approve: Optional[bool] = None
+    can_request: Optional[bool] = None
 
 
 # --- Last.fm ---
@@ -311,3 +325,66 @@ class DiscoveryAddResponse(BaseModel):
     already_present: bool = False
     albums_unmonitored: list[int] = []
     message: str = ""
+
+
+# --- Requests ---
+
+class RequestCreate(BaseModel):
+    """Ask for an album (release_group_mbid) or a discography (artist_mbid)."""
+
+    kind: str = "album"                     # album | artist
+    release_group_mbid: Optional[str] = None
+    artist_mbid: Optional[str] = None
+    scope: Optional[str] = None             # artist: studio | studio_eps | everything
+    note: Optional[str] = None
+
+
+class RequestResponse(BaseModel):
+    """One request, shaped so a list needs no catalog or Lidarr call."""
+
+    id: int
+    kind: str
+    status: str
+    release_group_mbid: Optional[str] = None
+    artist_mbid: Optional[str] = None
+    artist_name: Optional[str] = None
+    album_title: Optional[str] = None
+    year: Optional[int] = None
+    primary_type: Optional[str] = None
+    cover_url: Optional[str] = None
+    scope: Optional[str] = None
+    note: Optional[str] = None
+    requested_by: Optional[str] = None
+    requested_at: Optional[datetime] = None
+    decided_at: Optional[datetime] = None
+    decided_by: Optional[str] = None
+    vote_count: int = 0
+    last_error: Optional[str] = None
+    lidarr_album_id: Optional[int] = None
+    # Artist requests only: per-status child counts, computed on read so a child
+    # retried outside the parent's flow cannot leave it stale.
+    rollup: dict[str, int] = {}
+    children: list["RequestResponse"] = []
+
+
+class RequestListResponse(BaseModel):
+    requests: list[RequestResponse]
+    total: int
+
+
+class RequestVoteResponse(BaseModel):
+    request_id: int
+    voted: bool
+    added: bool = False
+    vote_count: int = 0
+
+
+class ArtistRequestPlan(BaseModel):
+    """What a discography request would create, before it is created."""
+
+    artist_mbid: str
+    artist_name: Optional[str] = None
+    disambiguation: Optional[str] = None
+    scope: str
+    albums: list[dict] = []
+    summary: dict[str, int] = {}

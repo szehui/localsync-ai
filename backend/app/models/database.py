@@ -55,6 +55,12 @@ class User(Base):
     navidrome_url = Column(String, nullable=False)
     navidrome_password = Column(String, nullable=False)
     is_owner = Column(Boolean, default=False)  # first user; can manage others
+    # Approval policy, per user. Default False so a new household member cannot
+    # queue downloads on the owner's bandwidth without them being seen; the
+    # owner can flip it after deciding they trust someone.
+    auto_approve = Column(Boolean, default=False)
+    # Set False to give someone read-only access (browse and search, no asking).
+    can_request = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
 
@@ -192,6 +198,48 @@ class Request(Base):
               sqlite_where=text("kind = 'album' AND status NOT IN ('denied','cancelled')"),
               unique=True),
     )
+
+
+class RequestVote(Base):
+    """A second user's "me too" on an existing request.
+
+    The partial unique index allows only one *open* request per release group,
+    so a duplicate request cannot become a second row — the only way to record
+    that someone else wants the same album is a vote on the existing request.
+
+    (request_id, user_id) is the primary key rather than a surrogate id: it
+    makes re-voting idempotent without a read-then-insert race, and it is the
+    only lookup either way. Both foreign keys cascade, so neither a deleted
+    request nor a deleted user leaves a vote behind.
+    """
+    __tablename__ = "request_votes"
+    request_id = Column(Integer, ForeignKey("requests.id", ondelete="CASCADE"),
+                        primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"),
+                     primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Blocklist(Base):
+    """The owner's "never offer or accept this again" list.
+
+    ``scope`` says which column carries the id — ``release_group`` reads
+    ``release_group_mbid``, ``artist`` reads ``artist_mbid``. One row shape for
+    both keeps the check a single query at request time and a single filter in
+    the catalog.
+
+    A block is enforced at creation, not merely hidden in the UI: a direct
+    MBID request from a client that never saw a filtered search must still be
+    refused, otherwise the blocklist is a suggestion.
+    """
+    __tablename__ = "blocklist"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scope = Column(String, nullable=False, default="release_group")
+    release_group_mbid = Column(String, nullable=True, index=True)
+    artist_mbid = Column(String, nullable=True, index=True)
+    reason = Column(Text, nullable=True)
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 class Track(Base):
@@ -439,13 +487,22 @@ class DiscoveryOffer(Base):
 
 
 class DiscoveryState(Base):
-    """Singleton row describing the last discovery refresh.
+    """Per-user status of the last discovery refresh.
 
-    The refresh is a background job (rate-limited upstream calls), so the UI
-    polls this to know whether to show a spinner or the feed.
+    Keyed by ``user_id``, not a singleton row. The refresh is a per-user
+    background job, and a shared row meant the Discover page showed whoever
+    refreshed last — one person's error text appearing on another person's page,
+    with their own counts attached.
+
+    A user with no row yet has never refreshed; the caller creates it on read
+    (see ``services.discovery.get_state``). Deleting a user takes the row.
     """
     __tablename__ = "discovery_state"
-    id = Column(Integer, primary_key=True, default=1)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
     last_run = Column(DateTime, nullable=True)
     last_status = Column(String, nullable=True)  # ok | running | error: ...
     last_error = Column(Text, nullable=True)
@@ -468,6 +525,38 @@ def init_db():
     # Migrate existing tables: add columns that may not exist yet
     import sqlalchemy as sa
     inspector = sa.inspect(engine)
+
+    # Request workflow flags on users. This runs FIRST, before any ORM query:
+    # the ORM selects every mapped column, so `_migrate_multi_user` and the
+    # discovery rebuilds below would fail with "no such column: users.auto_approve"
+    # on an upgraded database. create_all() does not alter existing tables, which
+    # is exactly the upgraded case.
+    user_columns = [c["name"] for c in inspector.get_columns("users")]
+    with engine.connect() as conn:
+        if "auto_approve" not in user_columns:
+            # Default 0: a new account cannot queue downloads until the owner
+            # decides otherwise. The explicit DEFAULT matters — existing rows
+            # must read as "not approved", and NULL is neither.
+            conn.execute(sa.text(
+                "ALTER TABLE users ADD COLUMN auto_approve BOOLEAN DEFAULT 0"
+            ))
+            logger.info("Migrated users: added auto_approve")
+        if "can_request" not in user_columns:
+            conn.execute(sa.text(
+                "ALTER TABLE users ADD COLUMN can_request BOOLEAN DEFAULT 1"
+            ))
+            logger.info("Migrated users: added can_request")
+        if "auto_approve" not in user_columns:
+            # The owner is implicitly trusted: the household model is that members
+            # ask and the owner approves, but the owner asking themselves is just
+            # friction. Set only inside this one-time upgrade window, so an owner
+            # who later turns auto-approve off keeps it off across restarts.
+            conn.execute(sa.text(
+                "UPDATE users SET auto_approve = 1 WHERE is_owner = 1"
+            ))
+            logger.info("Migrated users: owner auto-approve enabled")
+        conn.commit()
+
     columns = [c["name"] for c in inspector.get_columns("generated_playlists")]
     if "seed_playlist_id" not in columns:
         with engine.connect() as conn:
@@ -595,6 +684,89 @@ def init_db():
         ]
         if "user_id" not in offer_columns:
             _rebuild_discovery_offers(offer_columns)
+
+    # Per-user discovery state. The old table was a singleton (`id=1`), which
+    # multi-user turned into a bug: the Discover page showed whichever user
+    # refreshed last. The single legacy row belongs to the sole listener, i.e.
+    # the owner — the same attribution rule as the offers rebuild above, and the
+    # counts are worth keeping because they describe a real run.
+    if inspector.has_table("discovery_state"):
+        state_columns = [
+            c["name"] for c in inspector.get_columns("discovery_state")
+        ]
+        if "user_id" not in state_columns:
+            _rebuild_discovery_state(state_columns)
+
+def _rebuild_discovery_state(legacy_columns: list[str]) -> None:
+    """Recreate discovery_state keyed by user, keeping the one legacy row.
+
+    SQLite cannot swap a primary key in place, so the table is rebuilt the same
+    way ``_rebuild_discovery_offers`` does it. Unlike the offers table there is
+    at most one legacy row, and it is not ambiguous: pre-multi-user installs had
+    exactly one listener, so it belongs to the owner.
+
+    If no owner can be determined the rebuild is skipped rather than guessing —
+    handing one tenant another person's discovery counters would make their
+    Discover page claim a run that never happened. The consequence of skipping
+    is loud (the feed errors on the missing column) instead of subtly wrong.
+    """
+    import sqlalchemy as sa
+
+    table = Base.metadata.tables["discovery_state"]
+    existing = set(legacy_columns)
+    copy_columns = [
+        c.name for c in table.columns if c.name != "user_id" and c.name in existing
+    ]
+
+    with SessionLocal() as db:
+        owner = db.query(User).filter_by(is_owner=True).first()
+        if owner is None:
+            users = db.query(User).limit(2).all()
+            if len(users) == 1:
+                owner = users[0]
+        owner_id = owner.id if owner is not None else None
+
+    if owner_id is None:
+        logger.warning(
+            "Discovery state: no owner user exists to attribute the legacy row "
+            "to — leaving discovery_state on the pre-multi-user schema. Set "
+            "is_owner=True on the account that owns the old discovery run and "
+            "restart."
+        )
+        return
+
+    copy_sql = ", ".join(copy_columns)
+    insert_sql = (
+        f"INSERT INTO discovery_state (user_id, {copy_sql}) "
+        f"SELECT :owner_id, {copy_sql} FROM discovery_state_old"
+    )
+
+    with engine.connect() as conn:
+        conn.execute(
+            sa.text("ALTER TABLE discovery_state RENAME TO discovery_state_old")
+        )
+        # Named indexes survive a rename and index names are global in SQLite,
+        # so they must go before the new table is created. (The old table had no
+        # explicit indexes, but this keeps the rebuild identical to the offers
+        # one and safe if that changes.)
+        stale_indexes = conn.execute(sa.text(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND tbl_name='discovery_state_old' AND name NOT LIKE 'sqlite_%'"
+        )).scalars().all()
+        for name in stale_indexes:
+            conn.execute(sa.text(f'DROP INDEX IF EXISTS "{name}"'))
+
+        table.create(bind=conn)
+        # The legacy table may be empty (a fresh install that never refreshed),
+        # in which case the SELECT simply matches nothing.
+        result = conn.execute(sa.text(insert_sql), {"owner_id": owner_id})
+        conn.execute(sa.text("DROP TABLE discovery_state_old"))
+        conn.commit()
+
+    logger.info(
+        "Discovery state: rebuilt per-user, %s legacy row(s) attributed to owner %s",
+        result.rowcount, owner_id,
+    )
 
 
 def _rebuild_discovery_offers(legacy_columns: list[str]) -> None:
@@ -728,6 +900,8 @@ def _migrate_multi_user(db) -> None:
                 navidrome_url=legacy_conn.url,
                 navidrome_password=legacy_conn.password,
                 is_owner=True,
+                # The owner does not queue requests for their own approval.
+                auto_approve=True,
             )
             db.add(owner)
             db.flush()  # populate owner.id before child rows reference it

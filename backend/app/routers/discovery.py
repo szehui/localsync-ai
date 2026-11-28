@@ -33,6 +33,7 @@ from app.models.schemas import (
 )
 from app.routers.auth import get_current_user
 from app.services import discovery
+from app.services import requests as requests_service
 from app.services.lidarr import LidarrService
 from app.services.listenbrainz import ListenBrainzClient
 from app.services.users import get_listenbrainz_config
@@ -175,7 +176,17 @@ async def dismiss(offer_id: int, user: dict = Depends(get_current_user),
 async def add_to_lidarr(offer_id: int, request: DiscoveryAddRequest,
                         user: dict = Depends(get_current_user),
                         db: Session = Depends(get_db)):
-    """Add the caller's offer album to Lidarr's wanted list (single album only)."""
+    """Turn the caller's offer into an album request.
+
+    This used to call Lidarr directly with a *title* lookup, which is how the
+    Shang-Chi soundtrack resolved to Savage Mode: `album/lookup` matched the
+    artist and guessed at the album. The offer is now resolved to a release-group
+    MBID (exactly, when ListenBrainz gave us a release id) and turned into a
+    request, so the addition goes through the same MBID-keyed path as a search
+    and inherits the approval flow.
+
+    An offer that cannot be resolved is reported, not approximated.
+    """
     offer = (
         db.query(DiscoveryOffer)
         .filter(DiscoveryOffer.id == offer_id, DiscoveryOffer.user_id == user["id"])
@@ -193,66 +204,43 @@ async def add_to_lidarr(offer_id: int, request: DiscoveryAddRequest,
             message="Already sent to Lidarr",
         )
 
-    if not offer.artist_name or not offer.release_name:
-        raise HTTPException(
-            status_code=400,
-            detail="This offer has no artist/album metadata to look up in Lidarr",
-        )
-
-    service = _get_lidarr_service(db)
-    if service is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Lidarr is not configured; set it up under YouTube Import",
-        )
-
     try:
-        result = await service.add_single_album(
-            offer.artist_name, offer.release_name, search=request.search)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except httpx.HTTPStatusError as exc:
-        # The retry loop in LidarrService already absorbed transient 5xx, so
-        # anything reaching here survived ~10s of retries.
-        logger.exception("Lidarr album add failed for offer %s", offer_id)
-        status = exc.response.status_code
-        if status in lidarr.RETRY_STATUSES:
-            detail = (
-                "Lidarr is busy indexing MusicBrainz right now "
-                f"(HTTP {status} after retries). Wait a few seconds and try again."
-            )
-        elif status == 401 or status == 403:
-            detail = "Lidarr rejected the API key. Re-check the Lidarr config."
-        else:
-            detail = f"Lidarr returned HTTP {status}. Check the Lidarr logs."
-        raise HTTPException(status_code=502, detail=detail) from exc
-    except httpx.HTTPError as exc:
-        logger.exception("Lidarr album add failed for offer %s", offer_id)
-        raise HTTPException(
-            status_code=502,
-            detail="Could not reach Lidarr. Is it running?",
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Lidarr album add failed for offer %s", offer_id)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Unexpected error talking to Lidarr: {type(exc).__name__}",
-        ) from exc
+        result = await requests_service.create_request_from_offer(
+            db, user, offer, note=f"From discovery: {offer.track_title}"
+                                  if offer.track_title else None)
+    except requests_service.RequestError as exc:
+        raise HTTPException(status_code=exc.status,
+                            detail={"code": exc.code, "message": exc.message})
 
+    if result is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This offer could not be resolved to a release group on "
+                "MusicBrainz, so nothing was added. Search for the album "
+                "directly instead."
+            ),
+        )
+
+    album_request = result["request"]
     offer.status = discovery.STATUS_SAVED
-    offer.lidarr_album_id = result.get("album_id")
-    offer.lidarr_artist_name = result.get("artist_name")
+    offer.lidarr_album_id = album_request.lidarr_album_id
+    offer.lidarr_artist_name = album_request.artist_name
     db.commit()
+
+    if album_request.status == "approved":
+        message = "Requested and approved — Lidarr is fetching it"
+    elif album_request.status == "pending":
+        message = "Requested — waiting for approval"
+    else:
+        message = f"Request is {album_request.status}"
 
     return DiscoveryAddResponse(
         offer_id=offer.id,
-        artist_name=result.get("artist_name") or offer.artist_name,
-        release_name=result.get("release_name") or offer.release_name,
-        album_id=result.get("album_id"),
-        already_present=bool(result.get("already_present")),
-        albums_unmonitored=result.get("albums_unmonitored") or [],
-        message=(
-            "Already in Lidarr" if result.get("already_present")
-            else "Added to Lidarr wanted list"
-        ),
+        artist_name=album_request.artist_name or offer.artist_name,
+        release_name=album_request.album_title or offer.release_name,
+        album_id=album_request.lidarr_album_id,
+        already_present=False,
+        albums_unmonitored=[],
+        message=message,
     )

@@ -227,6 +227,17 @@ class MusicBrainzClient:
         return await self._request(f"release-group/{mbid}", {"inc": inc},
                                    allow_404=True)
 
+    async def get_release(self, mbid: str, *, inc: str = "release-groups") -> Optional[dict]:
+        """A release by MBID, with its release group.
+
+        ListenBrainz hands out *release* MBIDs, which is a different id space
+        from the release group a request is keyed on. Translating here avoids a
+        fuzzy title search in exactly the case where titles are least reliable
+        (compilations, localised editions).
+        """
+        return await self._request(f"release/{mbid}", {"inc": inc},
+                                   allow_404=True)
+
     async def get_artist(self, mbid: str, *, inc: str = "url-rels") -> Optional[dict]:
         return await self._request(f"artist/{mbid}", {"inc": inc}, allow_404=True)
 

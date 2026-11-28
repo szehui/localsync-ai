@@ -32,7 +32,7 @@ from app.models.database import (
     SmartTrigger,
     User,
 )
-from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse, HouseholdUserResponse, DeleteUserResponse
+from app.models.schemas import LoginRequest, TokenResponse, UserResponse, ConnectionStatus, SyncStatus, LastfmConfigRequest, LastfmConfigResponse, ListenbrainzConfigRequest, ListenbrainzConfigResponse, ListenbrainzTestResponse, HouseholdUserResponse, DeleteUserResponse, UserFlagsUpdate
 from app.services.navidrome import NavidromeClient
 from app.services.listenbrainz import ListenBrainzClient, ListenBrainzError, UserNotFoundError
 from app.services.sync import SyncService
@@ -255,12 +255,75 @@ async def list_users(
             username=member.username,
             display_name=member.display_name,
             is_owner=bool(member.is_owner),
+            auto_approve=bool(member.auto_approve),
+            can_request=bool(member.can_request),
             created_at=member.created_at,
             last_login=member.last_login,
             listenbrainz_configured=lb_user_id is not None,
         )
         for member, lb_user_id in rows
     ]
+
+
+@router.patch("/users/{user_id}", response_model=HouseholdUserResponse)
+async def update_user_flags(
+    user_id: int,
+    update: UserFlagsUpdate,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Change another member's request policy. Owner only.
+
+    These two flags are the whole approval model, so they are the one thing a
+    non-owner must never set for themselves — otherwise "auto approve" is
+    self-service and the queue is decorative.
+
+    The owner's own flags are left editable (an owner can stop being
+    auto-approved) but ``can_request=False`` on the owner is refused: the owner
+    is the only account that can approve, so locking themselves out of asking
+    leaves the household unable to request anything.
+    """
+    caller = db.get(User, user["id"])
+    if caller is None or not caller.is_owner:
+        raise HTTPException(status_code=403,
+                            detail="Only the owner can change request permissions")
+
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if update.auto_approve is None and update.can_request is None:
+        raise HTTPException(status_code=400,
+                            detail="Provide auto_approve and/or can_request")
+
+    if update.can_request is False and target.is_owner:
+        raise HTTPException(
+            status_code=400,
+            detail="The owner cannot disable their own ability to request — "
+                   "nobody would be left to approve",
+        )
+
+    if update.auto_approve is not None:
+        target.auto_approve = update.auto_approve
+    if update.can_request is not None:
+        target.can_request = update.can_request
+    db.commit()
+    db.refresh(target)
+
+    logger.info("Owner %s set flags on user %s: auto_approve=%s can_request=%s",
+                caller.id, target.id, target.auto_approve, target.can_request)
+
+    return HouseholdUserResponse(
+        id=target.id,
+        username=target.username,
+        display_name=target.display_name,
+        is_owner=bool(target.is_owner),
+        auto_approve=bool(target.auto_approve),
+        can_request=bool(target.can_request),
+        created_at=target.created_at,
+        last_login=target.last_login,
+        listenbrainz_configured=db.get(ListenbrainzUserConfig, target.id) is not None,
+    )
 
 
 @router.delete("/users/{user_id}", response_model=DeleteUserResponse)
