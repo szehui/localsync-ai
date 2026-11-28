@@ -8,7 +8,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 from app.models.database import init_db, engine, SessionLocal, SmartTrigger
 from app.routers import auth, library, playlists, triggers
-from app.routers import youtube_import, discovery
+from app.routers import youtube_import, discovery, catalog
 from app.config import settings
 from app.services.scheduler import init_scheduler, add_trigger_job
 from app.services.lidarr import LidarrService
@@ -108,6 +108,7 @@ app.include_router(playlists.router, prefix="/api/playlists", tags=["playlists"]
 app.include_router(triggers.router, prefix="/api/triggers", tags=["triggers"])
 app.include_router(youtube_import.router, prefix="/api/youtube-import", tags=["youtube-import"])
 app.include_router(discovery.router, prefix="/api/discovery", tags=["discovery"])
+app.include_router(catalog.router)
 
 
 @app.get("/api/health")
