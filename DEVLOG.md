@@ -1,5 +1,46 @@
 # LocalSync AI — Development Log
 
+## 2026-11-27 — Duplicate tenant from a second Navidrome URL
+
+Discovered page showed "no seeds available: this user has no played tracks with a
+recording MBID". The message was accurate but the cause was not the library: there
+were **two tenants named `sze`**. The owner row (`id=1`,
+`https://navidrome.hui-family.org`) held all 618 annotations and 255 discovery
+offers; a second row (`id=2`, `http://192.168.4.205:4533`, created minutes earlier
+by a login) held nothing but an empty ListenBrainz config. The session was scoped
+to the empty one, so discovery correctly found no seeds.
+
+`get_or_create_user` keys on `(url, username)`, and that is deliberate — the same
+username on two real Navidrome servers must be two tenants. But one server is
+routinely reachable at two addresses (public hostname *and* LAN IP), and the key
+cannot tell that apart from two servers. Logging in at the second address quietly
+minted a second account with none of the user's history.
+
+### Decision (reverses the earlier contract, on evidence)
+A login for a username that already exists at a **different URL** is now refused
+with `409` and a message naming the URL that owns it. Genuinely separate servers
+still work as long as the usernames differ. The tradeoff is explicit: a real
+second server that reuses a username now needs the row handled by an owner, which
+is a rare, visible, recoverable case — whereas the silent duplicate was invisible
+and cost a user their whole history. The tests that asserted the old
+"two tenants" behaviour were updated rather than deleted, so the reversal is
+recorded where the rule lives.
+
+### Data repair
+Deleted the empty duplicate (`id=2`) and its orphaned `listenbrainz_user_config`
+row after asserting it owned zero annotations and zero offers. The owner tenant
+kept `https://navidrome.hui-family.org`. Stale `discovery_state` error cleared.
+Verified afterwards: `select_seeds(user 1)` returns 20 seeds (one per artist,
+capped) and `select_seeds(<unknown user>)` still returns 0 — the guard against
+empty history is intact, it just has history to work with now.
+
+### Notes
+- `discovery_state` is a **singleton** row, not per-user. With multi-user auth the
+  UI therefore shows whichever user refreshed last, and one user's failure can
+  appear on another's page. Pre-existing; worth making per-user (or keyed by
+  `user_id`) before more than one person uses Discover.
+- 757 tests passing (10 new for the login guard).
+
 ## 2026-11-27 — Music requests, Phase 1: the catalog
 
 The read-only half of "Seerr for music": a user can now search MusicBrainz, browse
