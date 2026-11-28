@@ -22,6 +22,17 @@ import type {
   ConnectionStatus,
   DiscoveryFeed,
   DiscoveryAddResult,
+  AlbumDetail,
+  ArtistDetail,
+  ArtistRequestPlan,
+  CatalogSearchResponse,
+  RailsResponse,
+  ReconcileResult,
+  RequestCreatePayload,
+  RequestItem,
+  RequestListResponse,
+  RequestVoteResponse,
+  ArtistScope,
 } from './types';
 
 const BASE = '/api';
@@ -38,8 +49,16 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
+    // The backend's refusals carry `{detail: {code, message}}` for requests and
+    // a plain string elsewhere. Surface the message, never the raw object — a
+    // banner reading "[object Object]" is worse than the status code.
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    const detail = err?.detail;
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : detail?.message || detail?.code || res.statusText;
+    throw new Error(message);
   }
   return res.json();
 }
@@ -272,4 +291,69 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ search }),
     }),
+
+  // ─── Catalog ──────────────────────────────────────────────────────────────
+  //
+  // Search takes a signal so a fast typist's abandoned queries are actually
+  // cancelled: without it, a slow early keystroke can land after a later one and
+  // replace correct results with stale ones.
+
+  searchCatalog: (q: string, opts?: { limit?: number; offset?: number; signal?: AbortSignal }) => {
+    const qs = new URLSearchParams({ q });
+    if (opts?.limit) qs.set('limit', String(opts.limit));
+    if (opts?.offset) qs.set('offset', String(opts.offset));
+    return request<CatalogSearchResponse>(`/catalog/search?${qs}`, {
+      signal: opts?.signal,
+    });
+  },
+
+  getAlbum: (releaseGroupMbid: string) =>
+    request<AlbumDetail>(`/catalog/album/${encodeURIComponent(releaseGroupMbid)}`),
+
+  getArtist: (artistMbid: string) =>
+    request<ArtistDetail>(`/catalog/artist/${encodeURIComponent(artistMbid)}`),
+
+  getRails: () => request<RailsResponse>('/catalog/rails'),
+
+  // ─── Requests ─────────────────────────────────────────────────────────────
+
+  createRequest: (payload: RequestCreatePayload) =>
+    request<RequestItem>('/requests', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  listRequests: (opts?: { scope?: 'mine' | 'all'; status?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.scope) qs.set('scope', opts.scope);
+    if (opts?.status) qs.set('status', opts.status);
+    const suffix = qs.toString() ? `?${qs}` : '';
+    return request<RequestListResponse>(`/requests${suffix}`);
+  },
+
+  getRequest: (id: number) => request<RequestItem>(`/requests/${id}`),
+
+  voteRequest: (id: number) =>
+    request<RequestVoteResponse>(`/requests/${id}/vote`, { method: 'POST' }),
+
+  approveRequest: (id: number) =>
+    request<RequestItem>(`/requests/${id}/approve`, { method: 'POST' }),
+
+  denyRequest: (id: number, reason?: string) => {
+    const qs = reason ? `?reason=${encodeURIComponent(reason)}` : '';
+    return request<RequestItem>(`/requests/${id}/deny${qs}`, { method: 'POST' });
+  },
+
+  cancelRequest: (id: number) =>
+    request<RequestItem>(`/requests/${id}/cancel`, { method: 'POST' }),
+
+  retryRequest: (id: number) =>
+    request<RequestItem>(`/requests/${id}/retry`, { method: 'POST' }),
+
+  syncRequests: () => request<ReconcileResult>('/requests/sync', { method: 'POST' }),
+
+  planArtistRequest: (artistMbid: string, scope: ArtistScope) => {
+    const qs = new URLSearchParams({ artist_mbid: artistMbid, scope });
+    return request<ArtistRequestPlan>(`/requests/plan?${qs}`);
+  },
 };

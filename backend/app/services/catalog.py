@@ -41,6 +41,20 @@ logger = logging.getLogger(__name__)
 # the user cannot see is a request nobody needed.
 COVER_LIMIT = 10
 
+# A rail is browsed, not paginated. The fresh-releases feed carries ~3,600 rows
+# for a fortnight; rendering them all cost 37 seconds and a wall of DOM nodes,
+# and spent cover lookups on cards nobody would ever scroll to.
+RAIL_LIMIT = 24
+TRENDING_LIMIT = 12
+
+# Bump when the cached search payload changes shape or gains a field.
+SEARCH_CACHE_VERSION = "v2"
+# Popularity is one POST per 25 ids. The pool is wider than the rail so
+# "trending" ranks across a fortnight of releases rather than only the two dozen
+# newest — brand-new albums have barely any listens yet, so a pool the size of
+# the rail usually yields a one-item trending list.
+RAIL_POOL = 200
+
 # A name match is allowed to be one track off. Different editions of the same
 # album routinely differ by a bonus track, and refusing those would report a
 # genuinely owned album as missing.
@@ -213,43 +227,68 @@ async def search(db: Session, user: dict, query: str, *, limit: int = 10,
     if not query:
         return {"results": [], "count": 0, "offset": offset, "artist_suggestions": []}
 
+    # Only upstream data is cached. Ownership and request badges are recomputed
+    # on every call: caching those would keep offering "Request" on an album
+    # somebody asked for a minute ago, which reads as the request having failed.
+    #
+    # The version is part of the key on purpose. When artist suggestions became
+    # unconditional, every query cached under the old behaviour kept serving an
+    # empty suggestion list for its full ten minutes — the change was correct and
+    # invisible. Bumping this retires the old payloads instead of waiting them out.
+    key = make_key("search", SEARCH_CACHE_VERSION, query, limit, offset)
+    cached = cache_get(db, key, "search")
+
     client = mb or MusicBrainzClient()
     owns_client = mb is None
     try:
-        payload = await client.search_release_groups(query, limit=limit, offset=offset)
-        release_groups = payload.get("release_groups", [])
+        if cached is not None:
+            release_groups = cached.get("release_groups") or []
+            covers = cached.get("covers") or {}
+            total = cached.get("count") or len(release_groups)
+            suggestions = cached.get("artist_suggestions") or []
+        else:
+            payload = await client.search_release_groups(query, limit=limit, offset=offset)
+            release_groups = payload.get("release_groups", [])
 
-        alias_hits = album_aliases.match(db, query, limit=limit)
-        if alias_hits:
-            seen = {rg.get("id") for rg in release_groups}
-            missing = [m for m in alias_hits if m not in seen]
-            if missing:
-                fetched = await asyncio.gather(
-                    *(client.get_release_group(m, inc="artist-credits") for m in missing),
-                    return_exceptions=True,
-                )
-                for detail in fetched:
-                    if isinstance(detail, dict):
-                        release_groups.insert(0, detail)
+            alias_hits = album_aliases.match(db, query, limit=limit)
+            if alias_hits:
+                seen = {rg.get("id") for rg in release_groups}
+                missing = [m for m in alias_hits if m not in seen]
+                if missing:
+                    fetched = await asyncio.gather(
+                        *(client.get_release_group(m, inc="artist-credits") for m in missing),
+                        return_exceptions=True,
+                    )
+                    for detail in fetched:
+                        if isinstance(detail, dict):
+                            release_groups.insert(0, detail)
 
-        cards = annotate(db, release_groups, covers=await _covers(db, release_groups))
-        result = {
-            "results": cards,
-            "count": payload.get("count", len(cards)),
-            "offset": offset,
-            "artist_suggestions": [],
-        }
+            covers = await _covers(db, release_groups)
 
-        if not cards:
-            # No release group matched. An artist is a useful next step and is
-            # often what the user meant ("typing an artist name in the album box").
-            artists = await client.search_artists(query, limit=5)
-            result["artist_suggestions"] = [
+            # Always offered, not only when nothing matched. Searching an artist
+            # name returns albums that merely share the word — "twice" surfaces
+            # three albums called *Twice* by other artists, and without an artist
+            # strip there is no way to reach TWICE from here.
+            artists = await client.search_artists(query, limit=3)
+            suggestions = [
                 {"artist_mbid": a.get("id"), "artist_name": a.get("name"),
                  "disambiguation": a.get("disambiguation")}
                 for a in artists if a.get("id")
             ]
-        return result
+            total = payload.get("count", len(release_groups))
+            cache_put(db, key, "search", {
+                "release_groups": release_groups,
+                "covers": covers,
+                "count": total,
+                "artist_suggestions": suggestions,
+            })
+
+        return {
+            "results": annotate(db, release_groups, covers=covers),
+            "count": total,
+            "offset": offset,
+            "artist_suggestions": suggestions,
+        }
     finally:
         if owns_client:
             await client.close()
@@ -333,9 +372,18 @@ async def rails(db: Session, user: dict, *, mb: Optional[MusicBrainzClient] = No
     it is one batched ListenBrainz call over ids we already hold, and it keeps
     the two rails visually related instead of unrelated noise.
     """
-    from app.services.lb_rails import artist_popularity, fresh_releases
+    from app.services.lb_rails import fresh_releases, popularity
 
     fresh = await fresh_releases(db, days=days)
+
+    # Newest first, then slice. The feed is roughly date-ordered already and the
+    # explicit sort costs nothing next to being wrong about "new".
+    rows = sorted(
+        (r for r in fresh if r.get("release_group_mbid")),
+        key=lambda r: (r.get("release_date") or "", r.get("year") or 0),
+        reverse=True,
+    )[:RAIL_POOL]
+
     release_groups = [
         {"id": row["release_group_mbid"], "title": row.get("title"),
          "artist-credit": [{"name": row.get("artist_name") or "",
@@ -343,13 +391,32 @@ async def rails(db: Session, user: dict, *, mb: Optional[MusicBrainzClient] = No
          "primary-type": row.get("primary_type") or "Album",
          "first-release-date": row.get("year") and f"{row['year']}",
          "score": None}
-        for row in fresh if row.get("release_group_mbid")
+        for row in rows
     ]
 
-    cards = annotate(db, release_groups, covers=await _covers(db, release_groups))
+    # ListenBrainz already hands us a Cover Art Archive release id for most rows,
+    # so most artwork is free. Only the gaps cost a MusicBrainz lookup, which is
+    # why this is no longer thousands of requests for a page that shows two dozen.
+    lb_covers = {row["release_group_mbid"]: row.get("cover_url") for row in rows}
+    covers = {rid: url for rid, url in lb_covers.items() if url}
+    gaps = [rg for rg in release_groups if rg["id"] not in covers]
+    if gaps:
+        covers.update(await _covers(db, gaps))
 
-    artist_ids = {c["artist_mbid"] for c in cards if c["artist_mbid"]}
-    counts = await artist_popularity(sorted(artist_ids))
-    trending = sorted(cards, key=lambda c: counts.get(c["artist_mbid"], 0), reverse=True)[:10]
+    pool = annotate(db, release_groups, covers=covers)
+    cards = pool[:RAIL_LIMIT]
 
-    return {"new_releases": cards, "trending": trending}
+    # Trending means "the most-listened among these new releases", so popularity
+    # is asked about the release groups themselves. Ranking by *artist* popularity
+    # instead would surface whichever newcomer happens to have the largest
+    # back catalogue following — Queen, in practice — which is not what the rail
+    # claims to be.
+    counts = await popularity([c["release_group_mbid"] for c in pool])
+    trending = sorted(
+        pool, key=lambda c: counts.get(c["release_group_mbid"], 0), reverse=True
+    )[:TRENDING_LIMIT]
+
+    return {
+        "new_releases": cards,
+        "trending": [c for c in trending if counts.get(c["release_group_mbid"], 0) > 0],
+    }

@@ -31,20 +31,37 @@ CHUNK_SIZE = 25   # the API accepts up to 100; 25 keeps responses small
 MAX_IDS = 100
 
 
+CAA_FRONT = "https://coverartarchive.org/release/{mbid}/front-250"
+
+
 def _rg_card(row: dict) -> dict:
-    """Map a ListenBrainz fresh-release row onto the catalog card shape."""
+    """Map a ListenBrainz fresh-release row onto the catalog card shape.
+
+    Row keys verified against a live 3,597-row response (2026-11-27). The title
+    is **not** in ``release_group_name`` or ``title`` — neither key exists on a
+    real row. Zero of those 3,597 rows carried either one, so an earlier version
+    of this function rendered every home-rail card with a blank title while the
+    unit tests (whose fixtures used those invented keys) stayed green.
+    ``release_name`` is what is actually served.
+    """
     artist = row.get("artist_credit_name") or row.get("artist_name") or ""
     year = row.get("release_date")
+    caa = row.get("caa_release_mbid")
     return {
         "release_group_mbid": row.get("release_group_mbid"),
-        "title": row.get("release_group_name") or row.get("title") or "",
+        "title": (row.get("release_group_name") or row.get("title")
+                  or row.get("release_name") or ""),
         "artist_name": artist,
         "artist_mbid": (row.get("artist_mbids") or [None])[0],
         "year": int(year[:4]) if isinstance(year, str) and year[:4].isdigit() else None,
         "primary_type": row.get("release_group_primary_type") or "Album",
         "secondary_types": row.get("release_group_secondary_type_list") or [],
-        "cover_url": None,
-        "score": None,
+        # Cover Art Archive redirects (307) to the image itself, so this is a
+        # usable <img> URL with no extra API call. Only ~72% of rows have one.
+        "cover_url": CAA_FRONT.format(mbid=caa) if caa else None,
+        "score": row.get("listen_count"),
+        # Kept for ordering: "newest first" needs the day, not just the year.
+        "release_date": row.get("release_date"),
     }
 
 
@@ -91,6 +108,37 @@ def _chunks(ids: Iterable[str]) -> list[list[str]]:
     return [cleaned[i:i + CHUNK_SIZE] for i in range(0, len(cleaned), CHUNK_SIZE)]
 
 
+def _parse_counts(payload: object, id_field: str) -> dict[str, int]:
+    """Turn a ListenBrainz popularity payload into ``{mbid: listen_count}``.
+
+    The live shape is a **list of objects**, not a dict keyed by MBID::
+
+        [{"artist_mbid": "...", "total_listen_count": 77081947,
+          "total_user_count": 366682}, ...]
+
+    An earlier version of this module assumed ``{mbid: count}`` and its tests
+    encoded that assumption, so the unit tests passed while ``/catalog/rails``
+    returned 500 against the real service. A dict payload is still accepted —
+    ListenBrainz has served that shape historically — but the list is what it
+    actually returns today.
+    """
+    if isinstance(payload, dict):
+        return {str(k): int(v or 0) for k, v in payload.items() if k}
+
+    counts: dict[str, int] = {}
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            mbid = item.get(id_field)
+            if mbid:
+                counts[str(mbid)] = int(item.get("total_listen_count") or 0)
+        return counts
+
+    logger.warning("unexpected popularity payload: %s", type(payload).__name__)
+    return {}
+
+
 async def popularity(release_group_mbids: Iterable[str], *,
                      client: httpx.AsyncClient | None = None) -> dict[str, int]:
     """Map release-group MBID -> listen count.
@@ -116,9 +164,8 @@ async def popularity(release_group_mbids: Iterable[str], *,
             if response.status_code != 200:
                 logger.warning("ListenBrainz popularity -> %s", response.status_code)
                 continue
-            for mbid, count in (response.json() or {}).items():
-                totals[mbid] = int(count or 0)
-    except (httpx.HTTPError, ValueError) as exc:
+            totals.update(_parse_counts(response.json(), "release_group_mbid"))
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
         logger.warning("ListenBrainz popularity failed: %s", exc)
     finally:
         if owns_client:
@@ -148,9 +195,8 @@ async def artist_popularity(artist_mbids: Iterable[str], *,
             if response.status_code != 200:
                 logger.warning("ListenBrainz artist popularity -> %s", response.status_code)
                 continue
-            for mbid, count in (response.json() or {}).items():
-                totals[mbid] = int(count or 0)
-    except (httpx.HTTPError, ValueError) as exc:
+            totals.update(_parse_counts(response.json(), "artist_mbid"))
+    except (httpx.HTTPError, ValueError, TypeError) as exc:
         logger.warning("ListenBrainz artist popularity failed: %s", exc)
     finally:
         if owns_client:

@@ -13,5 +13,25 @@ services:
       - DATABASE_URL=sqlite:///./data/localsync.db
     restart: unless-stopped
 
+networks:
+  # Dual-stack, and that is load-bearing rather than tidy-minded.
+  #
+  # MusicBrainz (and ListenBrainz) resolve to a Hetzner IPv6 address first. On
+  # 2026-11-27 the IPv4 path to 142.132.241.153 stalled in the TLS handshake
+  # from this network while the IPv6 path was healthy — from the host *and* from
+  # containers — so a v4-only bridge made the entire catalog unusable with
+  # "MusicBrainz is busy" on every search. Docker's default bridge is IPv4-only,
+  # so the fix is an explicit IPv6 subnet: Docker sets up NAT66 itself, no host
+  # firewall changes needed.
+  #
+  # 172.22.0.0/16 is pinned rather than auto-assigned so the subnet survives
+  # re-creation; changing it is harmless (only this compose file references it).
+  default:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.22.0.0/16
+        - subnet: fd00:22:1::/64
+
 volumes:
   localsync-data:

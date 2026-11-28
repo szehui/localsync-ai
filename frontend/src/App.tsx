@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useCallback, useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './AuthContext.tsx';
 import { LoginView } from './LoginView.tsx';
 import { SourceDashboard } from './views/SourceDashboard.tsx';
@@ -7,16 +7,25 @@ import { PlaylistView } from './views/PlaylistView.tsx';
 import { AutomationHub } from './views/AutomationHub.tsx';
 import { YouTubeImport } from './views/YouTubeImport.tsx';
 import { DiscoveryFeedView } from './views/DiscoveryFeed.tsx';
+import { CatalogHome } from './views/CatalogHome.tsx';
+import { CatalogSearch } from './views/CatalogSearch.tsx';
+import { ArtistView } from './views/ArtistView.tsx';
+import { RequestsView } from './views/RequestsView.tsx';
+import { AlbumModal } from './views/AlbumModal.tsx';
+import type { CatalogCard } from './types.ts';
 
-type Tab = 'source' | 'discover' | 'seed' | 'playlists' | 'automation' | 'youtube';
+type Tab = 'home' | 'search' | 'requests' | 'discover' | 'seed' | 'playlists' | 'automation' | 'youtube' | 'source';
 
 const TABS: { id: Tab; label: string; icon: string; description: string }[] = [
-  { id: 'source', label: 'Source', icon: '🎵', description: 'Connect & sync your library' },
+  { id: 'home', label: 'Home', icon: '🏠', description: 'New releases worth a listen' },
+  { id: 'search', label: 'Search', icon: '🔎', description: 'Find anything; request what you lack' },
+  { id: 'requests', label: 'Requests', icon: '📥', description: 'What was asked for and where it is' },
   { id: 'discover', label: 'Discover', icon: '🔭', description: 'New music not in your library' },
   { id: 'seed', label: 'Seed', icon: '🌱', description: 'Generate from any track' },
   { id: 'playlists', label: 'Playlists', icon: '📋', description: 'View and manage' },
   { id: 'automation', label: 'Automation', icon: '⚡', description: 'Smart triggers' },
-  { id: 'youtube', label: 'YouTube Import', icon: '📺', description: 'Import YTM playlists' },
+  { id: 'youtube', label: 'YouTube', icon: '📺', description: 'Import YTM playlists' },
+  { id: 'source', label: 'Source', icon: '🎵', description: 'Connect & sync your library' },
 ];
 
 export default function App() {
@@ -52,8 +61,33 @@ function AppRouter() {
 }
 
 function MainApp() {
-  const [activeTab, setActiveTab] = useState<Tab>('source');
+  const [activeTab, setActiveTab] = useState<Tab>('home');
   const { user, logout } = useAuth();
+
+  // Catalog navigation is deliberately not URL routing: the app is tab-based and
+  // a deep link into an album would need a router the rest of the app does not
+  // have. One piece of state holds the open album, one holds the artist page.
+  const [openAlbumMbid, setOpenAlbumMbid] = useState<string | null>(null);
+  const [artist, setArtist] = useState<{ mbid: string; name?: string | null } | null>(null);
+  const [requestsKey, setRequestsKey] = useState(0);
+
+  const openAlbum = useCallback((card: CatalogCard) => {
+    if (card.release_group_mbid) setOpenAlbumMbid(card.release_group_mbid);
+  }, []);
+
+  const openArtist = useCallback((artistMbid: string, artistName?: string | null) => {
+    setArtist({ mbid: artistMbid, name: artistName });
+    setActiveTab('search');
+  }, []);
+
+  const bumpRequests = useCallback(() => setRequestsKey((key) => key + 1), []);
+
+  // Switching tabs leaves the artist page: a hidden artist view that reappears
+  // when you come back to Search reads as a stuck page.
+  const changeTab = useCallback((tab: Tab) => {
+    setActiveTab(tab);
+    setArtist(null);
+  }, []);
 
   return (
     <div className="min-h-screen bg-surface text-white flex flex-col">
@@ -77,6 +111,11 @@ function MainApp() {
               {user && (
                 <div className="flex items-center gap-2 text-sm text-gray-500">
                   <span className="hidden sm:inline">{user.username}</span>
+                  {user.is_owner && (
+                    <span className="text-[10px] uppercase tracking-wide text-accent/70 hidden sm:inline">
+                      owner
+                    </span>
+                  )}
                   <button
                     onClick={logout}
                     className="text-xs text-gray-500 hover:text-gray-300 transition-colors"
@@ -90,15 +129,15 @@ function MainApp() {
         </div>
         {/* Tabs */}
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
-          <nav className="flex gap-1 -mb-px">
+          <nav className="flex gap-1 -mb-px overflow-x-auto">
             {TABS.map((tab) => {
               const isActive = activeTab === tab.id;
               return (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
+                  onClick={() => changeTab(tab.id)}
                   className={`
-                    group relative px-4 py-3 text-sm font-medium transition-all duration-200
+                    group relative px-4 py-3 text-sm font-medium transition-all duration-200 whitespace-nowrap
                     ${isActive
                       ? 'text-accent'
                       : 'text-gray-500 hover:text-gray-300'
@@ -123,13 +162,47 @@ function MainApp() {
 
       {/* Content */}
       <main className="flex-1 max-w-6xl mx-auto w-full px-4 sm:px-6 lg:px-8 py-8 animate-fade-in">
-        {activeTab === 'source' && <SourceDashboard />}
+        {activeTab === 'home' && (
+          <CatalogHome
+            onOpenAlbum={openAlbum}
+            onOpenArtist={openArtist}
+            onGoToSearch={() => changeTab('search')}
+          />
+        )}
+        {activeTab === 'search' &&
+          (artist ? (
+            <ArtistView
+              artistMbid={artist.mbid}
+              artistName={artist.name}
+              onOpenAlbum={openAlbum}
+              onBack={() => setArtist(null)}
+              onRequested={bumpRequests}
+            />
+          ) : (
+            <CatalogSearch onOpenAlbum={openAlbum} onOpenArtist={openArtist} />
+          ))}
+        {activeTab === 'requests' && (
+          <RequestsView isOwner={Boolean(user?.is_owner)} refreshKey={requestsKey} />
+        )}
         {activeTab === 'discover' && <DiscoveryFeedView />}
         {activeTab === 'seed' && <SeedInterface />}
         {activeTab === 'playlists' && <PlaylistView />}
         {activeTab === 'automation' && <AutomationHub />}
         {activeTab === 'youtube' && <YouTubeImport />}
+        {activeTab === 'source' && <SourceDashboard />}
       </main>
+
+      {openAlbumMbid && (
+        <AlbumModal
+          releaseGroupMbid={openAlbumMbid}
+          onClose={() => setOpenAlbumMbid(null)}
+          onOpenArtist={(mbid, name) => {
+            setOpenAlbumMbid(null);
+            openArtist(mbid, name);
+          }}
+          onRequested={bumpRequests}
+        />
+      )}
     </div>
   );
 }

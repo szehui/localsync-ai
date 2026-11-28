@@ -28,6 +28,7 @@ export function Button({
   type = 'button',
   size = 'md',
   loading = false,
+  title,
 }: {
   children: React.ReactNode;
   onClick?: () => void;
@@ -37,6 +38,7 @@ export function Button({
   type?: 'button' | 'submit';
   size?: 'sm' | 'md';
   loading?: boolean;
+  title?: string;
 }) {
   const sizes = {
     sm: 'px-3 py-1.5 text-xs',
@@ -54,6 +56,7 @@ export function Button({
       type={type}
       onClick={onClick}
       disabled={disabled || loading}
+      title={title}
       className={cx(
         'rounded-lg font-medium transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-2',
         sizes[size],

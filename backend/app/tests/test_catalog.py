@@ -254,6 +254,40 @@ class TestSearchService:
         await catalog.search(db, {"id": 1}, "hysteria", mb=mb)
         assert mb.closed is False
 
+    async def test_artist_suggestions_are_offered_even_with_hits(self, db, user):
+        # Searching an artist name returns albums that only share the word, so
+        # the artist strip cannot be reserved for the empty-result case.
+        mb = FakeMB(search=[rg()], artists=[{"id": "a1", "name": "TWICE"}])
+        out = await catalog.search(db, {"id": 1}, "twice", mb=mb)
+        assert out["results"], "precondition: there are album hits"
+        assert out["artist_suggestions"] == [
+            {"artist_mbid": "a1", "artist_name": "TWICE", "disambiguation": None}]
+
+    async def test_repeat_search_is_served_from_cache(self, db, user):
+        mb = FakeMB(search=[rg()])
+        await catalog.search(db, {"id": 1}, "hysteria", mb=mb)
+        again = FakeMB(search=[rg(title="Should Not Appear")])
+        out = await catalog.search(db, {"id": 1}, "hysteria", mb=again)
+        assert again.search_calls == [], "a repeat query must not spend a request"
+        assert out["results"][0]["title"] == "Hysteria"
+
+    async def test_cached_search_still_recomputes_ownership(self, db, user):
+        # Upstream payloads are cached; ownership is not. Otherwise an album
+        # imported during the cache window keeps offering "Request".
+        mb = FakeMB(search=[rg()])
+        first = await catalog.search(db, {"id": 1}, "hysteria", mb=mb)
+        assert first["results"][0]["owned"] is False
+
+        album = Album(
+            id="lib-1", name="Hysteria", artist_name="Def Leppard", song_count=12,
+            release_group_mbid=first["results"][0]["release_group_mbid"],
+        )
+        db.add(album)
+        db.commit()
+
+        again = await catalog.search(db, {"id": 1}, "hysteria", mb=FakeMB())
+        assert again["results"][0]["owned"] is True
+
 
 class TestAlbumDetail:
     async def test_records_aliases_on_first_view(self, db, user):

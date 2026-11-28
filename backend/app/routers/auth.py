@@ -202,7 +202,7 @@ async def logout(user: dict = Depends(get_current_user)):
 
 
 @router.get("/me", response_model=UserResponse)
-async def me(user: dict = Depends(get_current_user)):
+async def me(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return current authenticated user info.
 
     Reads the registry without reconnecting: /me must answer even when the
@@ -218,10 +218,14 @@ async def me(user: dict = Depends(get_current_user)):
             server_version = result.get("version", "unknown")
         except Exception:
             server_version = None
+    row = db.get(User, user["id"])
     return UserResponse(
         username=user["username"],
         navidrome_url=user["navidrome_url"],
         server_version=server_version,
+        is_owner=bool(row.is_owner) if row else False,
+        auto_approve=bool(row.auto_approve) if row else False,
+        can_request=bool(row.can_request) if row else True,
     )
 
 

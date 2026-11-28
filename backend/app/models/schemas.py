@@ -169,6 +169,14 @@ class UserResponse(BaseModel):
     username: str
     navidrome_url: str
     server_version: Optional[str] = None
+    # The caller's own permissions. The UI needs these to decide what to offer —
+    # an Approve button that 403s on click is worse than no button at all. They
+    # are read from the database on every call rather than taken from the JWT,
+    # because `is_owner` is a mutable flag and a stale token must not carry
+    # elevated rights.
+    is_owner: bool = False
+    auto_approve: bool = False
+    can_request: bool = True
 
 
 # --- Household roster ---

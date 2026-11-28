@@ -182,6 +182,10 @@ export interface UserResponse {
   username: string;
   navidrome_url: string;
   server_version?: string;
+  /** Read from the database on every /me call, never trusted from the JWT. */
+  is_owner: boolean;
+  auto_approve: boolean;
+  can_request: boolean;
 }
 
 // ─── Discovery feed ──────────────────────────────────────────────────────────
@@ -246,4 +250,160 @@ export interface DiscoveryAddResult {
   already_present: boolean;
   albums_unmonitored: number[];
   message: string;
+}
+
+// ─── Catalog (MusicBrainz-backed) ────────────────────────────────────────────
+
+/** How a release group is known to be in the library, or null if it is not. */
+export type OwnedVia = 'mbid' | 'name' | null;
+
+export interface OpenRequestRef {
+  id: number;
+  status: RequestStatus;
+  requested_by?: string | null;
+}
+
+export interface CatalogCard {
+  release_group_mbid: string;
+  title?: string | null;
+  artist_name?: string | null;
+  artist_mbid?: string | null;
+  year?: number | null;
+  primary_type?: string | null;
+  secondary_types: string[];
+  cover_url?: string | null;
+  score?: number | null;
+  owned: boolean;
+  owned_via?: OwnedVia;
+  request?: OpenRequestRef | null;
+}
+
+export interface ArtistSuggestion {
+  artist_mbid: string;
+  artist_name?: string | null;
+  disambiguation?: string | null;
+}
+
+export interface CatalogSearchResponse {
+  results: CatalogCard[];
+  count: number;
+  offset: number;
+  artist_suggestions: ArtistSuggestion[];
+}
+
+export interface ReleaseEdition {
+  id: string;
+  title?: string | null;
+  date?: string | null;
+  country?: string | null;
+}
+
+export interface AlbumDetail extends CatalogCard {
+  aliases: string[];
+  /** MusicBrainz says the type is album/EP — singles and compilations are not. */
+  requestable: boolean;
+  releases: ReleaseEdition[];
+}
+
+export interface ArtistDetail {
+  artist_mbid: string;
+  artist_name?: string | null;
+  disambiguation?: string | null;
+  albums: CatalogCard[];
+  summary: {
+    albums: number;
+    owned: number;
+    requestable: number;
+  };
+}
+
+export interface RailsResponse {
+  new_releases: CatalogCard[];
+  trending: CatalogCard[];
+}
+
+// ─── Requests ────────────────────────────────────────────────────────────────
+
+/**
+ * The server's state machine, verbatim. The UI renders these strings and never
+ * infers a status from timestamps or from what the user just clicked.
+ */
+export type RequestStatus =
+  | 'pending'
+  | 'approved'
+  | 'downloading'
+  | 'partially_available'
+  | 'imported'
+  | 'available'
+  | 'failed'
+  | 'denied'
+  | 'cancelled';
+
+export type RequestKind = 'album' | 'artist';
+export type ArtistScope = 'studio' | 'studio_eps' | 'everything';
+
+export interface RequestItem {
+  id: number;
+  kind: RequestKind;
+  status: RequestStatus;
+  release_group_mbid?: string | null;
+  artist_mbid?: string | null;
+  artist_name?: string | null;
+  album_title?: string | null;
+  year?: number | null;
+  primary_type?: string | null;
+  cover_url?: string | null;
+  scope?: ArtistScope | null;
+  note?: string | null;
+  requested_by?: string | null;
+  requested_at?: string | null;
+  decided_at?: string | null;
+  decided_by?: string | null;
+  vote_count: number;
+  last_error?: string | null;
+  lidarr_album_id?: number | null;
+  rollup: Record<string, number>;
+  children: RequestItem[];
+}
+
+export interface RequestListResponse {
+  requests: RequestItem[];
+  total: number;
+}
+
+export interface RequestCreatePayload {
+  kind: RequestKind;
+  release_group_mbid?: string;
+  artist_mbid?: string;
+  scope?: ArtistScope;
+  note?: string;
+}
+
+export interface RequestVoteResponse {
+  request_id: number;
+  voted: boolean;
+  added: boolean;
+  vote_count: number;
+}
+
+export interface ArtistPlanAlbum {
+  release_group_mbid: string;
+  title?: string | null;
+  year?: number | null;
+  primary_type?: string | null;
+}
+
+export interface ArtistRequestPlan {
+  artist_mbid: string;
+  artist_name?: string | null;
+  disambiguation?: string | null;
+  scope: ArtistScope;
+  albums: ArtistPlanAlbum[];
+  summary: Record<string, number>;
+}
+
+export interface ReconcileResult {
+  total: number;
+  changed: number;
+  failed: number;
 }
