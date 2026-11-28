@@ -224,6 +224,19 @@ artist search must not take `results[0]`.**
 
 # Phase 1 — Catalog (read-only)
 
+**Status: complete (2026-11-27).** 747 tests passing (196 new). See DEVLOG for the
+measured decisions. Deviations from this plan, all deliberate:
+
+- The `requests` table was defined in this phase, not Phase 2 — catalog cards must
+  annotate "already requested", and its partial unique index is the concurrency
+  guard for the request button. Phase 2 Task 2.1 therefore only adds `RequestVote`,
+  `Blocklist` and the two `users` columns.
+- `sync_album_mbids` also backfills `albums.year` from Navidrome's `maxYear`: the
+  Subsonic album object has no `year` field, so every row was NULL and the date
+  tiebreaker in the backfill would have been dead code.
+- Album detail records aliases on first view (Task 1.11's harvest), and search
+  merges local alias hits in front of MusicBrainz results.
+
 ### Task 1.1: Reusable upstream rate limiter
 
 **Objective:** One serialiser for MusicBrainz-class APIs (1 req/s, injectable clock).
