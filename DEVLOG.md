@@ -1,5 +1,76 @@
 # LocalSync AI — Development Log
 
+## 2026-11-27 — Music requests, Phase 1: the catalog
+
+The read-only half of "Seerr for music": a user can now search MusicBrainz, browse
+an artist's discography, and see — per card — whether the album is already in the
+library and whether someone has already requested it. Nothing writes to Lidarr
+yet (that is Phase 2).
+
+### The decision that made this viable
+Availability is keyed on the **release-group MBID**, never on a title. Lidarr's
+title lookup returns the wrong album for compilations (a "Greatest Hits" request
+added a different artist's) and fails outright for non-Latin titles. But this
+library only carried a release-group MBID for 36.8% of albums — the rest were
+invisible to an MBID-keyed catalog.
+
+The fix costs **zero MusicBrainz calls**: Lidarr already resolved a release group
+for every album it tracks and stores it as `foreignAlbumId`. Folding `artist|title`
+on both sides and copying ids where the key maps to exactly one release group
+resolved **1,210 of 1,524 matchable untagged albums (79.4%)**, lifting coverage
+36.8% → 70.2%. Twenty sampled copies were validated against MusicBrainz: 18 exact,
+1 edition variant, 1 artist-credit variant (`Pharrell` vs `Pharrell Williams`),
+**zero wrong release groups**.
+
+### Decisions
+- **Backfill is a separate job** (`scripts/backfill_mbids.py`), not part of the
+  library sync. It is a bulk copy plus a ~400-call MusicBrainz tail; a sync should
+  not block on 15 minutes of upstream calls.
+- **`mbid_checked_at` distinguishes "never looked" from "looked, found nothing."**
+  Without it every re-run re-queries the ~800 albums that genuinely have no
+  release group. It is also how the job resumes and how the tail tier records the
+  structural floor (716 single-track rips, 135 `[Unknown Album]` tags).
+- **Name matching is a second ownership tier, not a fallback to be avoided.** It
+  needs no MBID, so an untagged rip still answers "probably in your library"
+  (`owned_via: "name"`) instead of offering a duplicate request.
+- **Ambiguity is skipped, never guessed.** A folded key mapping to two release
+  groups is the Greatest-Hits collision; those rows go to the tail instead.
+
+### Traps encoded in the code (each a measured failure, not a hypothetical)
+- `albums.year` was **NULL for all 3,626 albums** — the Subsonic album object has
+  no `year`. `maxYear` from Navidrome's native API is the only usable date, and it
+  is now captured. A rule reading `year` would have silently disabled its own
+  date check.
+- **Year and track count never veto a match.** Run DMC's *Raising Hell* has
+  `maxYear` 1999 against a 1986 release group (a reissue); Notorious B.I.G.'s
+  *Doing It Real Big* has 4 local tracks against 14 (a partial rip). Both are
+  correct matches that strict gating rejected.
+- **`싸다9` → `9`** if you de-accent with NFKD and forget to recompose: NFKD splits
+  Hangul syllables into jamo, which fall outside every CJK range. Recomposing with
+  NFC keeps the glyphs.
+- **CJK queries need a different shape:** `releasegroup:"화양연화 pt.1"` returns
+  503; `releasegroup:(화양연화 pt 1)` works. `normalize_query` rewrites it.
+- **`release-group` browse takes one `type` per call** — repeating the parameter
+  returns 503.
+- A release group's localised titles are *release* titles (`싸다9` has one titled
+  `PSY 9th`). Harvested into `album_aliases` on first detail view, so the name a
+  user remembers resolves locally without an upstream call.
+
+### Verification (real data, not mocks)
+- **747 tests passing** (196 new).
+- Live MusicBrainz: search (`Random Access Memories`, 7,506 count), release-group
+  detail, artist search and album browse all returned real payloads through the
+  new client, with the 1 req/s limiter.
+- Oracle tier end-to-end on a scratch DB with real Lidarr-shaped rows: exact match
+  → `high`, `Hysteria (Deluxe Edition)` → `high`, two *Greatest Hits* → skipped as
+  ambiguous, `八度空间` → left for the tail.
+
+### Known limitation
+Search results are presented in MusicBrainz relevance order. Ties at score 100 are
+not re-ranked by popularity, so a user searching "Random Access Memories" sees two
+cover versions before Daft Punk's. Worth a ListenBrainz-popularity re-rank once the
+rails have cache warmed.
+
 ## 2026-11-27 — Multi-user support
 
 Household members now get their own playlists, from their own listening history.
